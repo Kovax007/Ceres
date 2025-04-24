@@ -14,65 +14,149 @@
 #region Using directives 
 
 using System;
-using System.Text;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-
-using Microsoft.Extensions.Logging;
-
-using Ceres.Base.Misc;
-using Ceres.Base.Environment;
-using Ceres.Base.OperatingSystem;
-using Ceres.Base.CUDA;
-using Ceres.Chess.UserSettings;
-using Ceres.MCTS.Params;
-using Ceres.MCTS.Environment;
-
+using System.Text;
 using Ceres.APIExamples;
+using Ceres.Base.Benchmarking;
+using Ceres.Base.CUDA;
+using Ceres.Base.Environment;
+using Ceres.Base.Misc;
+using Ceres.Base.OperatingSystem;
+using Ceres.Chess;
+using Ceres.Chess.GameEngines;
+using Ceres.Chess.NNEvaluators.Defs;
+using Ceres.Chess.UserSettings;
 using Ceres.Commands;
 using Ceres.Features;
+using Ceres.Features.GameEngines;
+using Ceres.Features.Players;
+using Ceres.Features.Tournaments;
+using Ceres.MCTS.Environment;
+using Ceres.MCTS.Params;
+using Chess.Ceres.PlayEvaluation;
+using Microsoft.Extensions.Logging;
 
 #endregion
 
 namespace Ceres
 {
-  public static class Program
-  {
-    /// <summary>
-    /// Startup method for Ceres UCI chess engine and supplemental features.
-    /// </summary>
-    /// <param name="args"></param>
-    static void Main(string[] args)
+    public static class SPSATournamentRunner
     {
-      LaunchUCI(args);
+        // ========================================================================================================================
+        const string CERES_JSON_PATH = @"C:\Lc0\Ceres\artifacts\release\net8.0\Ceres.json";
+
+        const string CERES_NET_PATH = @"C:\Lc0\Ceres\artifacts\release\net8.0\C1-640-34.onnx";
+        const string CERES_DEVICE = "GPU:0#TensorRT16"; // or #TensorRT16
+        static int[] CONCURRENT_GAME_GPU_IDS = [0];
+
+        const string SF_EXE_PATH = @"D:\Engines\Stockfish\src\stockfish.exe";
+        const int SF_THREADS = 1;
+        const int SF_TB_SIZE_MB = 16;
+        const int SF_NODES_PER_MOVE = 300_000;
+
+        const int CERES_NODES_PER_MOVE = 256;
+        const int NUM_GAME_PAIRS = 2;
+        const string OPENING_FN = @"C:\Lc0\books\UHO_Lichess_4852_v1.epd";
+        const int NUM_CONCURRENT_GAMES = 4;
+        // ========================================================================================================================
+
+        public static void RunTournament()
+        {
+            CeresUserSettingsManager.LoadFromFile(CERES_JSON_PATH);
+
+            string CERES_NETWORK = CeresUserSettingsManager.Settings.DefaultNetworkSpecString;
+            string TB_DIR = CeresUserSettingsManager.Settings.DirTablebases;
+            SearchLimit CERES_TIME_CONTROL = SearchLimit.NodesPerMove(CERES_NODES_PER_MOVE);
+            SearchLimit SF_TIME_CONTROL = SearchLimit.NodesPerMove(SF_NODES_PER_MOVE);
+
+            const string logfile = "ceres.log.txt"; //null;
+
+            // Define Stockfish engine (via UCI) 
+            GameEngineDefUCI sfEngine = new GameEngineDefUCI("SF", new GameEngineUCISpec("SF", SF_EXE_PATH, SF_THREADS, SF_TB_SIZE_MB, TB_DIR));
+
+            // Turn on early search termination, and turn off overlapping executors (not needed for small searches).
+            Ceres.MCTS.Params.ParamsSearch searchParams = new Ceres.MCTS.Params.ParamsSearch()
+            {
+                FutilityPruningStopSearchEnabled = true,
+            };
+            searchParams.Execution.FlowDirectOverlapped = false;
+            searchParams.Execution.FlowDualSelectors = false;
+
+            // Define Ceres engine (in process) with associated neural network and GPU and parameter customizations
+            NNEvaluatorDef ceresNNDef = NNEvaluatorDefFactory.FromSpecification(CERES_NET_PATH, CERES_DEVICE);
+            GameEngineDefCeres engineDefCeres1 = new GameEngineDefCeres("Ceres1", ceresNNDef, null,
+                                                                        searchParams,
+                                                                        new Ceres.MCTS.Params.ParamsSelect(),
+                                                                        logFileName: logfile);
+
+            // Define players using these engines and specified time control
+            EnginePlayerDef playerCeres = new EnginePlayerDef(engineDefCeres1, CERES_TIME_CONTROL);
+            EnginePlayerDef playerSF = new EnginePlayerDef(sfEngine, SF_TIME_CONTROL);
+
+            // Create a tournament definition
+            TournamentDef tournDef = new TournamentDef("Ceres_vs_Stockfish", playerCeres, playerSF);
+            tournDef.NumGamePairs = NUM_GAME_PAIRS;
+            tournDef.OpeningsFileName = OPENING_FN;
+            tournDef.ShowGameMoves = false;
+
+            // Run the tournament
+            TimingStats stats = new TimingStats();
+            TournamentResultStats results;
+            using (new TimingBlock(stats, TimingBlock.LoggingType.None))
+            {
+                results = new TournamentManager(tournDef, NUM_CONCURRENT_GAMES, CONCURRENT_GAME_GPU_IDS).RunTournament();
+            }
+            Console.WriteLine();
+            Console.WriteLine($"Tournament completed in {stats.ElapsedTimeSecs,8:F2} seconds.");
+
+            PlayerStat ceresResults = results.Players[0];
+            PlayerStat sfResults = results.Players[1];
+            float eloDiff = EloCalculator.EloDiff(ceresResults.PlayerWins, ceresResults.Draws, ceresResults.PlayerLosses);
+            Console.WriteLine($"CERES W/D/L {ceresResults.PlayerWins} {ceresResults.Draws} {ceresResults.PlayerLosses}");
+            Console.WriteLine("ELO_DIFFERENCE " + eloDiff);
+            System.Environment.Exit(0);
+        }
     }
 
+    public static class Program
+    {
+        /// <summary>
+        /// Startup method for Ceres UCI chess engine and supplemental features.
+        /// </summary>
+        /// <param name="args"></param>
+        static void Main(string[] args)
+        {
+            SPSATournamentRunner.RunTournament();
+            //      LaunchUCI(args);
+        }
 
-    /// <summary>
-    /// Perform engine initialization and enters into UCI processing loop.
-    /// </summary>
-    /// <param name="args"></param>
-    /// <param name="searchModifier"></param>
-    /// <param name="selectModifier"></param>
-    /// <param name="enableLogging"></param>
-    public static void LaunchUCI(string[] args, 
-                                 Action<ParamsSearch> searchModifier = null, 
-                                 Action<ParamsSelect> selectModifier = null,
-                                 bool enableLogging = false)
-    {    
+
+        /// <summary>
+        /// Perform engine initialization and enters into UCI processing loop.
+        /// </summary>
+        /// <param name="args"></param>
+        /// <param name="searchModifier"></param>
+        /// <param name="selectModifier"></param>
+        /// <param name="enableLogging"></param>
+        public static void LaunchUCI(string[] args,
+                                     Action<ParamsSearch> searchModifier = null,
+                                     Action<ParamsSelect> selectModifier = null,
+                                     bool enableLogging = false)
+        {
 #if DEBUG
       Console.WriteLine();
       ConsoleUtils.WriteLineColored(ConsoleColor.Red, "*** WARNING: Ceres binaries built in Debug mode and will run much more slowly than Release");
 #endif
 
-      OutputBanner();
-      CheckRecursiveOverflow();
-      HardwareManager.VerifyHardwareSoftwareCompatability();
+            OutputBanner();
+            CheckRecursiveOverflow();
+            HardwareManager.VerifyHardwareSoftwareCompatability();
 
-      // Load (or cause to be created) a settings file.
-      if (!CeresUserSettingsManager.DefaultConfigFileExists)
-      {
-        const string DEFAULT_CERES_JSON = @"
+            // Load (or cause to be created) a settings file.
+            if (!CeresUserSettingsManager.DefaultConfigFileExists)
+            {
+                const string DEFAULT_CERES_JSON = @"
 {
   ""SyzygyPath"": null,
   ""DirCeresNetworks"": ""."",
@@ -81,85 +165,85 @@ namespace Ceres
 }
 ";
 
-        Console.WriteLine();
-        ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"*** NOTE: Configuration file {CeresUserSettingsManager.DefaultCeresConfigFileName} not found in working directory.");
-        Console.WriteLine($"A new Ceres.json will be created with default settings:");
-        Console.WriteLine(DEFAULT_CERES_JSON);
+                Console.WriteLine();
+                ConsoleUtils.WriteLineColored(ConsoleColor.Red, $"*** NOTE: Configuration file {CeresUserSettingsManager.DefaultCeresConfigFileName} not found in working directory.");
+                Console.WriteLine($"A new Ceres.json will be created with default settings:");
+                Console.WriteLine(DEFAULT_CERES_JSON);
 
-        System.IO.File.WriteAllText(CeresUserSettingsManager.DefaultCeresConfigFileName, DEFAULT_CERES_JSON);
-        CeresUserSettingsManager.LoadFromDefaultFile();
-      }
+                System.IO.File.WriteAllText(CeresUserSettingsManager.DefaultCeresConfigFileName, DEFAULT_CERES_JSON);
+                CeresUserSettingsManager.LoadFromDefaultFile();
+            }
 
-      // Configure logging level
-      CeresEnvironment.MONITORING_EVENTS = enableLogging;
-      LogLevel logLevel = enableLogging ? LogLevel.Information : LogLevel.Critical;
-      LoggerTypes loggerTypes = LoggerTypes.WinDebugLogger | LoggerTypes.ConsoleLogger;
-      CeresEnvironment.Initialize(loggerTypes, logLevel);
+            // Configure logging level
+            CeresEnvironment.MONITORING_EVENTS = enableLogging;
+            LogLevel logLevel = enableLogging ? LogLevel.Information : LogLevel.Critical;
+            LoggerTypes loggerTypes = LoggerTypes.WinDebugLogger | LoggerTypes.ConsoleLogger;
+            CeresEnvironment.Initialize(loggerTypes, logLevel);
 
-      CeresEnvironment.MONITORING_METRICS = !CommandLineWorkerSpecification.IsWorker
-                                           && CeresUserSettingsManager.Settings.LaunchMonitor;
+            CeresEnvironment.MONITORING_METRICS = !CommandLineWorkerSpecification.IsWorker
+                                                 && CeresUserSettingsManager.Settings.LaunchMonitor;
 
-      //      if (CeresUserSettingsManager.Settings.DirLC0Networks != null)
-      //        NNWeightsFilesLC0.RegisterDirectory(CeresUserSettingsManager.Settings.DirLC0Networks);
+            //      if (CeresUserSettingsManager.Settings.DirLC0Networks != null)
+            //        NNWeightsFilesLC0.RegisterDirectory(CeresUserSettingsManager.Settings.DirLC0Networks);
 
-      // Perform low-level hardware initialization.
-      MCTSEngineInitialization.BaseInitialize(CeresEnvironment.MONITORING_METRICS, CeresUserSettingsManager.Settings.NUMANode);
+            // Perform low-level hardware initialization.
+            MCTSEngineInitialization.BaseInitialize(CeresEnvironment.MONITORING_METRICS, CeresUserSettingsManager.Settings.NUMANode);
 
-      Console.WriteLine();
+            Console.WriteLine();
 
-      //Features.BatchAnalysis.BatchAnalyzer.Test();      return;
+            //Features.BatchAnalysis.BatchAnalyzer.Test();      return;
 
-      if (args != null && args.Length > 0 && (args[0].ToUpper() == "CUSTOM" || args[0].StartsWith("WORKER")))
-      {
-        TournamentTest.Test();
-        //TournamentTest.TestSFLeela(0, true); return;
-        //        SuiteTest.RunSuiteTest(); return;
-      }
+            if (args != null && args.Length > 0 && (args[0].ToUpper() == "CUSTOM" || args[0].StartsWith("WORKER")))
+            {
+                TournamentTest.Test();
+                //TournamentTest.TestSFLeela(0, true); return;
+                //        SuiteTest.RunSuiteTest(); return;
+            }
 
 #if DEBUG
       CheckDebugAllowed();
 #endif
 
-      StringBuilder allArgs = new StringBuilder();
-      if (args != null)
-      {
-        for (int i = 0; i < args.Length; i++)
-        {
-          allArgs.Append(args[i] + " ");
+            StringBuilder allArgs = new StringBuilder();
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    allArgs.Append(args[i] + " ");
+                }
+            }
+
+            string allArgsString = allArgs.ToString();
+
+            DispatchCommands.ProcessCommand(allArgsString, searchModifier, selectModifier);
+
+
+            //  Win32.WriteCrashdumpFile(@"d:\temp\dump.dmp");
         }
-      }
-
-      string allArgsString = allArgs.ToString();
-
-      DispatchCommands.ProcessCommand(allArgsString, searchModifier, selectModifier);
 
 
-      //  Win32.WriteCrashdumpFile(@"d:\temp\dump.dmp");
-    }
+        /// <summary>
+        /// Because Ceres runs much more slowly under Debug mode (at least 30%)
+        /// this check verifies a debug bulid will not run unless explicitly
+        /// requested in the options file or environment variables.
+        /// </summary>
+        private static void CheckDebugAllowed()
+        {
+            if (!CeresUserSettingsManager.Settings.DebugAllowed
+              && Environment.GetEnvironmentVariable("CERES_DEBUG") == null)
+            {
+                const string MSG = "ERROR: Ceres was compiled in Debug mode and will only run\r\n"
+                                 + "if the the DebugAllowed option is set to true\r\n"
+                                 + "or the operating system environment variable CERES_DEBUG is defined.";
+                Console.WriteLine();
+                ConsoleUtils.WriteLineColored(ConsoleColor.Red, MSG);
+                System.Environment.Exit(-1);
+            }
+        }
 
 
-    /// <summary>
-    /// Because Ceres runs much more slowly under Debug mode (at least 30%)
-    /// this check verifies a debug bulid will not run unless explicitly
-    /// requested in the options file or environment variables.
-    /// </summary>
-    private static void CheckDebugAllowed()
-    {
-      if (!CeresUserSettingsManager.Settings.DebugAllowed
-        && Environment.GetEnvironmentVariable("CERES_DEBUG") == null)
-      {
-        const string MSG = "ERROR: Ceres was compiled in Debug mode and will only run\r\n"
-                         + "if the the DebugAllowed option is set to true\r\n"
-                         + "or the operating system environment variable CERES_DEBUG is defined.";
-        Console.WriteLine();
-        ConsoleUtils.WriteLineColored(ConsoleColor.Red, MSG);
-        System.Environment.Exit(-1);
-      }
-    }
-
-
-    const string BannerString =
-    @"
+        const string BannerString =
+        @"
 |=========================================================|
 | Ceres - A Monte Carlo Tree Search Chess Engine          |
 |                                                         |
@@ -171,70 +255,70 @@ namespace Ceres
 |=========================================================|
 ";
 
-    static void OutputBanner()
-    {
-      string dotnetVersion = RuntimeInformation.FrameworkDescription;
-      (int majorCUDAVersion, int minorCUDAVersion) = CUDADevice.GetCUDAVersion();
+        static void OutputBanner()
+        {
+            string dotnetVersion = RuntimeInformation.FrameworkDescription;
+            (int majorCUDAVersion, int minorCUDAVersion) = CUDADevice.GetCUDAVersion();
 
-      string cudaVersion = $"{majorCUDAVersion}.{minorCUDAVersion}";     
+            string cudaVersion = $"{majorCUDAVersion}.{minorCUDAVersion}";
 
-      string[] bannerLines = BannerString.Split(Environment.NewLine);
-      foreach (string line in bannerLines)
-      {
-        if (line.StartsWith("| Ceres"))
-        {
-          ConsoleColor defaultColor = Console.ForegroundColor;
-          Console.Write("|");
-          Console.ForegroundColor = ConsoleColor.Magenta;
-          Console.Write(line.Substring(1, line.Length - 2));
-          Console.ForegroundColor = defaultColor;
-          Console.WriteLine("|");
+            string[] bannerLines = BannerString.Split(Environment.NewLine);
+            foreach (string line in bannerLines)
+            {
+                if (line.StartsWith("| Ceres"))
+                {
+                    ConsoleColor defaultColor = Console.ForegroundColor;
+                    Console.Write("|");
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    Console.Write(line.Substring(1, line.Length - 2));
+                    Console.ForegroundColor = defaultColor;
+                    Console.WriteLine("|");
+                }
+
+                else if (line.StartsWith("|  Version"))
+                {
+                    string version = $"|  Version {CeresVersion.VersionString} [git:{GitInfo.LastCommitSHA}]";
+                    int spaceLeft = line.Length - version.Length;
+                    string empty = new string(' ', 3 + spaceLeft - 1);
+                    Console.WriteLine($"{version}{empty}|");
+                }
+                else if (line.StartsWith("|  Runtime"))
+                {
+                    string runtime = $"|  Runtime {dotnetVersion} and CUDA {cudaVersion}";
+                    int spaceLeft = line.Length - runtime.Length;
+                    string empty = new string(' ', 3 + spaceLeft - 1);
+                    Console.WriteLine($"{runtime}{empty}|");
+                }
+                else
+                {
+                    Console.WriteLine(line);
+                }
+            }
         }
 
-        else if (line.StartsWith("|  Version"))
+
+
+        /// <summary>
+        /// Shuts down process if too many Ceres executables are running.
+        /// This prevents situation where computer becomes unresponsive
+        /// due to infinite cascade of Ceres processes (due to a coding error).
+        /// </summary>
+        static void CheckRecursiveOverflow()
         {
-          string version = $"|  Version {CeresVersion.VersionString} [git:{GitInfo.LastCommitSHA}]";
-          int spaceLeft = line.Length - version.Length;
-          string empty = new string(' ', 3 + spaceLeft - 1);
-          Console.WriteLine($"{version}{empty}|");
+            int countCeres = 0;
+            foreach (Process p in Process.GetProcesses())
+            {
+                if (p.ProcessName.ToUpper().Contains("CERES"))
+                    countCeres++;
+            }
+
+            const int MAX_CERES_EXECUTABLE = 20;
+            if (countCeres > MAX_CERES_EXECUTABLE)
+            {
+                Console.WriteLine("Shutting down, possible infinite process recursion, too many Ceres executables running running");
+                System.Environment.Exit(3);
+            }
         }
-        else if (line.StartsWith("|  Runtime"))
-        {
-          string runtime = $"|  Runtime {dotnetVersion} and CUDA {cudaVersion}";
-          int spaceLeft = line.Length - runtime.Length;
-          string empty = new string(' ', 3 + spaceLeft - 1);
-          Console.WriteLine($"{runtime}{empty}|");
-        }
-        else
-        {
-          Console.WriteLine(line);
-        }
-      }
+
     }
-
-
-
-    /// <summary>
-    /// Shuts down process if too many Ceres executables are running.
-    /// This prevents situation where computer becomes unresponsive
-    /// due to infinite cascade of Ceres processes (due to a coding error).
-    /// </summary>
-    static void CheckRecursiveOverflow()
-    {
-      int countCeres = 0;
-      foreach (Process p in Process.GetProcesses())
-      {
-        if (p.ProcessName.ToUpper().Contains("CERES"))
-          countCeres++;
-      }
-
-      const int MAX_CERES_EXECUTABLE = 20;
-      if (countCeres > MAX_CERES_EXECUTABLE)
-      {
-        Console.WriteLine("Shutting down, possible infinite process recursion, too many Ceres executables running running");
-        System.Environment.Exit(3);
-      }
-    }
-
-  }
 }
