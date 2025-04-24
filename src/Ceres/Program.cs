@@ -14,6 +14,7 @@
 #region Using directives 
 
 using System;
+using System.IO;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -36,11 +37,31 @@ using Ceres.MCTS.Environment;
 using Ceres.MCTS.Params;
 using Chess.Ceres.PlayEvaluation;
 using Microsoft.Extensions.Logging;
+using System.Text.Json;
 
 #endregion
 
 namespace Ceres
 {
+
+    public class TournamentConfig
+    {
+        public int NumGamePairs { get; set; }
+        public string OpeningsFile { get; set; }
+        public int ConcurrentGames { get; set; }
+        public int[] GPUIndices { get; set; }
+        public string Device { get; set; }
+        public EngineConfig Engine1 { get; set; }
+        public EngineConfig Engine2 { get; set; }
+    }
+
+    public class EngineConfig
+    {
+        public string Path { get; set; }
+        public string NetworkPath { get; set; }
+        public int NodesPerMove { get; set; }
+    }
+
     public static class SPSATournamentRunner
     {
         // ========================================================================================================================
@@ -61,10 +82,31 @@ namespace Ceres
         const int NUM_CONCURRENT_GAMES = 4;
         // ========================================================================================================================
 
-        public static void RunTournament()
+        public static void RunTournament(string configPath = null)
         {
-            CeresUserSettingsManager.LoadFromFile(CERES_JSON_PATH);
+            if (configPath != null && !File.Exists(configPath))
+            {
+                TournamentConfig config = null;
+                try
+                {
+                    string jsonText = System.IO.File.ReadAllText(configPath);
+                    JsonSerializerOptions options = new JsonSerializerOptions { AllowTrailingCommas = true };
+                    config = JsonSerializer.Deserialize<TournamentConfig>(jsonText, options);
 
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error reading config file: {ex.Message}");
+                    return;
+                }
+            }
+            else
+            {
+                throw new ArgumentException($"No such file: {configPath}");
+            }
+
+
+                CeresUserSettingsManager.LoadFromFile(CERES_JSON_PATH);
             string CERES_NETWORK = CeresUserSettingsManager.Settings.DefaultNetworkSpecString;
             string TB_DIR = CeresUserSettingsManager.Settings.DirTablebases;
             SearchLimit CERES_TIME_CONTROL = SearchLimit.NodesPerMove(CERES_NODES_PER_MOVE);
