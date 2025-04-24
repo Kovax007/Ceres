@@ -15,9 +15,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Serialization.Formatters.Binary;
 using System.Text;
 
 #endregion
@@ -29,29 +31,31 @@ namespace Ceres.Base.Misc
   /// </summary>
   public static class ObjUtils
   {
-
-
-#if NOT
-    // NOTE: Abandon DeepClone due to reliance upon deprecated BinarySerialization.
-    //       Instead utilize AutoMapper where necessary to achieve same effect.
+    /// <summary>
+    /// Creates a deep clone using binary serialization (BinaryFormatter).
+    /// 
+    /// Note that Microsoft discourage use of this library due to security concerns.
+    /// Those concerns only apply if the source of the serialization data is coming from
+    /// an unknown/untrusted source (such as file on disk that might have been manipulated).
+    /// However the Ceres usage is all "in process" and free of any such concerns.
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    /// <param name="a"></param>
+    /// <returns></returns>
     public static T DeepClone<T>(T a)
-  {
-      return a;
-#if AVOID_BINARY_SERIALIZATION
-    throw new Exception("WARNING: Not yet working, causes strange errors on Linux in TournamentManager with AccessDenied on Console.Out");
-    return (T)ObjUtilsCopy.Copy(a);
-#else
+    {
       using (MemoryStream stream = new MemoryStream())
       {
+#pragma warning disable SYSLIB0011 // Type or member is obsolete
         BinaryFormatter formatter = new BinaryFormatter();
+#pragma warning restore SYSLIB0011 // Type or member is obsolete
         formatter.Serialize(stream, a);
         stream.Position = 0;
         return (T)formatter.Deserialize(stream);
       }
-#endif
     }
-#endif
 
+    
     /// <summary>
     /// Interprets the given byte array as an array of structures of type T and copies into a specified output buffer of type T.
     /// </summary>
