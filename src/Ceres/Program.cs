@@ -82,7 +82,7 @@ namespace Ceres
         {
             TournamentConfig config = null;
 
-            if (configPath != null && !File.Exists(configPath))
+            if (configPath != null && File.Exists(configPath))
             {
                 try
                 {
