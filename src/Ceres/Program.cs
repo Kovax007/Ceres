@@ -46,20 +46,16 @@ namespace Ceres
 
     public class TournamentConfig
     {
+        public string CeresJsonPath { get; set; }
+        public string CeresNetPath { get; set; }
         public int NumGamePairs { get; set; }
         public string OpeningsFile { get; set; }
         public int ConcurrentGames { get; set; }
         public int[] GPUIndices { get; set; }
         public string Device { get; set; }
-        public EngineConfig Engine1 { get; set; }
-        public EngineConfig Engine2 { get; set; }
-    }
-
-    public class EngineConfig
-    {
-        public string Path { get; set; }
-        public string NetworkPath { get; set; }
-        public int NodesPerMove { get; set; }
+        public int Engine1NodesPerMove { get; set; }
+        public int Engine2NodesPerMove { get; set; }
+        public string Engine2ExePath { get; set; }
     }
 
     public static class SPSATournamentRunner
@@ -84,9 +80,10 @@ namespace Ceres
 
         public static void RunTournament(string configPath = null)
         {
+            TournamentConfig config = null;
+
             if (configPath != null && !File.Exists(configPath))
             {
-                TournamentConfig config = null;
                 try
                 {
                     string jsonText = System.IO.File.ReadAllText(configPath);
@@ -105,8 +102,18 @@ namespace Ceres
                 throw new ArgumentException($"No such file: {configPath}");
             }
 
+            string CERES_JSON_PATH = config.CeresJsonPath;
+            string CERES_NET_PATH = config.CeresNetPath;
+            string CERES_DEVICE = config.Device;
+            int CERES_NODES_PER_MOVE = config.Engine1NodesPerMove;
+            string SF_EXE_PATH = config.Engine2ExePath;
+            int SF_NODES_PER_MOVE = config.Engine2NodesPerMove;
+            int[] CONCURRENT_GAME_GPU_IDS = config.GPUIndices;
+            int NUM_GAME_PAIRS = config.NumGamePairs;
+            string OPENING_FN = config.OpeningsFile;
+            int NUM_CONCURRENT_GAMES = config.ConcurrentGames;
 
-                CeresUserSettingsManager.LoadFromFile(CERES_JSON_PATH);
+            CeresUserSettingsManager.LoadFromFile(CERES_JSON_PATH);
             string CERES_NETWORK = CeresUserSettingsManager.Settings.DefaultNetworkSpecString;
             string TB_DIR = CeresUserSettingsManager.Settings.DirTablebases;
             SearchLimit CERES_TIME_CONTROL = SearchLimit.NodesPerMove(CERES_NODES_PER_MOVE);
@@ -169,8 +176,30 @@ namespace Ceres
         /// <param name="args"></param>
         static void Main(string[] args)
         {
-            SPSATournamentRunner.RunTournament();
-            //      LaunchUCI(args);
+            string configPath = null;
+
+            if (args.Length == 0)
+            {
+                LaunchUCI(args);
+                return;
+            }
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--config" && i + 1 < args.Length)
+                {
+                    configPath = args[i + 1];
+                    i++;
+                }
+                else
+                {
+                    Console.WriteLine($"Unknown argument: {args[i]}");
+                    Console.WriteLine("Usage: Ceres.exe --config <path to config file>");
+                    System.Environment.Exit(1);
+                }
+            }
+
+            SPSATournamentRunner.RunTournament(configPath);
         }
 
 
