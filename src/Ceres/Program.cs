@@ -163,8 +163,9 @@ namespace Ceres
             Console.WriteLine();
             Console.WriteLine($"Tournament completed in {stats.ElapsedTimeSecs,8:F2} seconds.");
 
-            PlayerStat ceresResults = results.Players[0];
-            PlayerStat sfResults = results.Players[1];
+            int indexCeres = results.Players[0].Name.ToUpper().Contains("CERES") ? 0 : 1;
+            PlayerStat ceresResults = results.Players[indexCeres];
+            PlayerStat sfResults = results.Players[indexCeres == 0 ? 1 : 0];
             float eloDiff = EloCalculator.EloDiff(ceresResults.PlayerWins, ceresResults.Draws, ceresResults.PlayerLosses);
             Console.WriteLine($"CERES W/D/L {ceresResults.PlayerWins} {ceresResults.Draws} {ceresResults.PlayerLosses}");
             Console.WriteLine("ELO_DIFFERENCE " + eloDiff);
