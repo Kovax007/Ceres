@@ -148,6 +148,10 @@ namespace Ceres
             tournDef.NumGamePairs = NUM_GAME_PAIRS;
             tournDef.OpeningsFileName = OPENING_FN;
             tournDef.ShowGameMoves = false;
+            tournDef.AdjudicateMinNumMoves = int.MaxValue;
+            tournDef.AdjudicateDrawThresholdNumMoves = int.MaxValue;
+            tournDef.AdjudicateDrawThresholdCentipawns = int.MaxValue;
+            tournDef.UseTablebasesForAdjudication = false;
 
             // Run the tournament
             TimingStats stats = new TimingStats();
