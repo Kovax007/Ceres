@@ -153,6 +153,7 @@ namespace Ceres
             tournDef.AdjudicateDrawThresholdNumMoves = int.MaxValue;
             tournDef.AdjudicateDrawThresholdCentipawns = int.MaxValue;
             tournDef.UseTablebasesForAdjudication = false;
+            tournDef.RandomizeOpenings = true;
 
             // Run the tournament
             TimingStats stats = new TimingStats();
