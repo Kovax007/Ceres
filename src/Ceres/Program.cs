@@ -131,6 +131,7 @@ namespace Ceres
             };
             searchParams.Execution.FlowDirectOverlapped = false;
             searchParams.Execution.FlowDualSelectors = false;
+            searchParams.Execution.NodeAnnotationCacheSize = 20_000;
 
             // Define Ceres engine (in process) with associated neural network and GPU and parameter customizations
             NNEvaluatorDef ceresNNDef = NNEvaluatorDefFactory.FromSpecification(CERES_NET_PATH, CERES_DEVICE);
