@@ -13,6 +13,7 @@
 
 #region Using directives
 
+using System.Threading.Tasks;
 
 #endregion
 
@@ -100,7 +101,7 @@ namespace Ceres.Chess.NNEvaluators
       Evaluators = evaluators;
 
       // until possibly prove false below
-      isWDL = true; 
+      isWDL = true;
       hasM = true;
       hasUncertaintyV = true;
       hasUncertaintyP = true;
@@ -136,6 +137,16 @@ namespace Ceres.Chess.NNEvaluators
         return min;
       }
     }
+
+
+    /// <summary>
+    /// Performs any initialization to prepare evaluator for delay-free execution.
+    /// </summary>
+    public override void Warmup()
+    {
+      Parallel.ForEach(Evaluators, evaluator => evaluator.Warmup());
+    }
+
 
     protected override void DoShutdown()
     {

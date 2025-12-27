@@ -27,7 +27,7 @@ namespace Ceres.Chess.NetEvaluation.Batch
   /// Interface defining common operations supported by 
   /// batches of neural network evaluations of positions.
   /// </summary>
-  public interface IPositionEvaluationBatch : IEnumerable<NNPositionEvaluationBatchMember>
+  public interface IPositionEvaluationBatch : IEnumerable<NNPositionEvaluationBatchMember>, IDisposable
   {
     int NumPos { get; }
     bool IsWDL { get; }
@@ -60,15 +60,15 @@ namespace Ceres.Chess.NetEvaluation.Batch
     (Memory<CompressedPolicyVector> policies, int index) GetPolicy(int index);
     (Memory<CompressedActionVector> actions, int index) GetAction(int index);
 
-  
+
     public NNEvaluatorResultActivations GetActivations(int index);
 
     public float GetV(int index) => GetWinP(index) - GetLossP(index);
 
     public ref readonly CompressedPolicyVector PolicyRef(int index)
     {
-      (Memory<CompressedPolicyVector> policies, _) = GetPolicy(index);
-      return ref policies.Span[index];
+      (Memory<CompressedPolicyVector> policies, int subIndex) = GetPolicy(index);
+      return ref policies.Span[subIndex];
     }
   }
 }

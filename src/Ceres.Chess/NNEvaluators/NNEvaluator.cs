@@ -148,6 +148,11 @@ namespace Ceres.Chess.NNEvaluators
     /// </summary>
     public Action<object, bool> RetrainFunc;
 
+    /// <summary>
+    /// If true, use rented buffers for policy output to reduce allocations.
+    /// </summary>
+    public bool UseRentedPolicyBuffer;
+
     internal object PersistentID { set; get; }
     public bool IsPersistent => PersistentID != null;
     public int NumInstanceReferences { internal set; get; }
@@ -463,6 +468,15 @@ namespace Ceres.Chess.NNEvaluators
     #endregion
 
     #region Helper methods
+
+    /// <summary>
+    /// Performs any initialization to prepare evaluator for delay-free execution.
+    /// </summary>
+    public virtual void Warmup()
+    {
+
+    }
+
 
     /// <summary>
     /// Helper method to evaluates a single position.

@@ -19,13 +19,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading.Tasks;
 
-using Ceres.Base.DataTypes;
 using Ceres.Base.Threading;
 using Ceres.Chess.EncodedPositions;
 using Ceres.Chess.EncodedPositions.Basic;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
-using Ceres.Chess.NNEvaluators;
 
 #endregion
 
@@ -39,7 +37,7 @@ namespace Ceres.Chess.LC0.Batches
     /// <summary>
     // Bitmaps for the multiple board planes.
     /// </summary>
-    Memory<ulong> PosPlaneBitmaps { get;  }
+    Memory<ulong> PosPlaneBitmaps { get; }
 
     /// <summary>
     /// One byte for each bitmap with corresopnding value.
@@ -72,7 +70,7 @@ namespace Ceres.Chess.LC0.Batches
     /// <summary>
     /// Optionally the arrays of "plies since last move on square."
     /// </summary>
-    Memory<byte> LastMovePlies{ get; set; }
+    Memory<byte> LastMovePlies { get; set; }
 
     /// <summary>
     /// Optionally the set of moves from this position
@@ -83,7 +81,7 @@ namespace Ceres.Chess.LC0.Batches
     /// If originated from EncodedPositionWithHistory then
     /// this field optionally holds the origin data array.
     /// </summary>
-    Memory<EncodedPositionWithHistory> PositionsBuffer 
+    Memory<EncodedPositionWithHistory> PositionsBuffer
     {
       get
       {
@@ -106,14 +104,15 @@ namespace Ceres.Chess.LC0.Batches
 
     bool PositionsUseSecondaryEvaluator { get; set; }
 
+    IEncodedPositionBatchFlat Parent => default;
+
     #region Implmentation
 
-    Half[] ValuesFlatFromPlanes(Half[] preallocatedBuffer, bool nhwc, bool scale50MoveCounter);
+    void ConvertValuesToFlatFromPlanes(Memory<Half> destinationBuffer, bool nhwc, bool scale50MoveCounter);
 
-    
     public IEncodedPositionBatchFlat GetSubBatchSlice(int startIndex, int count)
     {
-      return new EncodedPositionBatchFlatSlice(this, startIndex, count);
+      return new EncodedPositionBatchFlatSlice(Parent, startIndex, count);
     }
 
 

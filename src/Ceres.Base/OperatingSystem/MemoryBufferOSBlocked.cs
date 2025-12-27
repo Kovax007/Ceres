@@ -76,7 +76,7 @@ namespace Ceres.Base.OperatingSystem
       this.itemsPerBlock = itemsPerBlock;
       this.bufferExtraItems = bufferExtraItems;
 
-      int maxItemsWithBuffer = (int)maxItems + bufferExtraItems;
+      long maxItemsWithBuffer = maxItems + bufferExtraItems;
       entries = new MemoryBufferOS<T>(maxItemsWithBuffer, tryEnableLargePages, sharedMemName,
                                      useExistingSharedMem, useIncrementalAlloc);
     }
@@ -96,26 +96,26 @@ namespace Ceres.Base.OperatingSystem
     /// <summary>
     /// Gets the total number of items allocated (by block).
     /// </summary>
-    public long NumAllocatedItems => nextFreeBlockIndex * itemsPerBlock;
+    public long NumAllocatedItems => (long)nextFreeBlockIndex * itemsPerBlock;
 
     /// <summary>
     /// Copies entries from one block area to another.
     /// </summary>
     public void CopyEntries(long sourceBlockIndex, long destinationBlockIndex, int numItems)
-        => entries.CopyEntries(sourceBlockIndex * (long)itemsPerBlock,
-                              destinationBlockIndex * (long)itemsPerBlock,
+        => entries.CopyEntries(sourceBlockIndex * itemsPerBlock,
+                              destinationBlockIndex * itemsPerBlock,
                               numItems);
 
     /// <summary>
     /// Ensures that the buffer has allocated space for at least the specified number of items.
     /// </summary>
-    public void InsureAllocated(long numItems) => entries.InsureAllocated(numItems);
+    public void InsureAllocated(long numItems) { lock (lockObj) entries.InsureAllocated(numItems); }
 
 
     /// <summary>
     /// Resizes the underlying memory to exactly the number of currently used items.
     /// </summary>
-    public void ResizeToCurrent() => ResizeToNumItems(nextFreeBlockIndex * itemsPerBlock);
+    public void ResizeToCurrent() => ResizeToNumItems((long)nextFreeBlockIndex * itemsPerBlock);
 
 
     /// <summary>
@@ -157,11 +157,16 @@ namespace Ceres.Base.OperatingSystem
       // Compute the new required allocation including extra padding.
       long newNumEntriesWithPadding = newNextFreeBlockIndex * itemsPerBlock + bufferExtraItems;
 
-      if (entries.NumItemsAllocated <= newNumEntriesWithPadding)
+      // Check if we need to allocate (optimistic check without lock)
+      if (entries.NumItemsAllocated < newNumEntriesWithPadding)
       {
         lock (lockObj)
         {
-          entries.InsureAllocated(newNumEntriesWithPadding);
+          // Re-check inside lock - another thread might have already allocated
+          if (entries.NumItemsAllocated < newNumEntriesWithPadding)
+          {
+            entries.InsureAllocated(newNumEntriesWithPadding);
+          }
         }
       }
 
@@ -190,7 +195,7 @@ namespace Ceres.Base.OperatingSystem
       {
         return Span<T>.Empty;
       }
-      return entries.Slice(blockIndex * itemsPerBlock, count);
+      return entries.Slice((blockIndex) * itemsPerBlock, count);
     }
 
 
@@ -204,6 +209,6 @@ namespace Ceres.Base.OperatingSystem
 
 
     public override string ToString() =>
-        $"<Buffer NumAllocatedItems={NumAllocatedItems} UsedItems~{nextFreeBlockIndex * itemsPerBlock}>";
+        $"<MemoryBufferOSBlocked NumAllocatedItems={NumAllocatedItems} UsedItems~{nextFreeBlockIndex * itemsPerBlock}>";
   }
 }

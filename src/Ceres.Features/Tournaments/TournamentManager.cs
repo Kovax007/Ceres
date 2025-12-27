@@ -101,6 +101,7 @@ namespace Ceres.Features.Tournaments
     readonly object lockObj = new();
 
     RandomDrawWithoutReplacement<int> openingsDraws = null;
+    int[] shuffledOpeningIndices = null;
 
 
     /// <summary>
@@ -116,32 +117,60 @@ namespace Ceres.Features.Tournaments
 
       lock (lockObj)
       {
-        if (Def.RandomizeOpenings)
+        switch (Def.OpeningRandomization)
         {
-          if (openingsDraws == null)
-          {
-            if (numOpeningsAvailable <= maxOpenings)
+          case OpeningRandomizationEnum.None:
+            return numGamePairsLaunched++;
+
+          case OpeningRandomizationEnum.ShuffleDeterministic:
+            if (shuffledOpeningIndices == null)
             {
-              throw new Exception($"Insufficient openings in opening book to play {maxOpenings} games.");
+              if (numOpeningsAvailable < maxOpenings)
+              {
+                throw new Exception($"Insufficient openings in opening book to play {maxOpenings} games.");
+              }
+
+              shuffledOpeningIndices = new int[numOpeningsAvailable];
+              for (int i = 0; i < numOpeningsAvailable; i++)
+              {
+                shuffledOpeningIndices[i] = i;
+              }
+
+              Random rng = new Random(0); // Use fixed seed for deterministic shuffle
+              int n = shuffledOpeningIndices.Length;
+              while (n > 1)
+              {
+                n--;
+                int k = rng.Next(n + 1);
+                (shuffledOpeningIndices[k], shuffledOpeningIndices[n]) = (shuffledOpeningIndices[n], shuffledOpeningIndices[k]);
+              }
+            }
+            return shuffledOpeningIndices[numGamePairsLaunched++];
+
+          case OpeningRandomizationEnum.Randomize:
+            if (openingsDraws == null)
+            {
+              if (numOpeningsAvailable < maxOpenings)
+              {
+                throw new Exception($"Insufficient openings in opening book to play {maxOpenings} games.");
+              }
+
+              // Create an array of indices of all possible openings.
+              int[] numbers = new int[numOpeningsAvailable];
+              for (int i = 0; i < numOpeningsAvailable; i++)
+              {
+                numbers[i] = i;
+              }
+
+              // Create a random chooser on top of that list.
+              openingsDraws = new RandomDrawWithoutReplacement<int>(numbers);
             }
 
-            // Create an array of indices of all possible openings.
-            int[] numbers = new int[numOpeningsAvailable];
-            for (int i = 0; i < numOpeningsAvailable; i++)
-            {
-              numbers[i] = i;
-            }
+            numGamePairsLaunched++;
+            return openingsDraws.TryDraw(out int openingIndex) ? openingIndex : -1;
 
-            // Create a random chooser on top of that list.
-            openingsDraws = new RandomDrawWithoutReplacement<int>(numbers);
-          }
-
-          numGamePairsLaunched++;
-          return openingsDraws.TryDraw(out int openingIndex) ? openingIndex : -1;
-        }
-        else
-        {
-          return numGamePairsLaunched++;
+          default:
+            throw new Exception($"Unknown RandomizeOpenings mode: {Def.OpeningRandomization}");
         }
       }
     }
@@ -221,7 +250,7 @@ namespace Ceres.Features.Tournaments
     {
       shutdownComplete.Reset();
       Def.ShouldShutDown = false;
-        
+
       if (Def.Engines.Length > 0)
       {
         foreach (EnginePlayerDef engine in Def.Engines)
@@ -256,11 +285,11 @@ namespace Ceres.Features.Tournaments
         // Install Ctrl-C handler to allow ad hoc clean termination of tournament (with stats).
         ConsoleCancelEventHandler ctrlCHandler = new ConsoleCancelEventHandler((object sender,
           ConsoleCancelEventArgs args) =>
-          {
-            Console.WriteLine("Tournament pending shutdown....");
-            Def.parentDef.ShouldShutDown = true;
-            shutdownComplete.WaitOne();
-          }); ;
+        {
+          Console.WriteLine("Tournament pending shutdown....");
+          Def.parentDef.ShouldShutDown = true;
+          shutdownComplete.WaitOne();
+        }); ;
         Console.CancelKeyPress += ctrlCHandler;
       }
 
@@ -280,12 +309,14 @@ namespace Ceres.Features.Tournaments
       // If we are a worker process then run only a single game thread.
       int numConcurrent = queueManager != null && !queueManager.IsCoordinator ? 1 : NumConcurrent;
 
+      // First loop instantiats/warms up all the engines
+      // (without concurrency due to potential CUDA synchronization conflicts).
       for (int i = 0; i < numConcurrent; i++)
       {
         TournamentDef tournamentDefClone = Def.Clone();
 
         // Make sure the threads will use either different or pooled evaluators
-        if (NumConcurrent > 1 || DeviceIDs != null)
+        if (NumConcurrent > 1)
         {
           int deviceID = DeviceIDs == null ? i : DeviceIDs[i % DeviceIDs.Length];
           TrySetRelativeDeviceIDIfNotPooled(tournamentDefClone, deviceID);
@@ -297,6 +328,12 @@ namespace Ceres.Features.Tournaments
 
         TournamentGameThread gameTest = new TournamentGameThread(tournamentDefClone, parentTest);
         gameThreads.Add(gameTest);
+      }
+
+      // Second loop creates and launches tasks for each.
+      for (int i = 0; i < numConcurrent; i++)
+      {
+        TournamentGameThread gameTest = gameThreads[i];
 
         Action action;
         if (QueueManager == null)

@@ -69,6 +69,8 @@ namespace Ceres.Features.Tournaments
       {
         def.Engines[i].EngineDef.ProcessorGroupID = def.ProcessGroupIndex;
       }
+
+      Run = new TournamentGameRunner(Def);
     }
 
 
@@ -96,7 +98,10 @@ namespace Ceres.Features.Tournaments
     /// <returns></returns>
     int GetNextOpeningIndexForLocalThread(int maxOpenings)
     {
-      if (Def.RandomizeOpenings) throw new NotImplementedException();
+      if (Def.OpeningRandomization != OpeningRandomizationEnum.None)
+      {
+        throw new NotImplementedException();
+      }
 
       lock (lockObj)
       {
@@ -112,8 +117,6 @@ namespace Ceres.Features.Tournaments
     public void RunGameTests(int runnerIndex, Func<int, int> getGamePairToProcess,
                              Action<TournamentGameInfo, TournamentGameInfo> doneGamePairCallback = null)
     {
-      Run = new TournamentGameRunner(Def);
-
       // Create a file name that will be common to all threads in tournament.
       string pgnFileName;
       if (Run.Engines.Length > 2)
@@ -442,13 +445,16 @@ namespace Ceres.Features.Tournaments
         Def.Logger.Write($"{eloAvg,4:0} {eloSD,4:0} {100.0f * los,5:0}  ");
         Def.Logger.Write($"{gNumber,5} {DateTime.Now.ToString().Split(" ")[1],10}  {gameSequenceNum,4:F0}  {openingIndex,4:F0} {openingPlayedBothWaysStr} ");
 
+        // TODO: these averages are inexact, one player may have 1 ply more than thisResult.PlyCount/2
+        int avgNodesPerMovePlayer1 = (int)MathF.Round(thisResult.TotalNodesEngine1 / (thisResult.PlyCount / 2), 0);
+        int avgNodesPerMovePlayer2 = (int)MathF.Round(thisResult.TotalNodesEngine2 / (thisResult.PlyCount / 2), 0);
         if (engine2White)
         {
           Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2} ");
           Def.Logger.Write($"{thisResult.TotalTimeEngine1,8:F2}{player1ForfeitChar}{thisResult.RemainingTimeEngine1,7:F2}  ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2}  {thisResult.TimeAggressivenessRatio(true),5:F2} ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine1,8:F2}{player1ForfeitChar}{thisResult.RemainingTimeEngine1,7:F2}  {thisResult.TimeAggressivenessRatio(false),5:F2}  ");
-          Def.Logger.Write($"{thisResult.TotalNodesEngine2,16:N0} {thisResult.TotalNodesEngine1,16:N0}   ");
+          Def.Logger.Write($"{avgNodesPerMovePlayer2,12:N0} {avgNodesPerMovePlayer1,12:N0}   ");
         }
         else
         {
@@ -456,7 +462,8 @@ namespace Ceres.Features.Tournaments
           Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2}  ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine1,8:F2}{player1ForfeitChar}{thisResult.RemainingTimeEngine1,7:F2}  {thisResult.TimeAggressivenessRatio(true),5:F2} ");
           // Def.Logger.Write($"{thisResult.TotalTimeEngine2,8:F2}{player2ForfeitChar}{thisResult.RemainingTimeEngine2,7:F2}  {thisResult.TimeAggressivenessRatio(false),5:F2}  ");
-          Def.Logger.Write($"{thisResult.TotalNodesEngine1,16:N0} {thisResult.TotalNodesEngine2,16:N0}   ");
+
+          Def.Logger.Write($"{avgNodesPerMovePlayer1,12:N0} {avgNodesPerMovePlayer2,12:N0}   ");
         }
 
 
@@ -531,13 +538,13 @@ namespace Ceres.Features.Tournaments
 
       if (Def.CheckPlayer2Def != null)
       {
-        Def.Logger.WriteLine("  Player1    Player2   ELO   +/-  LOS   GAME#     TIME    TH#   OP#      TIME1    REM1    TIME2    REM2        NODES 2       PLY  DIF    RES  R   ENDCP     W   D   L   FEN");
-        Def.Logger.WriteLine(" ---------  ---------  ---   ---  ---   -----  --------   ---   ---     ------  ------   ------  ------   --------------   ----  ---    ---  -   -----     -   -   -   ---------------------------------------------------");
+        Def.Logger.WriteLine("  Player1    Player2   ELO   +/-  LOS   GAME#     TIME    TH#   OP#      TIME1    REM1    TIME2    REM2   AVG NODE2     PLY  DIF    RES  R   ENDCP     W   D   L   FEN");
+        Def.Logger.WriteLine(" ---------  ---------  ---   ---  ---   -----  --------   ---   ---     ------  ------   ------  ------   ----------   ----  ---    ---  -   -----     -   -   -   ---------------------------------------------------");
       }
       else
       {
-        Def.Logger.WriteLine("  Player1    Player2   ELO   +/-  LOS   GAME#     TIME    TH#   OP#      TIME1    REM1    TIME2    REM2       NODES 1           NODES 2       PLY    RES  R   ENDCP     W   D   L   FEN");
-        Def.Logger.WriteLine(" ---------  ---------  ---   ---  ---   -----  --------   ---   ---     ------  ------   ------  ------    --------------   --------------   ----    ---  -   -----     -   -   -   ---------------------------------------------------");
+        Def.Logger.WriteLine("  Player1    Player2   ELO   +/-  LOS   GAME#     TIME    TH#   OP#      TIME1    REM1    TIME2    REM2    AVG NODE1     AVG NODE2    PLY   RES   R   ENDCP     W   D   L   FEN");
+        Def.Logger.WriteLine(" ---------  ---------  ---   ---  ---   -----  --------   ---   ---     ------  ------   ------  ------    ----------   ----------   ----   ---   -   -----     -   -   -   ---------------------------------------------------");
       }
       havePrintedHeaders = true;
     }

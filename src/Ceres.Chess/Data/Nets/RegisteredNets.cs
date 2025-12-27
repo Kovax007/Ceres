@@ -49,6 +49,8 @@ namespace Ceres.Chess.Data.Nets
 
         { "T60", SimpleLC0Net("606512") },
         { "T78", SimpleLC0Net("784984") },
+        { "T79", SimpleLC0Net("791556") }, // included in LCZero package
+        { "T79_FP16_TRT", ONNXNet16LC0("791556.pb.gz_fp16.onnx#16", true) },
         { "T80", SimpleLC0Net("809942") }, // 801307
         { "T81", SimpleLC0Net("811971") }, //Training restarted after surgery after 811971
         { "T81_FP16_TRT", ONNXNet16LC0("weights_run1_811971.pb.gz_fp16.onnx#16", true) },
@@ -72,8 +74,13 @@ namespace Ceres.Chess.Data.Nets
         {"BT4_FP16_TRT", ONNXNet16LC0("BT4-1024x15x32h-swa-6147500.pb.gz_fp16", true)},
 
         // for BT5, TRT version fails in engine building!
-        {"BT5_FP16", ONNXNet16LC0("BT5-1024x15x32h-rpe-3700000-fixed-fp16.onnx", false)},
-
+        {"BT5_BIG_FP16", ONNXNet16LC0("BT5-1024x15x32h-rpe-3700000-fixed-fp16.onnx", true)},
+        {"BT5_SMALL_FP16", ONNXNet16LC0("BT5-1024x15x32h-rpe-swa-3700000.onnx", true)},
+        
+        //{"BT5_FP16", ONNXNet16LC0("BT5-1024x15x32h-rpe-swa-3700000.pb.gz.fp16.onnx", false)},
+        
+        {"BT5_FP16_QUANT", ONNXNet16LC0("BT5-int8.onnx", false)},
+        
         // From: https://storage.lczero.org/files/networks-contrib/big-transformers/
         {"BT4-1740_FP16_TRT", ONNXNet16LC0("BT4-1740.pb.gz_fp16", true) },
         {"BT4_SPSA_FP16_TRT", ONNXNet32LC0("bt4-newtune-3rdbranch-1130.pb.gz", true)},
@@ -173,6 +180,7 @@ namespace Ceres.Chess.Data.Nets
 
     static RegisteredNetInfo ONNXNet16LC0(string netID, bool tensorRT = false) =>  new (netID, tensorRT ? NNEvaluatorType.ONNXViaTRT : NNEvaluatorType.ONNXViaORT, MakeDesc(netID, true, tensorRT) + "#16");
     static RegisteredNetInfo ONNXNet32LC0(string netID, bool tensorRT = false) => new (netID, tensorRT ? NNEvaluatorType.ONNXViaTRT : NNEvaluatorType.ONNXViaORT, MakeDesc(netID, true, tensorRT) + "#32");
+
     static RegisteredNetInfo ONNXNet16Ceres(string netID, bool tensorRT = false) => new(netID, tensorRT ? NNEvaluatorType.Ceres : NNEvaluatorType.Ceres, MakeDesc(netID, false, tensorRT) + "#16");
     static RegisteredNetInfo ONNXNet32Ceres(string netID) => new(netID, NNEvaluatorType.Ceres, MakeDesc(netID, false, false) + "#32");
 

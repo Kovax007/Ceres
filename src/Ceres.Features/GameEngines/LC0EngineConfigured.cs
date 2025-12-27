@@ -64,12 +64,13 @@ namespace Ceres.Features.GameEngines
                                                  INNWeightsFileInfo network,
                                                  bool emulateCeresOptions,
                                                  bool verboseOutput,
-                                                 string overrideEXE = null,
-                                                 bool forceDisableSmartPruning = false,
-                                                 bool alwaysFillHistory = false,
-                                                 int? overrideBatchSize = null,
-                                                 int? overrideCacheSize = null,
-                                                 string? overrideBackendString = null)
+                                                 string overrideEXE,
+                                                 bool forceDisableSmartPruning,
+                                                 bool alwaysFillHistory,
+                                                 int? overrideBatchSize,
+                                                 int? overrideCacheSize,
+                                                 string? overrideBackendString,
+                                                 bool useCUDAFP16)
     {
       if (paramsSearch == null)
       {
@@ -88,7 +89,7 @@ namespace Ceres.Features.GameEngines
       // otherwise we use roundrobin and best is 1 + number of GPUS
       // Note that with increasing threads Leela plays significantly non-deterministically and somewhat worse
       int NUM_THREADS = (evaluatorDef == null || evaluatorDef.EqualFractions) ? 2 : evaluatorDef.Devices.Length + 1;
-      
+
       string lzOptions = "--nodes-as-playouts "; // essential to get same behavior as Ceres with go nodes command 
 
 #if NOT
@@ -108,7 +109,7 @@ namespace Ceres.Features.GameEngines
       int MOVE_OVERHEAD = (int)(new ParamsSearch().MoveOverheadSeconds * 1000);
       lzOptions += $"--move-overhead={MOVE_OVERHEAD} ";
 
-      if (alwaysFillHistory) lzOptions += $" --history-fill=always "; 
+      if (alwaysFillHistory) lzOptions += $" --history-fill=always ";
 
       if (overrideBatchSize == null && OVERRIDE_LC0_BATCH_SIZE.HasValue)
       {
@@ -124,7 +125,7 @@ namespace Ceres.Features.GameEngines
       const float LC0_CACHE_FRAC_MEM = 0.05f; // sufficiently small to allow multiple concurrent engines
       const int BYTES_PER_CACHE_ITEM = 250;
       long memorySize = Math.Min(HardwareManager.MemorySize, 196_000_000_000);
-      int DEFAULT_CACHE_SIZE= (int)Math.Max(2_000_000, (memorySize  * LC0_CACHE_FRAC_MEM) / BYTES_PER_CACHE_ITEM);
+      int DEFAULT_CACHE_SIZE = (int)Math.Max(2_000_000, (memorySize * LC0_CACHE_FRAC_MEM) / BYTES_PER_CACHE_ITEM);
       int cacheSize = overrideCacheSize ?? DEFAULT_CACHE_SIZE;
       lzOptions += $"--nncache={cacheSize} ";
 
@@ -170,9 +171,9 @@ namespace Ceres.Features.GameEngines
         // we use a large nncache and number of threads appropriate for the number of GPUs in use
         //        lzOptions = $@"-w {weightsDir}\{netSourceFile} --minibatch-size={minibatchSize} -t {paramsNN.NNEVAL_NUM_GPUS + 1} " +
         lzOptions += $@"-w {netSourceFile} -t {NUM_THREADS} " +
-//                    $"--score-type=win_percentage " +
+                     //                    $"--score-type=win_percentage " +
                      // like TCEC 10, only 5% benefit     $"--max-prefetch=160 --max-collision-events=917 " +
-                     overrideBackendString ?? BackendArgumentsString(evaluatorDef);
+                     (overrideBackendString ?? BackendArgumentsString(evaluatorDef, useCUDAFP16));
 
       }
 
@@ -231,15 +232,21 @@ namespace Ceres.Features.GameEngines
                                          int? overrideCacheSize = null,
                                          string? overrideBackendString = null)
     {
-      (string EXE, string lzOptions) = GetLC0EngineOptions(paramsSearch, paramsSelect, evaluatorDef, network, 
-                                                           emulateCeresOptions, verboseOutput, overrideEXE, 
-                                                           forceDisableSmartPruning, alwaysFillHistory, 
-                                                           overrideBatchSize, overrideCacheSize, overrideBackendString);
+      // TODO: this is a hack, presence of "-cuda" in executable name triggers use of lc0's cuda-fp16 backend
+      bool useCUDAFP16 = overrideEXE != null && overrideEXE.ToLower().Contains("-cuda");
+      (string EXE, string lzOptions) = GetLC0EngineOptions(paramsSearch, paramsSelect, evaluatorDef, network,
+                                                           emulateCeresOptions, verboseOutput, overrideEXE,
+                                                           forceDisableSmartPruning, alwaysFillHistory,
+                                                           overrideBatchSize, overrideCacheSize, overrideBackendString,
+                                                           useCUDAFP16);
       if (extraCommandLineArgs != null)
       {
-        lzOptions += " " + extraCommandLineArgs;
+        // Put the extraCommandLineArgs at the beginning
+        // so that in case a command (e.g. "dag-preview")
+        // is specified it appears as the first argument as required.
+        lzOptions = " " + extraCommandLineArgs + " " + lzOptions;
       }
-      return new LC0Engine(EXE, processorGroupID,  lzOptions, resetStateAndCachesBeforeMoves);
+      return new LC0Engine(EXE, processorGroupID, lzOptions, resetStateAndCachesBeforeMoves);
     }
 
 
@@ -249,7 +256,7 @@ namespace Ceres.Features.GameEngines
     /// </summary>
     /// <param name="evaluatorDef"></param>
     /// <returns></returns>
-    static string BackendArgumentsString(NNEvaluatorDef evaluatorDef)
+    static string BackendArgumentsString(NNEvaluatorDef evaluatorDef, bool useCUDAFP16)
     {
       if (evaluatorDef == null)
       {
@@ -264,7 +271,8 @@ namespace Ceres.Features.GameEngines
           precision = NNEvaluatorPrecision.FP16;
         }
 
-      return LC0EngineArgs.BackendArgumentsString(evaluatorDef.DeviceIndices, precision, evaluatorDef.EqualFractions);
+        bool isONNX = evaluatorDef.Nets[0].Net.NetworkID.ToLower().EndsWith(".onnx");
+        return LC0EngineArgs.BackendArgumentsString(evaluatorDef.DeviceIndices, precision, evaluatorDef.EqualFractions, useCUDAFP16);
       }
     }
 

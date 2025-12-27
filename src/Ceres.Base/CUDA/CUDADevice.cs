@@ -42,7 +42,26 @@ namespace Ceres.Base.CUDA
     /// <summary>
     /// Associated (default) context for this device.
     /// </summary>
-    public CudaContext Context;
+    public PrimaryContext Context;
+
+    #region Device information
+
+    /// <summary>
+    /// CUDA capability major version of this device.
+    /// </summary>
+    public int CUDACapabilityMajor => Context.GetDeviceInfo().ComputeCapability.Major;
+
+    /// <summary>
+    /// CUDA capability minor version of this device.
+    /// </summary>
+    public int CUDACapabilityMinor => Context.GetDeviceInfo().ComputeCapability.Minor;
+
+    /// <summary>
+    /// Number of streaming multiprocessors on this device.
+    /// </summary>
+    public int NumStreamingMultiprocessors => Context.GetDeviceInfo().MultiProcessorCount;
+
+    #endregion
 
 
     /// <summary>
@@ -83,7 +102,7 @@ namespace Ceres.Base.CUDA
       lock (InitializingCUDAContextLockObj)
       {
         GPUID = gpuID;
-        Context = new CudaContext(gpuID, false);
+        Context = new PrimaryContext(gpuID);
 
         CudaDeviceProperties deviceProperties = Context.GetDeviceInfo();
         driverVersionMajor = deviceProperties.DriverVersion.Major;

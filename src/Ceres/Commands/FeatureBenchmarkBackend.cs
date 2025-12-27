@@ -55,7 +55,7 @@ namespace Ceres.Commands
 
       NetworkSpec = keys.GetValueOrDefaultMapped("Network", CeresUserSettingsManager.Settings.DefaultNetworkSpecString, true, spec => new NNNetSpecificationString(spec));
       DeviceSpec = keys.GetValueOrDefaultMapped("Device", CeresUserSettingsManager.Settings.DefaultDeviceSpecString, true, spec => new NNDevicesSpecificationString(spec));
-      batchSpec = keys.GetValueOrDefaultMapped("BatchSpec", null, false, spec=>spec);
+      batchSpec = keys.GetValueOrDefaultMapped("BatchSpec", null, false, spec => spec);
     }
 
 
@@ -64,40 +64,41 @@ namespace Ceres.Commands
 
     public void ExecuteComparisonTest()
     {
-      if(batchSpec == null)
+      if (batchSpec == null)
       {
         throw new Exception("BatchSpec must be specified");
       }
 
-      if(DeviceSpec.ComboType != NNEvaluatorDeviceComboType.Single)
+      if (DeviceSpec.ComboType != NNEvaluatorDeviceComboType.Single)
       {
-//        throw new Exception("BACKENDBENCH_COMPARE only supported with single devices");
+        //        throw new Exception("BACKENDBENCH_COMPARE only supported with single devices");
       }
 
       //NNDevicesSpecificationString deviceSpec = new NNDevicesSpecificationString(modifiedDeviceString);
       NNEvaluatorDef evaluatorDef = new NNEvaluatorDef(NetworkSpec.ComboType, NetworkSpec.NetDefs,
                                                        DeviceSpec.ComboType, DeviceSpec.Devices, NetworkSpec.OptionsString, null);
+      NNEvaluator evaluator = evaluatorDef.ToEvaluator();
 
       Console.WriteLine($"\r\nTESTING WITH BASELINE DEVICE SPECIFICTATION {NNDevicesSpecificationString.ToSpecificationString(DeviceSpec.ComboType, DeviceSpec.Devices)}");
 
       int maxBatchSize = Math.Min(CeresUserSettingsManager.Settings.MaxBatchSize, 2048);
 
       // Run base evaluator.
-      var (evaluator1, _) = BackendBench(evaluatorDef, 16, maxBatchSize: maxBatchSize, show:false); // warmup
-      var (evaluator2, before) = BackendBench(evaluatorDef, SKIP, TRIES, maxBatchSize: maxBatchSize);
+      var (evaluator1, _) = BackendBench(evaluatorDef, evaluator, 16, maxBatchSize: maxBatchSize, show: false); // warmup
+      var (evaluator2, before) = BackendBench(evaluatorDef, evaluator, SKIP, TRIES, maxBatchSize: maxBatchSize);
 
       Thread.Sleep(3_000); // cooloff
 
       // Bulid modified evaluator.
       NNEvaluatorDeviceDef deviceDev = DeviceSpec.Devices[0].Item1;
 
-      OptionsParserHelpers.ParseBatchSizeSpecification(batchSpec, out int ? maxTestBatchSize, out int ? optimalTestBatchSize, out string batchSizesFileName);
+      OptionsParserHelpers.ParseBatchSizeSpecification(batchSpec, out int? maxTestBatchSize, out int? optimalTestBatchSize, out string batchSizesFileName);
       if (batchSizesFileName != null)
       {
         throw new NotImplementedException("Use of batch file configuration file not yet supported.");
       }
 
-      for (int i=0; i< DeviceSpec.Devices.Count;i++)
+      for (int i = 0; i < DeviceSpec.Devices.Count; i++)
       {
         DeviceSpec.Devices[i].Item1.MaxBatchSize = maxTestBatchSize;
         DeviceSpec.Devices[i].Item1.OptimalBatchSize = optimalTestBatchSize;
@@ -116,10 +117,11 @@ namespace Ceres.Commands
 
       NNEvaluatorDef evaluatorDef1 = new NNEvaluatorDef(NetworkSpec.ComboType, NetworkSpec.NetDefs,
                                                         DeviceSpec.ComboType, DeviceSpec.Devices, NetworkSpec.OptionsString, null);
+      NNEvaluator evaluator1Test = evaluatorDef1.ToEvaluator();
 
       // Run modified evaluator.
-      var (evaluator3, _) = BackendBench(evaluatorDef1, 16, TRIES, maxBatchSize: maxBatchSize, show: false); // warmup
-      var (evaluator4, after) = BackendBench(evaluatorDef1, SKIP, TRIES, maxBatchSize: maxBatchSize);
+      var (evaluator3, _) = BackendBench(evaluatorDef1, evaluator1Test, 16, TRIES, maxBatchSize: maxBatchSize, show: false); // warmup
+      var (evaluator4, after) = BackendBench(evaluatorDef1, evaluator1Test, SKIP, TRIES, maxBatchSize: maxBatchSize);
 
       // Output summary statistics.
       static float PctDiff(float v1, float v2) => 100.0f * ((v1 - v2) / v2);
@@ -145,14 +147,22 @@ namespace Ceres.Commands
     }
 
 
-    public (NNEvaluator, List<(int, float)>) ExecuteBenchmark(NNEvaluatorDef evaluatorDef)
+    public (NNEvaluator, List<(int, float)>) ExecuteBenchmark(NNEvaluatorDef evaluatorDef, NNEvaluator evaluator,
+                                                              int numRunsPerBatchSize = 5,
+                                                              int firstBatchSize = 1, int maxBatchSize = 2048,
+                                                              int? explicitStepSize = null, bool show = true)
     {
       if (evaluatorDef == null)
       {
         evaluatorDef = new NNEvaluatorDef(NetworkSpec.ComboType, NetworkSpec.NetDefs,
                                           DeviceSpec.ComboType, DeviceSpec.Devices, NetworkSpec.OptionsString, null);
       }
-      return BackendBench(evaluatorDef);
+      if (evaluator == null)
+      {
+        evaluator = evaluatorDef.ToEvaluator();
+      }
+
+      return BackendBench(evaluatorDef, evaluator, numRunsPerBatchSize, firstBatchSize, maxBatchSize, explicitStepSize);
     }
 
 
@@ -160,15 +170,18 @@ namespace Ceres.Commands
     /// Runs a benchmark of the NN backend (similar to the LC0 backendbench command).
     /// </summary>
     /// <param name="evaluatorDef"></param>
+    /// <param name="evaluator"></param>
     /// <param name="extraSkipMultiplier"></param>
     /// <param name="numRunsPerBatchSize"></param>
     /// <param name="firstBatchSize"></param>
     /// <param name="maxBatchSize"></param>
     /// <param name="show"></param>
     /// <returns></returns>
-    public static (NNEvaluator, List<(int,float)>) BackendBench(NNEvaluatorDef evaluatorDef, 
-                                                                int extraSkipMultiplier = 1, int numRunsPerBatchSize = 5, 
-                                                                int firstBatchSize = 1, int maxBatchSize = 4096, 
+    public static (NNEvaluator, List<(int, float)>) BackendBench(NNEvaluatorDef evaluatorDef,
+                                                                NNEvaluator evaluator,
+                                                                int numRunsPerBatchSize = 5,
+                                                                int firstBatchSize = 1, int maxBatchSize = 2048,
+                                                                int? explicitStepSize = null,
                                                                 bool show = true)
     {
       if (show)
@@ -177,21 +190,23 @@ namespace Ceres.Commands
         Console.WriteLine($"Benchmark of neural network evaluator backend - {evaluatorDef}");
       }
 
-      NNEvaluator evaluator = evaluatorDef.ToEvaluator();
       maxBatchSize = Math.Min(maxBatchSize, evaluator.MaxBatchSize);
 
       List<(int, float)> ret = new();
       InitPositionsBuffer(maxBatchSize);
 
-      TestBatchSize(evaluator, 1, show:show);
+      evaluator.Warmup();
+
+      TestBatchSize(evaluator, 1, show: show);
 
       // Loop over a set of batch sizes.
       int lastBatchSize = firstBatchSize;
       while (true)
       {
-        int skip = extraSkipMultiplier * (lastBatchSize < 256 ? 4 : (lastBatchSize < 512 ? 16 : 32));
+        int skip = explicitStepSize ?? (lastBatchSize < 256 ? 4 : (lastBatchSize < 512 ? 16 : 32));
         lastBatchSize += skip;
-        lastBatchSize = (lastBatchSize / 4) * 4;
+        int roundTo = Math.Min(skip, 4);
+        lastBatchSize = (lastBatchSize / roundTo) * roundTo;
 
         if (lastBatchSize > maxBatchSize)
         {
@@ -200,14 +215,13 @@ namespace Ceres.Commands
         else
         {
           float nps = TestBatchSize(evaluator, lastBatchSize, numRunsPerBatchSize, show);
-          ret.Add((lastBatchSize, nps));  
+          ret.Add((lastBatchSize, nps));
         }
       }
       if (show)
       {
         Console.WriteLine();
       }
-      evaluator.Shutdown();
 
       return (evaluator, ret);
     }
@@ -233,7 +247,7 @@ namespace Ceres.Commands
       (testBatchBuffer as IEncodedPositionBatchFlat).TrySetMoves();
     }
 
-    private static float TestBatchSize(NNEvaluator evaluator, int batchSize, int numRunsPerBatchSize = 5, bool show = false)
+    private static float TestBatchSize(NNEvaluator evaluator, int batchSize, int numRunsPerBatchSize = 4, bool show = false)
     {
       // Prepare batch with test positions.
       IEncodedPositionBatchFlat testBatch = testBatchBuffer.GetSubBatchSlice(0, batchSize);
@@ -249,15 +263,14 @@ namespace Ceres.Commands
       }
 
       // Keep track of all timings except the worst.
-      TopN<float> bestTimings = new(numRunsPerBatchSize - 1, s => s);
+      TopN<float> bestTimings = new(Math.Max(1, numRunsPerBatchSize - 1), s => s);
       for (int runIndex = 0; runIndex < numRunsPerBatchSize; runIndex++)
       {
-        TimingStats stats = new();
-        using (new TimingBlock(stats, TimingBlock.LoggingType.None))
-        {
-          evaluator.EvaluateIntoBuffers(testBatch);
-        }
-        bestTimings.Add((float)stats.ElapsedTimeSecs);
+        DateTime startTime = DateTime.Now;
+        evaluator.EvaluateIntoBuffers(testBatch);
+        DateTime endTime = DateTime.Now;
+
+        bestTimings.Add((float)(endTime - startTime).TotalSeconds);
       }
 
       float bestSeconds = bestTimings.Members.Min(f => f);

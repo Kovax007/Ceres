@@ -62,6 +62,11 @@ namespace Ceres.Chess.ExternalPrograms.UCI
     public int NPS;
 
     /// <summary>
+    /// Neural network evaluator evaluations per second.
+    /// </summary>
+    public int EPS;
+
+    /// <summary>
     /// Search time reported by engine (in milliseconds).
     /// </summary>
     public int EngineReportedSearchTime;
@@ -80,6 +85,21 @@ namespace Ceres.Chess.ExternalPrograms.UCI
     /// Move proposed for ponder by engine.
     /// </summary>
     public string Ponder;
+
+    /// <summary>
+    /// Win/draw/loss percentages (if available).
+    /// </summary>
+    public (float W, float D, float L) WDL = (float.NaN, float.NaN, float.NaN);
+
+    /// <summary>
+    /// Returns Q search evaluation (if available).
+    /// </summary>
+    public float Q => WDL.W - WDL.L;
+
+    /// <summary>
+    /// Win percentage
+    /// </summary>
+    public float W = float.NaN;
 
     /// <summary>
     /// Sequence of UCI detail lines emitted by engine 
@@ -130,6 +150,7 @@ namespace Ceres.Chess.ExternalPrograms.UCI
       ScoreCentipawns = -1;
       Nodes = 0;
       NPS = -1;
+      EPS = -1;
       EngineReportedSearchTime = -1;
       Mate = 0;
 
@@ -149,7 +170,16 @@ namespace Ceres.Chess.ExternalPrograms.UCI
         Check(i, "mate", ref Mate);
         CheckU(i, "nodes", ref Nodes);
         Check(i, "nps", ref NPS);
+        Check(i, "eps", ref EPS);
         Check(i, "time", ref EngineReportedSearchTime);
+
+        if (tokens[i].ToUpper() == "WDL")
+        {
+          int.TryParse(tokens[i + 1], out int w);
+          int.TryParse(tokens[i + 2], out int d);
+          int.TryParse(tokens[i + 3], out int l);
+          WDL = (w / 1000f, d / 1000f, l / 1000f);
+        }
 
         if (tokens.Contains("mate"))
         {
@@ -176,7 +206,7 @@ namespace Ceres.Chess.ExternalPrograms.UCI
           stripped = stripped.Substring(0, stripped.IndexOf(" string"));
         }
         return stripped;
-        
+
       }
     }
 

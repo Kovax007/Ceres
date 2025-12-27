@@ -15,8 +15,13 @@
 
 using System;
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using Ceres.Base.Benchmarking;
 using Ceres.Base.DataTypes;
 using Ceres.Base.Math;
 using Ceres.Chess.EncodedPositions;
@@ -170,7 +175,7 @@ namespace Ceres.Chess.LC0.Batches
           Array.Copy(States[i], states[i], States[i].Length);
         }
         ret.States = states;
-      } 
+      }
 
       if (Positions != null)
       {
@@ -288,9 +293,10 @@ namespace Ceres.Chess.LC0.Batches
     {
       NumPos = numToProcess;
       TrainingType = EncodedPositionType.PositionOnly;
+
       if (RETAIN_POSITION_INTERNALS)
       {
-        PositionsBuffer = positions.ToArray();
+        PositionsBuffer = positions.Slice(0, numToProcess).ToArray();
       }
 
       int nextOutPlaneIndex = 0;
@@ -355,6 +361,7 @@ namespace Ceres.Chess.LC0.Batches
         WritePairWithValue1(ulong.MaxValue); // "all ones to help NN find board edges" // index 111
       }
     }
+
 
     public void Set(ReadOnlySpan<EncodedTrainingPosition> positions, int numToProcess, EncodedPositionType trainingType, bool setPositions)
     {
@@ -468,7 +475,7 @@ namespace Ceres.Chess.LC0.Batches
       Init(trainingType);
     }
 
-    public EncodedPositionBatchFlat(ReadOnlySpan<EncodedPositionWithHistory> positions, int numToProcess, 
+    public EncodedPositionBatchFlat(ReadOnlySpan<EncodedPositionWithHistory> positions, int numToProcess,
                                     bool setPositions, bool fillInHistoryPlanes = false)
     {
       MaxBatchSize = (int)MathUtils.RoundedUp(numToProcess, BATCH_SIZE_ALIGNMENT);
@@ -651,107 +658,409 @@ namespace Ceres.Chess.LC0.Batches
     }
 
 
-    public Half[] ValuesFlatFromPlanes(Half[] preallocatedBuffer, bool nwhc, bool scale50MoveCounter)
+    public void ConvertValuesToFlatFromPlanes(Memory<Half> destinationBuffer,
+                                            bool nhwc, bool scale50MoveCounter)
     {
-      Debug.Assert(!nwhc); // not implemented
-
-      Half[] ret;
-
-      int length = TOTAL_NUM_PLANES_ALL_HISTORIES * NumPos * 64;
-      if (preallocatedBuffer != null)
-      {
-        Debug.Assert(preallocatedBuffer.Length >= length);
-        ret = preallocatedBuffer;
-        Array.Clear(ret, 0, length);
-      }
-      else
-      {
-        ret = new Half[length];
-      }
-
-      ConvertToFlat(ret, scale50MoveCounter);
-      return ret;
+      Debug.Assert(!nhwc);
+      ConvertToFlat(0, NumPos, destinationBuffer, scale50MoveCounter);
     }
 
 
-    unsafe static void BitmapRepresentationExpand(ulong[] thisLongs, byte[] thisValues,
-                                                  Half[] targetArray, 
-                                                  int startIndex, int numToConvert, int totalElements,
-                                                  bool scale50MoveCounter)
-    {
-      int targetOffset = startIndex * 64;
 
+    /// <summary>
+    /// Non-optimized version of BitmapRepresentationExpand for reference.  
+    /// </summary>
+    /// <param name="thisLongs"></param>
+    /// <param name="thisValues"></param>
+    /// <param name="targetArray"></param>
+    /// <param name="numToConvert"></param>
+    /// <param name="scale50MoveCounter"></param>
+    unsafe static void BitmapRepresentationExpandSLOW(ulong[] thisLongs, byte[] thisValues,
+                                                      Memory<Half> targetArrayM, int numToConvert,
+                                                      bool scale50MoveCounter)
+    {
+      int targetOffset = 0;
+      Span<Half> targetArray = targetArrayM.Span;
       fixed (ulong* longs = &thisLongs[0])
       {
-        int endIndex = Math.Min(totalElements, startIndex + numToConvert);
-        for (int outer = startIndex; outer < endIndex; outer++)
+        for (int planeIndex = 0; planeIndex < numToConvert; planeIndex++)
         {
-          // We can bypass conversion of the value is zero since product will always be zero
-          if (longs[outer] == 0)
-          {
-            targetOffset += 64;
-            continue;
-          }
-
           // Apply the necessary scaling of this is the move counter (50 move rule)
-          bool isMoves50Plane = outer % 112 == 109;
+          bool isMoves50Plane = planeIndex % 112 == 109;
           float multiplier = (scale50MoveCounter && isMoves50Plane) ? (1.0f / 99.0f) : 1.0f;
-          Half targetValue = (Half)(multiplier * thisValues[outer]);
+          float targetValue = multiplier * thisValues[planeIndex];
 
-          byte thisSquare;
-          ulong thisLong = longs[outer];
-          while (true)
+          byte* bytes = (byte*)&longs[planeIndex];
+
+          for (int i = 0; i < 8; i++)
           {
-            thisSquare = (byte)System.Numerics.BitOperations.TrailingZeroCount(thisLong);
-            if (thisSquare < 64)
+            targetArray[targetOffset] = default;
+            targetArray[targetOffset + 1] = default;
+            targetArray[targetOffset + 2] = default;
+            targetArray[targetOffset + 3] = default;
+            targetArray[targetOffset + 4] = default;
+            targetArray[targetOffset + 5] = default;
+            targetArray[targetOffset + 6] = default;
+            targetArray[targetOffset + 7] = default;
+
+            byte val = bytes[i];
+            if (val != 0)
             {
-              targetArray[targetOffset + thisSquare] = targetValue;
-              thisLong ^= 1UL << thisSquare;
+              if ((val & (1 << 0)) > 0) targetArray[targetOffset] = (Half)targetValue;
+              if ((val & (1 << 1)) > 0) targetArray[targetOffset + 1] = (Half)targetValue;
+              if ((val & (1 << 2)) > 0) targetArray[targetOffset + 2] = (Half)targetValue;
+              if ((val & (1 << 3)) > 0) targetArray[targetOffset + 3] = (Half)targetValue;
+              if ((val & (1 << 4)) > 0) targetArray[targetOffset + 4] = (Half)targetValue;
+              if ((val & (1 << 5)) > 0) targetArray[targetOffset + 5] = (Half)targetValue;
+              if ((val & (1 << 6)) > 0) targetArray[targetOffset + 6] = (Half)targetValue;
+              if ((val & (1 << 7)) > 0) targetArray[targetOffset + 7] = (Half)targetValue;
             }
-            else
-            {
-              break;
-            }
+            targetOffset += 8;
           }
-          targetOffset += 64;
+
         }
       }
     }
 
 
     /// <summary>
-    /// 
+    /// Lookup table: for each byte value (0-255), stores 8 Half values 
+    /// representing the expanded bits (1.0 for set bit, 0.0 for unset).
     /// </summary>
-    /// <param name="outBuffer">buffer to receive values. NOTE! This is assumed to start out cleared (all zeros)</param>
-    /// <param name="encodingType"></param>
-    void ConvertToFlat(Half[] outBuffer, bool scale50MoveCounter)
+    private static readonly Half[] ByteToHalfLUT = InitializeByteLUT();
+
+    private static Half[] InitializeByteLUT()
     {
-      // TODO: Somehow rework this performance-critical method
-      //       by vectorization or putting expansion on GPU.
-      //return ConvertToFlatSlow(outBuffer, encodingType); old slow version
-      int numToConvert = NumPos * TOTAL_NUM_PLANES_ALL_HISTORIES;
-      if (numToConvert < 64)
+      // 256 possible byte values, each expands to 8 Half values
+      Half[] lut = new Half[256 * 8];
+      Half one = (Half)1.0f;
+      Half zero = (Half)0.0f;
+
+      for (int b = 0; b < 256; b++)
       {
-        BitmapRepresentationExpand(PosPlaneBitmaps, PosPlaneValues, outBuffer,
-                                   0, numToConvert, numToConvert, scale50MoveCounter);
+        int baseIdx = b * 8;
+        for (int bit = 0; bit < 8; bit++)
+        {
+          lut[baseIdx + bit] = ((b >> bit) & 1) != 0 ? one : zero;
+        }
+      }
+      return lut;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static unsafe void BitmapRepresentationExpand(ulong[] thisLongs,
+                                                         byte[] thisValues,
+                                                         Memory<Half> targetArrayMemory,
+                                                         int startPlaneIndex,
+                                                         int numPlanesToConvert,
+                                                         int totalElements,
+                                                         bool scale50MoveCounter)
+    {
+      const int SQUARES_PER_PLANE = 64;
+
+      int endIndex = startPlaneIndex + numPlanesToConvert;
+      if (endIndex > totalElements) throw new NotImplementedException();
+
+      // Verify buffer sizes to prevent out of range accesses
+      Debug.Assert(startPlaneIndex <= totalElements);
+      Debug.Assert(startPlaneIndex + numPlanesToConvert <= thisLongs.Length);
+      Debug.Assert(targetArrayMemory.Length >= numPlanesToConvert * SQUARES_PER_PLANE);
+
+      // Choose vectorized path if AVX2 is available (x64)
+      if (Avx2.IsSupported)
+      {
+        BitmapRepresentationExpandAVX2(thisLongs, thisValues, targetArrayMemory,
+                                       startPlaneIndex, numPlanesToConvert, totalElements, scale50MoveCounter);
       }
       else
       {
-        // Do a Parallel.For with each thread converting a block of 16 positions
-        const int NUM_PER_BLOCK = 32;
-        int numBlocks = numToConvert / NUM_PER_BLOCK;
-        if (numToConvert % NUM_PER_BLOCK != 0)
-        {
-          numBlocks++;
-        }
-
-        Parallel.For(0, numBlocks, i =>
-        {
-          BitmapRepresentationExpand(PosPlaneBitmaps, PosPlaneValues, outBuffer,
-                                     i * NUM_PER_BLOCK, NUM_PER_BLOCK, numToConvert, scale50MoveCounter);
-        });
-
+        BitmapRepresentationExpandScalar(thisLongs, thisValues, targetArrayMemory,
+                                         startPlaneIndex, numPlanesToConvert, totalElements, scale50MoveCounter);
       }
+    }
+
+
+    /// <summary>
+    /// AVX2-optimized version of BitmapRepresentationExpand.
+    /// Uses SIMD to expand 8 bits to 8 Half values at a time.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static unsafe void BitmapRepresentationExpandAVX2(ulong[] thisLongs,
+                                                               byte[] thisValues,
+                                                               Memory<Half> targetArrayMemory,
+                                                               int startPlaneIndex,
+                                                               int numPlanesToConvert,
+                                                               int totalElements,
+                                                               bool scale50MoveCounter)
+    {
+      const int SQUARES_PER_PLANE = 64;
+      const int PLANES_PER_BLOCK = 112;
+      const int MOVES50_PLANE_MOD = 109;
+      const float INV_99 = 1.0f / 99.0f;
+
+      Span<Half> targetSpan = targetArrayMemory.Span;
+      int endIndex = startPlaneIndex + numPlanesToConvert;
+      int targetOffset = 0;
+      int rem112 = startPlaneIndex % PLANES_PER_BLOCK;
+
+      fixed (ulong* longsPtr = thisLongs)
+      fixed (byte* valsPtr = thisValues)
+      fixed (Half* dstPtr = targetSpan)
+      fixed (Half* lutPtr = ByteToHalfLUT)
+      {
+        // Precompute bit masks for expansion: [1, 2, 4, 8, 16, 32, 64, 128]
+        Vector128<byte> bitMasks = Vector128.Create((byte)1, 2, 4, 8, 16, 32, 64, 128,
+                                                     1, 2, 4, 8, 16, 32, 64, 128);
+
+        for (int outer = startPlaneIndex; outer < endIndex; outer++)
+        {
+          Half* dst = dstPtr + targetOffset;
+          ulong bits = longsPtr[outer];
+
+          if (bits == 0UL)
+          {
+            // Fast path: zero the entire plane using vectorized stores
+            Vector256<short> zero256 = Vector256<short>.Zero;
+            Avx.Store((short*)dst, zero256);
+            Avx.Store((short*)(dst + 16), zero256);
+            Avx.Store((short*)(dst + 32), zero256);
+            Avx.Store((short*)(dst + 48), zero256);
+          }
+          else
+          {
+            float val = (float)valsPtr[outer];
+            if (scale50MoveCounter && rem112 == MOVES50_PLANE_MOD)
+            {
+              val *= INV_99;
+            }
+            Half hval = (Half)val;
+            ushort hvalBits = Unsafe.As<Half, ushort>(ref hval);
+
+            if (bits == ulong.MaxValue)
+            {
+              // Fast path: all bits set - fill with hval using vectorized stores
+              Vector256<ushort> valVec = Vector256.Create(hvalBits);
+              Avx.Store((ushort*)dst, valVec);
+              Avx.Store((ushort*)(dst + 16), valVec);
+              Avx.Store((ushort*)(dst + 32), valVec);
+              Avx.Store((ushort*)(dst + 48), valVec);
+            }
+            else
+            {
+              // General case: expand each byte of the ulong
+              // Process using LUT + scalar multiplication for value scaling
+              byte* bitsBytes = (byte*)&bits;
+
+              for (int byteIdx = 0; byteIdx < 8; byteIdx++)
+              {
+                byte b = bitsBytes[byteIdx];
+                Half* dstByte = dst + byteIdx * 8;
+
+                if (b == 0)
+                {
+                  // Zero 8 Half values (16 bytes) - use 128-bit store
+                  Sse2.Store((short*)dstByte, Vector128<short>.Zero);
+                }
+                else if (b == 0xFF)
+                {
+                  // All 8 bits set - fill with hval
+                  Vector128<ushort> valVec128 = Vector128.Create(hvalBits);
+                  Sse2.Store((ushort*)dstByte, valVec128);
+                }
+                else
+                {
+                  // Use LUT for bit pattern, then multiply by value
+                  Half* lutEntry = lutPtr + b * 8;
+
+                  // Load 8 Half values from LUT (0.0 or 1.0)
+                  Vector128<short> lutVec = Sse2.LoadVector128((short*)lutEntry);
+
+                  // Convert to float, multiply by hval, convert back
+                  // Since LUT contains 0 or 1, we can use integer masking instead:
+                  // Create mask where set bits become 0xFFFF
+                  Vector128<byte> byteVec = Vector128.Create(b, b, b, b, b, b, b, b,
+                                                              b, b, b, b, b, b, b, b);
+                  Vector128<byte> expanded = Sse2.And(byteVec, bitMasks);
+                  Vector128<byte> mask8 = Sse2.CompareEqual(expanded, bitMasks);
+
+                  // Expand 8-bit mask to 16-bit mask for Half values
+                  Vector128<short> maskLo = Sse2.UnpackLow(mask8, mask8).AsInt16();
+
+                  // Apply mask to select hval or zero
+                  Vector128<ushort> valVec128 = Vector128.Create(hvalBits);
+                  Vector128<short> result = Sse2.And(valVec128.AsInt16(), maskLo);
+
+                  Sse2.Store((short*)dstByte, result);
+                }
+              }
+            }
+          }
+
+          targetOffset += SQUARES_PER_PLANE;
+          rem112++;
+          if (rem112 == PLANES_PER_BLOCK) { rem112 = 0; }
+        }
+      }
+    }
+
+    /// <summary>
+    /// Optimized scalar fallback using lookup table.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static unsafe void BitmapRepresentationExpandScalar(ulong[] thisLongs,
+                                                                 byte[] thisValues,
+                                                                 Memory<Half> targetArrayMemory,
+                                                                 int startPlaneIndex,
+                                                                 int numPlanesToConvert,
+                                                                 int totalElements,
+                                                                 bool scale50MoveCounter)
+    {
+      const int SQUARES_PER_PLANE = 64;
+      const int PLANES_PER_BLOCK = 112;
+      const int MOVES50_PLANE_MOD = 109;
+      const float INV_99 = 1.0f / 99.0f;
+
+      Span<Half> targetSpan = targetArrayMemory.Span;
+      ref Half dst = ref MemoryMarshal.GetReference(targetSpan);
+      ref ulong longsRef = ref MemoryMarshal.GetArrayDataReference(thisLongs);
+      ref byte valsRef = ref MemoryMarshal.GetArrayDataReference(thisValues);
+
+      int endIndex = startPlaneIndex + numPlanesToConvert;
+      int targetOffset = 0;
+      int rem112 = startPlaneIndex % PLANES_PER_BLOCK;
+
+      // Pin LUT for fast access
+      fixed (Half* lutPtr = ByteToHalfLUT)
+      {
+        for (int outer = startPlaneIndex; outer < endIndex; outer++)
+        {
+          ulong bits = Unsafe.Add(ref longsRef, outer);
+
+          if (bits == 0UL)
+          {
+            // Zero the plane
+            targetSpan.Slice(targetOffset, SQUARES_PER_PLANE).Clear();
+          }
+          else
+          {
+            float val = (float)Unsafe.Add(ref valsRef, outer);
+            if (scale50MoveCounter && rem112 == MOVES50_PLANE_MOD)
+            {
+              val *= INV_99;
+            }
+
+            ref Half dstStripe = ref Unsafe.Add(ref dst, targetOffset);
+
+            if (bits == ulong.MaxValue)
+            {
+              // All bits set - fill with value
+              Half hval = (Half)val;
+              for (int i = 0; i < 64; i++)
+              {
+                Unsafe.Add(ref dstStripe, i) = hval;
+              }
+            }
+            else if (val == 1.0f)
+            {
+              // Value is 1.0 - use LUT directly without scaling
+              byte* bitsBytes = (byte*)&bits;
+              for (int byteIdx = 0; byteIdx < 8; byteIdx++)
+              {
+                byte b = bitsBytes[byteIdx];
+                Half* lutEntry = lutPtr + b * 8;
+                ref Half dstByte = ref Unsafe.Add(ref dstStripe, byteIdx * 8);
+
+                // Copy 8 Half values from LUT
+                Unsafe.Add(ref dstByte, 0) = lutEntry[0];
+                Unsafe.Add(ref dstByte, 1) = lutEntry[1];
+                Unsafe.Add(ref dstByte, 2) = lutEntry[2];
+                Unsafe.Add(ref dstByte, 3) = lutEntry[3];
+                Unsafe.Add(ref dstByte, 4) = lutEntry[4];
+                Unsafe.Add(ref dstByte, 5) = lutEntry[5];
+                Unsafe.Add(ref dstByte, 6) = lutEntry[6];
+                Unsafe.Add(ref dstByte, 7) = lutEntry[7];
+              }
+            }
+            else
+            {
+              // General case with value scaling
+              Half hval = (Half)val;
+              Half zero = default;
+              byte* bitsBytes = (byte*)&bits;
+
+              for (int byteIdx = 0; byteIdx < 8; byteIdx++)
+              {
+                byte b = bitsBytes[byteIdx];
+                ref Half dstByte = ref Unsafe.Add(ref dstStripe, byteIdx * 8);
+
+                if (b == 0)
+                {
+                  // Zero all 8
+                  Unsafe.Add(ref dstByte, 0) = zero;
+                  Unsafe.Add(ref dstByte, 1) = zero;
+                  Unsafe.Add(ref dstByte, 2) = zero;
+                  Unsafe.Add(ref dstByte, 3) = zero;
+                  Unsafe.Add(ref dstByte, 4) = zero;
+                  Unsafe.Add(ref dstByte, 5) = zero;
+                  Unsafe.Add(ref dstByte, 6) = zero;
+                  Unsafe.Add(ref dstByte, 7) = zero;
+                }
+                else if (b == 0xFF)
+                {
+                  // Fill all 8 with value
+                  Unsafe.Add(ref dstByte, 0) = hval;
+                  Unsafe.Add(ref dstByte, 1) = hval;
+                  Unsafe.Add(ref dstByte, 2) = hval;
+                  Unsafe.Add(ref dstByte, 3) = hval;
+                  Unsafe.Add(ref dstByte, 4) = hval;
+                  Unsafe.Add(ref dstByte, 5) = hval;
+                  Unsafe.Add(ref dstByte, 6) = hval;
+                  Unsafe.Add(ref dstByte, 7) = hval;
+                }
+                else
+                {
+                  // Expand each bit
+                  Unsafe.Add(ref dstByte, 0) = (b & 0x01) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 1) = (b & 0x02) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 2) = (b & 0x04) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 3) = (b & 0x08) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 4) = (b & 0x10) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 5) = (b & 0x20) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 6) = (b & 0x40) != 0 ? hval : zero;
+                  Unsafe.Add(ref dstByte, 7) = (b & 0x80) != 0 ? hval : zero;
+                }
+              }
+            }
+          }
+
+          targetOffset += SQUARES_PER_PLANE;
+          rem112++;
+          if (rem112 == PLANES_PER_BLOCK) { rem112 = 0; }
+        }
+      }
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name="destinationBuffer">buffer to receive values. NOTE! This is assumed to start out cleared (all zeros)</param>
+    /// <param name="encodingType"></param>
+    internal void ConvertToFlat(int startPosToConvertIndex, int numPositionsToConvert,
+                                Memory<Half> destinationBuffer, bool scale50MoveCounter)
+    {
+      int numPlanesTotal = NumPos * TOTAL_NUM_PLANES_ALL_HISTORIES;
+      int startPlanesToConvert = startPosToConvertIndex * TOTAL_NUM_PLANES_ALL_HISTORIES;
+      int numPlanesToConvert = numPositionsToConvert * TOTAL_NUM_PLANES_ALL_HISTORIES;
+
+      if (false)
+      {
+        BitmapRepresentationExpandSLOW(PosPlaneBitmaps, PosPlaneValues, destinationBuffer,
+                                       numPlanesToConvert, scale50MoveCounter); //old slow version
+        return;
+      }
+
+      BitmapRepresentationExpand(PosPlaneBitmaps, PosPlaneValues, destinationBuffer,
+                                 startPlanesToConvert, numPlanesToConvert, numPlanesTotal, scale50MoveCounter);
     }
 
 
@@ -759,7 +1068,8 @@ namespace Ceres.Chess.LC0.Batches
 
     public void DumpDecoded()
     {
-      DumpDecoded(this.ValuesFlatFromPlanes(null, false, false), TOTAL_NUM_PLANES_ALL_HISTORIES);
+      throw new NotImplementedException();
+      //DumpDecoded(ValuesFlatFromPlanes(default, false, false).ToArray(), TOTAL_NUM_PLANES_ALL_HISTORIES);
     }
 
     public static void DumpDecoded(Memory<Half> encodedPos, int numPlanes)
@@ -895,8 +1205,6 @@ namespace Ceres.Chess.LC0.Batches
 
     Memory<Half[]> IEncodedPositionBatchFlat.States { get => States.AsMemory(); set => States = value.ToArray(); }
 
-    Half[] IEncodedPositionBatchFlat.ValuesFlatFromPlanes(Half[] preallocatedBuffer, bool nwhc, bool scaleMove50Counter) => ValuesFlatFromPlanes(preallocatedBuffer, nwhc, scaleMove50Counter);
-
     Memory<EncodedPositionWithHistory> IEncodedPositionBatchFlat.PositionsBuffer { get => PositionsBuffer; }
 
     #endregion
@@ -909,7 +1217,7 @@ namespace Ceres.Chess.LC0.Batches
     /// <returns></returns>
     public override string ToString()
     {
-      return $"<EncodedPositionBatchFlat of size { NumPos } of type { TrainingType }>";
+      return $"<EncodedPositionBatchFlat of size {NumPos} of type {TrainingType}>";
     }
 
     #endregion

@@ -16,11 +16,31 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
 
 #endregion
 
 namespace Ceres.Base.OperatingSystem
 {
+  /// <summary>
+  /// Static object tracking statistics related to MemoryBufferOS
+  /// (over all T).
+  /// </summary>
+  public static class MemoryBufferOSStats
+  {
+    /// <summary>
+    /// Total number of buffers ever allocated.
+    /// </summary>
+    public static int TotalNumAllocated;
+
+    /// <summary>
+    /// Total number of buffers ever disposed.
+    /// </summary>
+    public static int TotalNumDisposed;
+  }
+
+
   /// <summary>
   /// A buffer of memory allocated from the operating system (Windows)
   /// which is interpreted as an array of structs of generic unmanaged type T.
@@ -42,7 +62,7 @@ namespace Ceres.Base.OperatingSystem
     /// <summary>
     /// Number of items requested to be allocated
     /// </summary>
-    public readonly long MaxItems;
+    public readonly long NumItems;
 
     /// <summary>
     /// If memory should be allocated only incrementally as needed
@@ -58,22 +78,42 @@ namespace Ceres.Base.OperatingSystem
 
     IRawMemoryManagerIncremental<T> rawMemoryManager;
 
+
+    /// <summary>
+    /// Returns a summary string about this buffer.
+    /// </summary>
+    /// <returns></returns>
+    public string StoreInfoString()
+    {
+
+      double gbUsed = Marshal.SizeOf<T>() * rawMemoryManager.NumItemsAllocated / (1024.0 * 1024.0 * 1024.0);
+      return "MemoryBufferOS<" + typeof(T).Name + "[" + Marshal.SizeOf<T>() + " bytes] " +
+             (UseExistingSharedMemory ? "shared " : "private ") +
+             (UseIncrementalAlloc ? "incremental " : "preallocated ") +
+             NumItems + " items, " +
+             rawMemoryManager.NumItemsAllocated + " reserved " +
+             MathF.Round((float)rawMemoryManager.NumItemsAllocated / NumItems, 4) + " use ratio, " +
+             $"{System.Math.Round(gbUsed, 3)}gb used>";
+    }
+
+
     #region Constructor
 
     /// <summary>
     /// Constructor.
     /// </summary>
-    /// <param name="maxItems"></param>
+    /// <param name="numItems"></param>
     /// <param name="largePages"></param>
     /// <param name="sharedMemoryName"></param>
     /// <param name="useExistingSharedMemory"></param>
     /// <param name="useIncrementalAlloc"></param>
-    public MemoryBufferOS(long maxItems, bool largePages, string sharedMemoryName,
+    public MemoryBufferOS(long numItems, bool largePages, string sharedMemoryName,
                           bool useExistingSharedMemory, bool useIncrementalAlloc)
     {
-      MaxItems = maxItems;
+      NumItems = numItems;
       UseExistingSharedMemory = useExistingSharedMemory;
       UseIncrementalAlloc = useIncrementalAlloc;
+      Interlocked.Increment(ref MemoryBufferOSStats.TotalNumAllocated);
 
       // Make name unique to this process if we are not sharing
       if (sharedMemoryName != null && !useExistingSharedMemory)
@@ -81,7 +121,7 @@ namespace Ceres.Base.OperatingSystem
         sharedMemoryName += "_" + Process.GetCurrentProcess().Id.ToString();
       }
 
-      Allocate(sharedMemoryName, useExistingSharedMemory, maxItems, largePages);
+      Allocate(sharedMemoryName, useExistingSharedMemory, numItems, largePages);
     }
 
     #endregion
@@ -145,10 +185,15 @@ namespace Ceres.Base.OperatingSystem
     /// </summary>
     public long NumItemsAllocated => rawMemoryManager.NumItemsAllocated;
 
+
     /// <summary>
     /// Releases the memory buffer.
     /// </summary>
-    public void Dispose() => rawMemoryManager.Dispose();
+    public void Dispose()
+    {
+      rawMemoryManager.Dispose();
+      Interlocked.Increment(ref MemoryBufferOSStats.TotalNumDisposed);
+    }
 
 
     #endregion
@@ -164,7 +209,7 @@ namespace Ceres.Base.OperatingSystem
     /// <summary>
     /// Returns the total number of items in the buffer.
     /// </summary>
-    public long Length => MaxItems;
+    public long Length => NumItems;
 
 
     /// <summary>
@@ -244,9 +289,9 @@ namespace Ceres.Base.OperatingSystem
       [MethodImpl(MethodImplOptions.AggressiveInlining)]
       get
       {
-        Debug.Assert(MaxItems <= int.MaxValue); // the Length property of a Span<T> is an int
+        Debug.Assert(NumItems <= int.MaxValue); // the Length property of a Span<T> is an int
 
-        return new Span<T>(rawMemoryAddress, (int)MaxItems);
+        return new Span<T>(rawMemoryAddress, (int)NumItems);
       }
     }
 
@@ -267,5 +312,16 @@ namespace Ceres.Base.OperatingSystem
     }
 
     #endregion
+
+    /// <summary>
+    /// Dumps a summary of memory use to the console.
+    /// </summary>
+    public void DumpMemoryUseSummary()
+    {
+      Console.WriteLine(typeof(T).Name + " size=" + Marshal.SizeOf<T>() + " bytes " +
+                           (int)(NumItems / (1024.0 * 1024.0)) + "m items " + (NumItems * Marshal.SizeOf<T>() / (int)(1024.0 * 1024.0 * 1024.0))
+                          + "GB");
+    }
+
   }
 }

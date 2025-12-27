@@ -23,6 +23,7 @@ using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.NNEvaluators;
 using Ceres.Chess.NNEvaluators.Defs;
 using Chess.Ceres.NNEvaluators;
+using System.Threading;
 
 #endregion
 
@@ -34,15 +35,6 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
   /// </summary>
   public class ONNXNetExecutor : IDisposable
   {
-    /// In August 2024 with TensorRT 10.2 it was discovered that (very) incorrect results
-    /// were returned when batch size 1 was used with certain Ceres networks, presumably a bug.
-    /// It was also observed that batch size 4 was similar in speed as batch size 1.
-    /// Therefore as a workaround we use a minimum batch size of 4 for TensorRT execution provider.
-    /// Subsequent tests with TensorRT 10.5 showed the problem remained,
-    /// sometimes returning NaN or random values for certain networks.
-    /// </summary>
-    internal const int MIN_BATCH_SIZE_TENSOR_RT_CERES = 4;
-
     public const int TPG_BYTES_PER_SQUARE_RECORD = 137; // TODO: should be referenced from TPGRecord
     public const int TPG_MAX_MOVES = 92; //  // TODO: should be referenced from TPGRecord
 
@@ -93,6 +85,13 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
     internal ONNXExecutor executor;
 
     /// <summary>
+    /// If an input with the name "squares_byte" exists
+    /// indicating the network can accept TPG style data in pure byte format.
+    /// </summary>
+    public bool HasSquaresByteInput = false;
+
+
+    /// <summary>
     /// Name of the LoRA adapter file (if any).
     /// </summary>
     public readonly string LoRAAdapterFileName;
@@ -141,6 +140,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
                                NNEvaluatorPrecision precision,
                                NNDeviceType deviceType, int gpuNum,
                                bool useTensorRT,
+                               bool enableCUDAGraphs,
                                bool enableProfiling,
                                bool retainRawOutputs,
                                string loraAdapterFileName = null)
@@ -163,9 +163,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
       UseTensorRT = deviceType == NNDeviceType.GPU && useTensorRT;
       RetainRawOutputs = retainRawOutputs;
 
-      MinBatchSize = NetType == NetTypeEnum.TPG
-                  && UseTensorRT
-                  ? MIN_BATCH_SIZE_TENSOR_RT_CERES : 1;
+      MinBatchSize = 1;
       LoRAAdapterFileName = loraAdapterFileName;
 
       int deviceIndex;
@@ -196,9 +194,225 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         _ => throw new NotImplementedException($"The enum type '{netType}' is not handled."),
       };
 
+      // TODO: Clean up, this is a hack.
+      // Look for the input with name with -I8 indicating
+      // the network can directly accept byte inputs.
+      HasSquaresByteInput = netType == NetTypeEnum.TPG && onnxFileName.ToUpper().Contains("-I8");
+
+      int inputsNumBits = HasSquaresByteInput ? 8 : (Precision == NNEvaluatorPrecision.FP16 ? 16 : 32);
       executor = new ONNXExecutor(shortID, onnxFileName, onnxModelBytes, inputNames, nonBatchDimensions,
-                                  precisionNumBits, deviceIndex, useTensorRT, MinBatchSize, maxBatchSize, 
-                                  enableProfiling, retainRawOutputs);
+                                  inputsNumBits, precisionNumBits, true, deviceIndex, useTensorRT, enableCUDAGraphs,
+                                  MinBatchSize, maxBatchSize, enableProfiling, retainRawOutputs);
+
+    }
+
+
+    /// <summary>
+    /// Evaluates a batch.
+    /// </summary>
+    /// <param name="isWDL"></param>
+    /// <param name="positionEncoding"></param>
+    /// <param name="numPositionsUsed"></param>
+    /// <param name="debuggingDump"></param>
+    /// <param name="alreadyConvertedToLZ0"></param>
+    /// <returns></returns>
+    public ONNXRuntimeExecutorResultBatch[] ExecuteTPGByteInputs(bool isWDL, bool hasState,
+                                                                 Memory<byte> flatValuesPrimary,
+                                                                 Memory<Half[]> flatValuesState,
+                                                                 int numPositionsUsed,
+                                                                 Predicate<int> shouldUseStateForPos = null)
+    {
+      Debug.Assert(NetType == NetTypeEnum.TPG);
+
+      List<(string, Memory<Float16>)> eval;
+
+      int NUM_INPUTS = executor.NumInputs;
+      (Memory<byte> input, int[] shape)[] inputs = new (Memory<byte> input, int[] shape)[NUM_INPUTS];
+
+      int TOTAL_LEN = numPositionsUsed * 64 * TPG_BYTES_PER_SQUARE_RECORD;
+      Memory<byte> input0 = flatValuesPrimary.Slice(0, TOTAL_LEN);
+
+      inputs[0] = (input0, [numPositionsUsed, 64, TPG_BYTES_PER_SQUARE_RECORD]);
+
+      if (inputs.Length > 1)
+      {
+        // TODO: improve efficiency here
+        if (flatValuesState.IsEmpty)
+        {
+          // No state available, pass all zeroes.
+          inputs[1] = (new byte[numPositionsUsed * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE],
+                     new int[] { numPositionsUsed, 64, NNEvaluator.SIZE_STATE_PER_SQUARE });
+        }
+        else
+        {
+          Span<Half[]> flatValuesStateSpan = flatValuesState.Span;
+
+          // Reformat the state data into a 1D array
+          // TODO: improve efficiency
+          //            Half[] states1D = new Half[numPositionsInBatchSentToExecutor * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE];
+          throw new Exception("Needs remeditation; the inputs are assumed all byte but for this case the second one should be Half");
+          byte[] states1D = new byte[numPositionsUsed * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE];
+          for (int i = 0; i < numPositionsUsed; i++)
+          {
+            if (flatValuesStateSpan[i] == null
+             || (shouldUseStateForPos != null && !shouldUseStateForPos(i)))
+            {
+              // No state available, pass all zeroes.
+              // Noting to do since array was created just above and is already zeroed.
+            }
+            else if (flatValuesStateSpan[i].Length != 64 * NNEvaluator.SIZE_STATE_PER_SQUARE)
+            {
+              throw new Exception("State input size mismatch.");
+            }
+            else
+            {
+              Array.Copy(flatValuesStateSpan[i], 0, states1D, i * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE, 64 * NNEvaluator.SIZE_STATE_PER_SQUARE);
+            }
+          }
+          inputs[1] = (states1D, new int[] { states1D.Length });
+        }
+      }
+
+#if NOT
+        if (flatValuesSecondary.Length > 0)
+        {
+          Span<float> flatValuesSecondaryS = flatValuesSecondary.Span;
+          for (int i = 0; i < flatValuesSecondary.Length; i++) flatValuesSecondaryS[i] /= DIVISOR;
+          inputs[1] = (new Memory<float>(flatValuesSecondaryS.ToArray()), new int[] { numPositionsUsed, TPG_MAX_MOVES, TPG_BYTES_PER_MOVE_RECORD });
+        }
+#endif
+
+      eval = executor.Run(HasSquaresByteInput ? ONNXExecutor.ONNXInputTypeEnum.Byte
+                                              : ONNXExecutor.ONNXInputTypeEnum.Float16,
+                          inputs, numPositionsUsed);
+
+      if (executor.MultiNetNames != null)
+      {
+        if (executor.MultiNetWeights == null || executor.MultiNetWeights.Length != 2)
+        {
+          throw new Exception("Expected to find metadata for Ceres_multinet_weights with exactly two constituents.");
+        }
+        ONNXRuntimeExecutorResultBatch model1Outputs = ExtractNetOutputs("model1_", isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval);
+        ONNXRuntimeExecutorResultBatch model2Outputs = ExtractNetOutputs("model2_", isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval);
+        return [model1Outputs, model2Outputs];
+      }
+
+      return [ExtractNetOutputs(null, isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval)];
+    }
+
+
+
+    /// <summary>
+    /// Evaluates a batch.
+    /// </summary>
+    /// <param name="isWDL"></param>
+    /// <param name="positionEncoding"></param>
+    /// <param name="numPositionsUsed"></param>
+    /// <param name="debuggingDump"></param>
+    /// <param name="alreadyConvertedToLZ0"></param>
+    /// <returns></returns>
+    public ONNXRuntimeExecutorResultBatch[] ExecuteForTPGBytesDirect(bool isWDL, bool hasState,
+                                                                     Memory<byte> flatValuesPrimary,
+                                                                     Memory<Half[]> flatValuesState,
+                                                                     int numPositionsUsed,
+                                                                     Predicate<int> shouldUseStateForPos = null)
+    {
+      List<(string, Memory<Float16>)> eval;
+      Span<byte> flatValuesPrimarySpan = flatValuesPrimary.Span;
+
+      Debug.Assert(NetType == NetTypeEnum.TPG);
+
+      int NUM_INPUTS = executor.NumInputs;
+      (Memory<byte> input, int[] shape)[] inputs = new (Memory<byte> input, int[] shape)[NUM_INPUTS];
+
+      // TODO: this code duplicated below, refactor/clean up.
+      int TOTAL_LEN = numPositionsUsed * 64 * TPG_BYTES_PER_SQUARE_RECORD;
+      Memory<byte> input0 = flatValuesPrimary.Slice(0, TOTAL_LEN);
+
+      inputs[0] = (input0, [numPositionsUsed, 64, TPG_BYTES_PER_SQUARE_RECORD]);
+
+      if (inputs.Length > 1)
+      {
+        // TODO: improve efficiency here
+        if (flatValuesState.IsEmpty)
+        {
+          // No state available, pass all zeroes.
+          inputs[1] = (new byte[numPositionsUsed * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE],
+                     new int[] { numPositionsUsed, 64, NNEvaluator.SIZE_STATE_PER_SQUARE });
+        }
+        else
+        {
+          throw new NotImplementedException("Remediation for switch to bytes");
+#if NOT
+          Span<Half[]> flatValuesStateSpan = flatValuesState.Span;
+
+            // Reformat the state data into a 1D array
+            // TODO: improve efficiency
+            Half[] states1D = new Half[numPositionsInBatchSentToExecutor * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE];
+            for (int i = 0; i < numPositionsUsed; i++)
+            {
+              if (flatValuesStateSpan[i] == null
+               || (shouldUseStateForPos != null && !shouldUseStateForPos(i)))
+              {
+                // No state available, pass all zeroes.
+                // Noting to do since array was created just above and is already zeroed.
+              }
+              else if (flatValuesStateSpan[i].Length != 64 * NNEvaluator.SIZE_STATE_PER_SQUARE)
+              {
+                throw new Exception("State input size mismatch.");
+              }
+              else
+              {
+                Array.Copy(flatValuesStateSpan[i], 0, states1D, i * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE, 64 * NNEvaluator.SIZE_STATE_PER_SQUARE);
+              }
+            }
+            inputs[1] = (states1D, new int[] { states1D.Length });
+#endif        
+        }
+
+#if NOT
+        if (flatValuesSecondary.Length > 0)
+        {
+          Span<float> flatValuesSecondaryS = flatValuesSecondary.Span;
+          for (int i = 0; i < flatValuesSecondary.Length; i++) flatValuesSecondaryS[i] /= DIVISOR;
+          inputs[1] = (new Memory<float>(flatValuesSecondaryS.ToArray()), new int[] { numPositionsUsed, TPG_MAX_MOVES, TPG_BYTES_PER_MOVE_RECORD });
+        }
+#endif
+      }
+
+      (Memory<byte> input, int[] shape)[] inputsByte = new (Memory<byte> input, int[] shape)[NUM_INPUTS];
+      inputsByte[0].input = new Memory<byte>(new byte[flatValuesPrimary.Length]);
+
+      Span<byte> flatValuesPrimaryTarget = inputsByte[0].input.Span;
+      for (int i = 0; i < flatValuesPrimarySpan.Length; i++)
+      {
+        //            flatValuesPrimaryTarget[i] = (byte)flatValuesPrimarySpan[i];
+      }
+
+      //          CopyFloatToByteAvx2(flatValuesPrimarySpan, flatValuesPrimaryTarget);  
+      //          TensorPrimitives.ConvertSaturating<Half, byte>(flatValuesPrimarySpan, flatValuesPrimaryTarget);
+      //          TensorPrimitives.ConvertChecked<Half, byte>(flatValuesPrimarySpan, flatValuesPrimaryTarget);  
+      //          for (int i = 0; i < flatValuesPrimarySpan.Length; i++)
+      //          {
+      //            // TODO: improve efficiency
+      //            flatValuesPrimaryTarget[i] = (byte)flatValuesPrimarySpan[i];
+      //          }
+
+      inputsByte[0].shape = inputs[0].shape;
+      eval = executor.Run(ONNXExecutor.ONNXInputTypeEnum.Byte, inputsByte, numPositionsUsed);
+
+      if (executor.MultiNetNames != null)
+      {
+        if (executor.MultiNetWeights == null || executor.MultiNetWeights.Length != 2)
+        {
+          throw new Exception("Expected to find metadata for Ceres_multinet_weights with exactly two constituents.");
+        }
+        ONNXRuntimeExecutorResultBatch model1Outputs = ExtractNetOutputs("model1_", isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval);
+        ONNXRuntimeExecutorResultBatch model2Outputs = ExtractNetOutputs("model2_", isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval);
+        return [model1Outputs, model2Outputs];
+      }
+
+      return [ExtractNetOutputs(null, isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval)];
     }
 
 
@@ -212,7 +426,8 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
     /// <param name="alreadyConvertedToLZ0"></param>
     /// <returns></returns>
     public ONNXRuntimeExecutorResultBatch[] Execute(bool isWDL, bool hasState,
-                                                    Memory<Half> flatValuesPrimary, Memory<Half[]> flatValuesState,
+                                                    Memory<Half> flatValuesPrimary,
+                                                    Memory<Half[]> flatValuesState,
                                                     int numPositionsUsed,
                                                     bool debuggingDump = false, bool alreadyConvertedToLZ0 = false,
                                                     float tpgDivisor = 1,
@@ -222,8 +437,6 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
       {
         throw new NotImplementedException();
       }
-
-      int numPositionsInBatchSentToExecutor = numPositionsUsed < MinBatchSize ? MinBatchSize : numPositionsUsed;
 
       if (!alreadyConvertedToLZ0)
       {
@@ -254,6 +467,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
       }
 
       List<(string, Memory<Float16>)> eval;
+      Span<Half> flatValuesPrimarySpan = flatValuesPrimary.Span;
 
       if (NetType == NetTypeEnum.TPG)
       {
@@ -261,7 +475,6 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         (Memory<Half> input, int[] shape)[] inputs = new (Memory<Half> input, int[] shape)[NUM_INPUTS];
         if (tpgDivisor != 1.0f)
         {
-          Span<Half> flatValuesPrimarySpan = flatValuesPrimary.Span;
           for (int i = 0; i < flatValuesPrimarySpan.Length; i++)
           {
             // TODO: improve efficiency (slow conversion/ non-SIMD division here)
@@ -271,23 +484,26 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         }
 
         int TOTAL_LEN = numPositionsUsed * 64 * TPG_BYTES_PER_SQUARE_RECORD;
-        inputs[0] = (flatValuesPrimary.Slice(0, TOTAL_LEN), new int[] { numPositionsUsed, 64, TPG_BYTES_PER_SQUARE_RECORD });
+        Memory<Half> input0 = flatValuesPrimary.Slice(0, TOTAL_LEN);
+        inputs[0] = (input0, [numPositionsUsed, 64, TPG_BYTES_PER_SQUARE_RECORD]);
+
         if (inputs.Length > 1)
         {
           // TODO: improve efficiency here
           if (flatValuesState.IsEmpty)
           {
             // No state available, pass all zeroes.
-            inputs[1] = (new Half[numPositionsInBatchSentToExecutor * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE],
-                       new int[] { numPositionsInBatchSentToExecutor, 64, NNEvaluator.SIZE_STATE_PER_SQUARE });
+            inputs[1] = (new Half[numPositionsUsed * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE],
+                       new int[] { numPositionsUsed, 64, NNEvaluator.SIZE_STATE_PER_SQUARE });
           }
           else
           {
+            throw new Exception("Need to access predefined buffer in ONNXExecutor, not allocate here");
             Span<Half[]> flatValuesStateSpan = flatValuesState.Span;
 
             // Reformat the state data into a 1D array
             // TODO: improve efficiency
-            Half[] states1D = new Half[numPositionsInBatchSentToExecutor * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE];
+            Half[] states1D = new Half[numPositionsUsed * 64 * NNEvaluator.SIZE_STATE_PER_SQUARE];
             for (int i = 0; i < numPositionsUsed; i++)
             {
               if (flatValuesStateSpan[i] == null
@@ -318,16 +534,34 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         }
 #endif
 
-
-        eval = executor.Run(inputs, numPositionsInBatchSentToExecutor, Precision == NNEvaluatorPrecision.FP16);
-
-        if (numPositionsInBatchSentToExecutor != numPositionsUsed)
+        if (HasSquaresByteInput)
         {
-          // Resize all results to match the number of positions actually used.
-          for (int i = 0; i < eval.Count; i++)
+          (Memory<byte> input, int[] shape)[] inputsByte = new (Memory<byte> input, int[] shape)[NUM_INPUTS];
+          inputsByte[0].input = new Memory<byte>(new byte[flatValuesPrimary.Length]);
+
+          Span<byte> flatValuesPrimaryTarget = inputsByte[0].input.Span;
+          for (int i = 0; i < flatValuesPrimarySpan.Length; i++)
           {
-            eval[i] = (eval[i].Item1, eval[i].Item2.Slice(0, numPositionsUsed * eval[i].Item2.Length / numPositionsInBatchSentToExecutor));
+            //            flatValuesPrimaryTarget[i] = (byte)flatValuesPrimarySpan[i];
           }
+
+          //          CopyFloatToByteAvx2(flatValuesPrimarySpan, flatValuesPrimaryTarget);  
+          //          TensorPrimitives.ConvertSaturating<Half, byte>(flatValuesPrimarySpan, flatValuesPrimaryTarget);
+          //          TensorPrimitives.ConvertChecked<Half, byte>(flatValuesPrimarySpan, flatValuesPrimaryTarget);  
+          //          for (int i = 0; i < flatValuesPrimarySpan.Length; i++)
+          //          {
+          //            // TODO: improve efficiency
+          //            flatValuesPrimaryTarget[i] = (byte)flatValuesPrimarySpan[i];
+          //          }
+
+          inputsByte[0].shape = inputs[0].shape;
+          eval = executor.Run(ONNXExecutor.ONNXInputTypeEnum.Byte, inputsByte, numPositionsUsed);
+        }
+        else
+        {
+          eval = executor.Run(Precision == NNEvaluatorPrecision.FP16 ? ONNXExecutor.ONNXInputTypeEnum.Float16
+                                                                     : ONNXExecutor.ONNXInputTypeEnum.Float32,
+                              inputs, numPositionsUsed);
         }
       }
       else
@@ -335,7 +569,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         (Memory<Half> flatValuesPrimary, int[]) input = default;
         input.Item1 = flatValuesPrimary.Slice(0, numPositionsUsed * 112 * 8 * 8);
         input.Item2 = [numPositionsUsed, 112, 8, 8];
-        eval = executor.Run([input], numPositionsUsed, Precision == NNEvaluatorPrecision.FP16);
+        eval = executor.Run(ONNXExecutor.ONNXInputTypeEnum.Float16, [input], numPositionsUsed);
       }
 
 
@@ -347,7 +581,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         }
         ONNXRuntimeExecutorResultBatch model1Outputs = ExtractNetOutputs("model1_", isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval);
         ONNXRuntimeExecutorResultBatch model2Outputs = ExtractNetOutputs("model2_", isWDL, hasState, RetainRawOutputs, numPositionsUsed, eval);
-        return [model1Outputs, model2Outputs];  
+        return [model1Outputs, model2Outputs];
       }
 
 
@@ -356,8 +590,8 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
 
 
     private static ONNXRuntimeExecutorResultBatch ExtractNetOutputs(string namePrefixFilter,
-                                                                    bool isWDL, bool hasState, 
-                                                                    bool retainRawOutputs, int numPositionsUsed, 
+                                                                    bool isWDL, bool hasState,
+                                                                    bool retainRawOutputs, int numPositionsUsed,
                                                                     List<(string, Memory<Float16>)> eval)
     {
       bool hasMLH = FindIndexExact("mlh") != -1;
@@ -371,7 +605,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         for (int i = 0; i < eval.Count; i++)
         {
           string outputNameWithoutPrefix = namePrefixFilter == null
-                                           ? eval[i].Item1 
+                                           ? eval[i].Item1
                                            : eval[i].Item1.Replace(namePrefixFilter, "");
           if (MatchesNamePrefix(i) && outputNameWithoutPrefix == name)
           {
@@ -386,7 +620,7 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
         int expectedLength = numPositionsUsed * expectedPerPosition;
         for (int i = 0; i < eval.Count; i++)
         {
-          if (MatchesNamePrefix(i) && 
+          if (MatchesNamePrefix(i) &&
             eval[i].Item2.Length == expectedLength
             && i != indexToIgnore
             && (mustContainString == null || eval[i].Item1.Contains(mustContainString)))
@@ -444,6 +678,15 @@ namespace Ceres.Chess.NNBackends.ONNXRuntime
     }
 
     public void EndProfiling() => executor.EndProfiling();
+
+
+    /// <summary>
+    /// Performs any initialization to prepare evaluator for delay-free execution.
+    /// </summary>
+    public void Warmup()
+    {
+      this.executor.Warmup();
+    }
 
 
     public void Dispose()

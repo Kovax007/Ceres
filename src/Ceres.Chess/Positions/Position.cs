@@ -859,75 +859,48 @@ namespace Ceres.Chess
     }
 
 
-    public readonly PiecesOnSquaresEnumerator GetEnumerator()
-    {
-      unsafe
-      {
-        fixed (byte* pieceSquares = &Square_0_1)
-        {
-          return new PiecesOnSquaresEnumerator(pieceSquares);
-        }
-      }
-    }
 
     /// <summary>
     /// Custom enumerator struct for allocation-free enumeration.
     /// </summary>
-    public unsafe struct PiecesOnSquaresEnumerator : IEnumerator<(Piece, Square)>
+    public PiecesOnSquaresEnumerator GetEnumerator()
     {
-      private readonly byte* _pieceSquares;
-      private int index;
+      // Create a span that covers the 32 bytes holding the 64 nibbles
+      ReadOnlySpan<byte> squares = MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in Square_0_1), 32);
 
-      public PiecesOnSquaresEnumerator(byte* pieceSquares)
+      return new PiecesOnSquaresEnumerator(squares);
+    }
+
+    public ref struct PiecesOnSquaresEnumerator
+    {
+      private readonly ReadOnlySpan<byte> _pieceSquares;
+      private int _index;
+
+      public PiecesOnSquaresEnumerator(ReadOnlySpan<byte> pieceSquares)
       {
         _pieceSquares = pieceSquares;
-        index = 0;
+        _index = -1;
         Current = default;
       }
 
       public (Piece, Square) Current { get; private set; }
 
-      object IEnumerator.Current => Current;
-
       public bool MoveNext()
       {
-        while (index < 64)
+        while (++_index < 64)
         {
-          byte rawValue = _pieceSquares[index / 2];
+          int half = _index >> 1;              // which byte
+          int nibbleShift = (_index & 1) * 4;  // left or right nibble
+          byte nibble = (byte)((_pieceSquares[half] >> nibbleShift) & 0xF);
 
-          if (index % 2 == 0)
+          if (nibble != 0)
           {
-            byte valueLeft = (byte)(rawValue & 0b0000_1111);
-            if (valueLeft != 0)
-            {
-              Current = (new Piece(valueLeft), new Square(index));
-              index++;
-              return true;
-            }
+            Current = (new Piece(nibble), new Square(_index));
+            return true;
           }
-          else
-          {
-            byte valueRight = (byte)(rawValue >> 4);
-            if (valueRight != 0)
-            {
-              Current = (new Piece(valueRight), new Square(index));
-              index++;
-              return true;
-            }
-          }
-
-          index++;
         }
         return false;
       }
-
-      public void Reset()
-      {
-        index = 0;
-        Current = default;
-      }
-
-      public void Dispose() { }
     }
 
 
@@ -939,16 +912,19 @@ namespace Ceres.Chess
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly Piece PieceOnSquare(Square square)
     {
-      byte rawValue = 0;
+      int idx = square.SquareIndexStartA1;
+
       unsafe
       {
         fixed (byte* pieceSquares = &Square_0_1)
         {
-          rawValue = pieceSquares[square.SquareIndexStartA1 / 2];
-          rawValue = square.SquareIndexStartA1 % 2 == 1 ? (byte)(rawValue >> 4) : (byte)(rawValue & 0b0000_1111);
+          byte raw = pieceSquares[idx >> 1];                 // / 2
+          int shift = (idx & 1) << 2;                        // 0 or 4
+          raw = (byte)((raw >> shift) & 0x0F);               // select lower/upper nibble
+
+          return new Piece(raw);
         }
       }
-      return new Piece(rawValue);
     }
 
 
@@ -995,8 +971,7 @@ namespace Ceres.Chess
       else
       {
         // Move list not already known, generate
-        moves = new MGMoveList();
-        MGMoveGen.GenerateMoves(in posMG, moves);
+        moves = MGMoveGen.GeneratedMoves(in posMG);
       }
 
       if (moves.NumMovesUsed > 0)

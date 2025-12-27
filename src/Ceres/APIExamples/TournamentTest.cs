@@ -55,7 +55,7 @@ namespace Ceres.APIExamples
   {
     const bool POOLED = false;
 
-   static int CONCURRENCY = POOLED ? 8 : Environment.MachineName.ToUpper().Contains("DEV") ? 3 : 3;
+    static int CONCURRENCY = POOLED ? 8 : Environment.MachineName.ToUpper().Contains("DEV") ? 1 : 1;
     static int[] OVERRIDE_DEVICE_IDs = /*POOLED ? null*/
        (Environment.MachineName.ToUpper() switch
        {
@@ -84,8 +84,8 @@ namespace Ceres.APIExamples
 
     static string exeCeres() => SoftwareManager.IsLinux ? @"/raid/dev/Ceres/artifacts/release/net8.0/Ceres.dll"
                                           : @"C:\dev\ceres\artifacts\release\net8.0\ceres.exe";
-    static string exeCeres93() => SoftwareManager.IsLinux ? @"/raid/dev/Ceres93/artifacts/release/5.0/Ceres.dll"
-                                                : @"C:\ceres\releases\v0.93\ceres.exe";
+    static string exeCeresV2() => SoftwareManager.IsLinux ? ""//throw new NotImplementedException()
+                                                : @"G:\dev\Ceres.MCGS.ok\artifacts\release\net10.0\ceres.mcgs.exe";
     static string exeCeres96() => SoftwareManager.IsLinux ? @"/raid/dev/Ceres96/Ceres.dll"
                                                 : @"C:\ceres\releases\v0.96\ceres.exe";
     static string exeCeresPreNC() => SoftwareManager.IsLinux ? @"/raid/dev/v0.97RC3/artifacts/release/5.0/Ceres.dll"
@@ -132,7 +132,7 @@ namespace Ceres.APIExamples
     }
 
 
-    public enum HeadTestType {  Default, Policy, Value};
+    public enum HeadTestType { Default, Policy, Value };
 
     /// <summary>
     /// Test code.
@@ -140,7 +140,11 @@ namespace Ceres.APIExamples
     public static float Test(GameEngineDef overrideCeresEngine1Def = null,
                              GameEngineDef overrideCeresEngine2Def = null,
                              string overrideNET1 = null, string overrideNET2 = null,
-                             HeadTestType headType = HeadTestType.Default)
+                             HeadTestType headType = HeadTestType.Default,
+                             SearchLimit overrideSearchLimit1 = null,
+                             SearchLimit overrideSearchLimit2 = null,
+                             GameEngineDef overrideExternalEngineDef = null,
+                             bool? runSuite = null)
     {
       //      PreTournamentCleanup();
       //RunEngineComparisons(); return;
@@ -162,7 +166,7 @@ namespace Ceres.APIExamples
       NET1 = "~T3_DISTILL_512_15_FP16_TRT";
       NET2 = "~T3_DISTILL_512_15_NATIVE";
       NET1 = "~BT4_FP16_TRT";
-
+      NET2 = "~T70";
 
       //      NET2 = "~T1_DISTILL_256_10_FP16";
 
@@ -216,11 +220,12 @@ namespace Ceres.APIExamples
 
       //      NET2 = "~T1_DISTILL_256_10_FP16";
 
-      
+
       //NET2 = "~BT4_FP16_TRT";
       //NET2 = "~T3_512_15_FP16_TRT";
 
-//      NNEvaluatorDef t1Distill = NNEvaluatorDef.FromSpecification("~T1_512_RL_TRT", "GPU:0#TensorRT16");
+#if NOT
+      //      NNEvaluatorDef t1Distill = NNEvaluatorDef.FromSpecification("~T1_512_RL_TRT", "GPU:0#TensorRT16");
       NNEvaluatorDef t1Distill = NNEvaluatorDef.FromSpecification("~T1_DISTILL_256_10_FP16", "GPU:0#TensorRT16");
       NNEvaluatorDef bt4 = NNEvaluatorDef.FromSpecification("~BT4_FP16_TRT", "GPU:0#TensorRT16");
 
@@ -233,7 +238,7 @@ namespace Ceres.APIExamples
         null, null,
         (t1Distill.Nets[0].Net, 1, 1, 1, 1, 1, 1),
         (bt4.Nets[0].Net, 1, 1, 1, 1, 1, 1));
-
+#endif
 
       //      NNEvaluatorDef twoNets = new NNEvaluatorDef(NNEvaluatorNetComboType.WtdAverage, gpu3, null, null, (netT30, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f), (netT40, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f));
 
@@ -271,15 +276,15 @@ namespace Ceres.APIExamples
       //      NET1 = "9ae67f7c4630_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_3699993600.onnx";//|USEV2";
 
 
-//great,lepned, became final 640x34
-//NET1 = "f2c88aecad90_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_7999982592_8199979008_8399978496_8599981056_8799977472_8999980032_9199979520_9399979008.onnx";
+      //great,lepned, became final 640x34
+      //NET1 = "f2c88aecad90_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_7999982592_8199979008_8399978496_8599981056_8799977472_8999980032_9199979520_9399979008.onnx";
 
-//      NET1 = "HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_last_nc.onnx";
-//      NET1 = "C1-640-34.onnx|USEV2";
-//      NET1 = "C1-640-34.onnx";
-//      NET2 = "C1-640-34.onnx|USEV2";
+      //      NET1 = "HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_last_nc.onnx";
+      //      NET1 = "C1-640-34.onnx|USEV2";
+      //      NET1 = "C1-640-34.onnx";
+      //      NET2 = "C1-640-34.onnx|USEV2";
 
-     NET1 = "Ceres:HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_last.onnx";
+      NET1 = "Ceres:HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_last.onnx";
 
       //      NET1 = "f2c88aecad90_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_7999982592_8199979008_8399978496_8599981056_8799977472_8999980032_9199979520_9399979008_7899979776_8099979264_8299978752_8499978240_8699980800_8899977216_9099979776_9299976192.onnx";
       //+3@1000      NET1 = "f2c88aecad90_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_monster_8599981056_8799977472_last.onnx";
@@ -313,7 +318,7 @@ namespace Ceres.APIExamples
 
       //      NET1 = "~T1_256_RL_TRT";
       //NET2 = "~BT5_FP16";
-      
+
       NET1 = "C1-512-25";
 
 
@@ -327,7 +332,7 @@ namespace Ceres.APIExamples
       //      NET2 = "C1-640-34";
       NET1 = "C1-640-34,combo35j5_nc,~BT4_FP16_TRT,HOP_SP_512_55_16H_FFN3_NLA_SMOL_SP_B1_8bn_BASE_fp16_2599993344";
       //,~BT5_FP16";
-   //      NET2 = "combo35j_nc";
+      //      NET2 = "combo35j_nc";
 
 
       //      NET1 = "HOP_SP_512_55_16H_FFN3_NLA_SMOL_SP_B1_8bn_BASE_fp16_last";
@@ -345,32 +350,32 @@ namespace Ceres.APIExamples
       //      NET1 = "combo35j5_nc";
       //NET2 = "combo35j_nc";
       //      NET1 = "HOP_SP_512_55_16H_FFN3_NLA_SMOL_SP_B1_8bn_BASE_fp16_2199994368,C1-640-34";
-//      NET1 = "ONNX_TRT:bt4-4520.pb.gz_fp16";
+      //      NET1 = "ONNX_TRT:bt4-4520.pb.gz_fp16";
 
-//      NET1 = "~T81";
-//NET2 = "C1-640-34";
-//      NET2 = "~BT4_NATIVE";
-//      NET2 = "~BT4_FP16";
+      //      NET1 = "~T81";
+      //NET2 = "C1-640-34";
+      //      NET2 = "~BT4_NATIVE";
+      //      NET2 = "~BT4_FP16";
 
       //      NET2 = "~T81";
-//NET2 = "~T81_FP16_TRT";
+      //NET2 = "~T81_FP16_TRT";
 
       //NET1 = "CUSTOM1";
 
-//      NET1 = "C1-640-34.value3_L32_x2.onnx|V2TEMP=1.0;V2FRAC=0.5";
+      //      NET1 = "C1-640-34.value3_L32_x2.onnx|V2TEMP=1.0;V2FRAC=0.5";
       //      NET2 = "C1-640-34.value3_L32_x2.onnx|V2FRAC=0";
       //      NET2 = "C1-640-34"
-//      NET1 = "55_comboX";
+      //      NET1 = "55_comboX";
 
       NET1 = "HOP_SP_512_55_16H_FFN3_NLA_SMOL_SP_B1_8bn_BASE_fp16_5799985152.onnx|V2FRAC=0.4;V1TEMP=0.8;V2TEMP=1.5";
       NET1 = "combo35j5T_nc";
-//      NET2 = "9ae67f7c4630_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_5999984640.onnx";
-//      NET2 = "HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_5399986176.onnx";
+      //      NET2 = "9ae67f7c4630_SP_640_34_20H_FFN3_NLA_SMOL_SP_B1_10bn_fp16_5999984640.onnx";
+      //      NET2 = "HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_5399986176.onnx";
 
-//      NET1 = "CUSTOM1|V2FRAC=0.5;V1TEMP=0.8;V2TEMP=1.15";
+      //      NET1 = "CUSTOM1|V2FRAC=0.5;V1TEMP=0.8;V2TEMP=1.15";
       //NET2 = "CUSTOM2";
 
-//      NET1 = @"e:\cout\nets\C1-512-35.value3_L33_x2.onnx.value3|V2FRAC=0.6;V1TEMP=0.80;V2TEMP=1.1";
+      //      NET1 = @"e:\cout\nets\C1-512-35.value3_L33_x2.onnx.value3|V2FRAC=0.6;V1TEMP=0.80;V2TEMP=1.1";
       NET1 = @"e:\cout\nets\C1-512-35.value3_L33_x2.onnx.value3|V2FRAC=1;V1TEMP=0.80;V2TEMP=1.0";
       //      NET2 = "C1-512-35";//|V2FRAC=0.4;V1TEMP=0.8;V2TEMP=1.5";
       //      NET1 = "C1-512-35.value3_L33_x2";
@@ -382,28 +387,28 @@ namespace Ceres.APIExamples
 
       //      NET1 = "combo640T_nc";
 
-//      NET1 = "combo_55_2last.onnx|V2FRAC=1;V2TEMP=1.2";
+      //      NET1 = "combo_55_2last.onnx|V2FRAC=1;V2TEMP=1.2";
       //NET1 = NET2 = "C1-512-25";
 
       NET1 = "C1-640-34.value3_L32_x4.onnx.value3.onnx|V2FRAC=1;V1TEMP=0.8;V2TEMP=1.4";
-//      NET2 = "C1-640-34.value3_L32_x2.onnx.value3.onnx|V2FRAC=1;V1TEMP=0.8;V2TEMP=1";
+      //      NET2 = "C1-640-34.value3_L32_x2.onnx.value3.onnx|V2FRAC=1;V1TEMP=0.8;V2TEMP=1";
       NET2 = "C1-640-34|V2FRAC=0";//
 
       NET2 = "HOP_SP_512_55_16H_FFN4_NLA_SMOL_SP_B1_9bn_fp16_5599985664.onnx";
-      
-      NET1 = "frankenstein8x2_nc.onnx";
 
-//      NET1 = "lepned.lora";
-//      NET1 = "C1-512-35.french002.lora.onnx";
+      NET1 = "~T81";
+      NET2 = "~T81";// "C1-640-34";
 
-//      NET1 = "HOP_SP_512_55_16H_FFN4_NLA_SMOL_SP_B1_9bn_fp16_6799982592";
-      NET2 = "C1-640-34";
+      //      NET1 = "lepned.lora";
+      //      NET1 = "C1-512-35.french002.lora.onnx";
+
+      //      NET1 = "HOP_SP_512_55_16H_FFN4_NLA_SMOL_SP_B1_9bn_fp16_6799982592";
 
       //      NET1 = "HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_7399983104_lora.onnx";
       //      NET2 = "HOP_SP_512_35_16H_FFN3_NLA_SMOL_SP_B1_80bn_fp16_7399983104.onnx";
 
       //NET1 = "HOP_SP_512_55_16H_FFN4_NLA_SMOL_SP_B1_9bn_fp16_last.onnx";
-      NET2 = "~BT4_FP16_TRT";
+      //NET2 = "~BT4_FP16_TRT";
       //NET2 = "combo_55_6x_67bn";
 
 
@@ -431,7 +436,8 @@ namespace Ceres.APIExamples
       //NET2 = "~T1_DISTIL_512_15_NATIVE";
 
 
-      SearchLimit limit1 = SearchLimit.NodesPerMove(2000); //with 100 game pairs 20=78sec, 50=105sec
+      SearchLimit limit1 = SearchLimit.NodesPerMove(100); //with 100 game pairs 20=78sec, 50=105sec
+//SearchLimit limit1 = SearchLimit.SecondsPerMove(3);
       //limit1 = SearchLimit.BestValueMove;
       if (headType == HeadTestType.Policy)
       {
@@ -444,8 +450,16 @@ namespace Ceres.APIExamples
 
       //      limit1 = new SearchLimit(SearchLimitType.SecondsForAllMoves, 60, false, 0.1f);
       SearchLimit limit2 = limit1;
-//      limit1 = limit2 = SearchLimit.SecondsForAllMoves(30, .5f);
+      //      limit1 = limit2 = SearchLimit.SecondsForAllMoves(30, .5f);
 
+      if (overrideSearchLimit1 != null)
+      {
+        limit1 = overrideSearchLimit1;
+      }
+      if (overrideSearchLimit2 != null)
+      {
+        limit2 = overrideSearchLimit2;
+      }
 
       Console.WriteLine();
 
@@ -510,8 +524,8 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       NNEvaluatorDef evalDef1 = NNEvaluatorDefFactory.FromSpecification(NET1, GPUS_1);
       NNEvaluatorDef evalDef2 = NET2 == null ? null : NNEvaluatorDefFactory.FromSpecification(NET2, GPUS_2);
 
-//      evalDef1 = evaluatorDefEndgameStrong;
-//      evalDef2 = t1Distill;
+      //      evalDef1 = evaluatorDefEndgameStrong;
+      //      evalDef2 = t1Distill;
 
       NNEvaluatorDef? evalDefSecondary1 = null;
       if (NET1_SECONDARY1 != null)
@@ -561,15 +575,15 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       //engineDefCeres2.SearchParams.Execution.MaxBatchSize = 3;
 
       //engineDefCeres1.SelectParams.MinimaxSurpriseMultiplier = 0.10f;
-//      engineDefCeres1.SelectParams.CPUCT *= 0.70f;
-//      engineDefCeres2.SelectParams.CPUCT *= 0.70f;
+      //      engineDefCeres1.SelectParams.CPUCT *= 0.70f;
+      //      engineDefCeres2.SelectParams.CPUCT *= 0.70f;
 
-//      engineDefCeres1.SelectParams.PolicySoftmax *= 0.85f;
+      //      engineDefCeres1.SelectParams.PolicySoftmax *= 0.85f;
 
       engineDefCeres1.SearchParams.ReusePositionEvaluationsFromOtherTree = false;
       engineDefCeres2.SearchParams.ReusePositionEvaluationsFromOtherTree = false;
 
-      if (true)
+      if (false)
       {
         engineDefCeres1.SearchParams.Execution.FlowDualSelectors = false;
         engineDefCeres2.SearchParams.Execution.FlowDualSelectors = false;
@@ -577,8 +591,8 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
         engineDefCeres2.SearchParams.Execution.FlowDirectOverlapped = false;
       }
 
-      engineDefCeres1.SearchParams.FutilityPruningStopSearchEnabled = false;
-      engineDefCeres2.SearchParams.FutilityPruningStopSearchEnabled = false;
+      //engineDefCeres1.SearchParams.FutilityPruningStopSearchEnabled = false;
+      //engineDefCeres2.SearchParams.FutilityPruningStopSearchEnabled = false;
 
 
       if (false)
@@ -623,7 +637,7 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
 
       //      engineDefCeres1.SearchParams.EnableSearchExtension = false;
       //      engineDefCeres2.SearchParams.EnableSearchExtension = false;
-//engineDefCeres1.SearchParams.TestFlag = true;
+      //engineDefCeres1.SearchParams.TestFlag = true;
       //      engineDefCeres1.SearchParams.Execution.FlowDualSelectors = false;
       //      engineDefCeres1.SearchParams.TranspositionRootPolicyBlendingFraction = 0.5f;
 
@@ -708,7 +722,7 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
 
 
       // TODO: support this in GameEngineDefCeresUCI
-      bool forceDisableSmartPruning = limit1.IsNodesLimit && !limit1.IsPerGameLimit;
+      bool forceDisableSmartPruning = !limit1.IsPerGameLimit;
       if (forceDisableSmartPruning)
       {
         engineDefCeres1.SearchParams.FutilityPruningStopSearchEnabled = false;
@@ -723,13 +737,13 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       GameEngineDef engineDefCeresUCI1 = new GameEngineDefCeresUCI("CeresUCINew", evalDef1, overrideEXE: exeCeres(), disableFutilityStopSearch: forceDisableSmartPruning);
       GameEngineDef engineDefCeresUCI2 = new GameEngineDefCeresUCI("CeresUCINew", evalDef2, overrideEXE: exeCeres(), disableFutilityStopSearch: forceDisableSmartPruning);
 
-      GameEngineDef engineDefCeres93 = new GameEngineDefCeresUCI("Ceres93", evalDef2, overrideEXE: exeCeres93(), disableFutilityStopSearch: forceDisableSmartPruning);
+      GameEngineDef ceresV2 = new GameEngineDefCeresUCI("CeresV2", evalDef2, overrideEXE: exeCeresV2(), disableFutilityStopSearch: forceDisableSmartPruning);
       GameEngineDef engineDefCeres96 = new GameEngineDefCeresUCI("Ceres96", evalDef2, overrideEXE: exeCeres96(), disableFutilityStopSearch: forceDisableSmartPruning);
       GameEngineDef engineDefCeresPreNC = new GameEngineDefCeresUCI("CeresPreNC", evalDef2, overrideEXE: exeCeresPreNC(), disableFutilityStopSearch: forceDisableSmartPruning);
 
       EnginePlayerDef playerCeres1UCI = new EnginePlayerDef(engineDefCeresUCI1, limit1);
       EnginePlayerDef playerCeres2UCI = new EnginePlayerDef(engineDefCeresUCI2, limit2);
-      EnginePlayerDef playerCeres93 = new EnginePlayerDef(engineDefCeres93, limit2);
+      EnginePlayerDef playerCeresV2 = new EnginePlayerDef(ceresV2, limit2);
       EnginePlayerDef playerCeres96 = new EnginePlayerDef(engineDefCeres96, limit2);
       EnginePlayerDef playerCeresPreNC = new EnginePlayerDef(engineDefCeresPreNC, limit2);
 
@@ -745,12 +759,12 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       GameEngineDefLC0 engineDefLC1 = ENABLE_LC0_1 ? new GameEngineDefLC0("LC0_0", evalDef1, forceDisableSmartPruning, null, null, overrideEXE: OVERRIDE_LC0_EXE, overrideBackendString: OVERRIDE_LC0_BACKEND_STRING) : null;
       GameEngineDefLC0 engineDefLC2 = ENABLE_LC0_2 ? new GameEngineDefLC0("LC0_2", evalDef2, forceDisableSmartPruning, null, null, overrideEXE: OVERRIDE_LC0_EXE, overrideBackendString: OVERRIDE_LC0_BACKEND_STRING) : null;
 
-      EnginePlayerDef playerStockfish17 = new EnginePlayerDef(MakeEngineDefStockfish("SF17", SF17_EXE, hashtableSize:64, numThreads:6), limit2);// * 350);
+      EnginePlayerDef playerStockfish17 = new EnginePlayerDef(MakeEngineDefStockfish("SF17", SF17_EXE, hashtableSize: 64, numThreads: 6), limit2);// * 350);
       EnginePlayerDef playerLC0 = ENABLE_LC0_1 ? new EnginePlayerDef(engineDefLC1, limit1) : null;
       EnginePlayerDef playerLC0_2 = ENABLE_LC0_2 ? new EnginePlayerDef(engineDefLC2, limit2) : null;
 
 
-      const bool RUN_SUITE = false;
+      bool RUN_SUITE = false;// (runSuite is not null) && runSuite.Value;
       if (RUN_SUITE)
       {
         // NET2 = null;
@@ -773,40 +787,49 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
           }
         }
 
-        NNEvaluator bmEval1 = NNEvaluator.FromSpecification(NET1, GPUS_1);
-        NNEvaluator bmEval2 = NET2 == null ? null : NNEvaluator.FromSpecification(NET2, GPUS_2);
-
-        if (overrideNET1 == null)
+        if (overrideCeresEngine1Def == null)
         {
-          Console.WriteLine();
-          Console.WriteLine("BENCHMARK");
-          Console.WriteLine("1: " + NNEvaluatorBenchmark.EstNPS(bmEval1, bigBatchSize: 256).NPSBigBatch);
-          Console.WriteLine("1: " + NNEvaluatorBenchmark.EstNPS(bmEval1, bigBatchSize: 256).NPSBigBatch);
-          if (bmEval2 != null)
+          NNEvaluator bmEval1 = NNEvaluator.FromSpecification(NET1, GPUS_1);
+          NNEvaluator bmEval2 = NET2 == null ? null : NNEvaluator.FromSpecification(NET2, GPUS_2);
+
+          if (overrideNET1 == null)
           {
-            Console.WriteLine("2: " + NNEvaluatorBenchmark.EstNPS(bmEval2, bigBatchSize: 256).NPSBigBatch);
-            Console.WriteLine("2: " + NNEvaluatorBenchmark.EstNPS(bmEval2, bigBatchSize: 256).NPSBigBatch);
+            Console.WriteLine();
+            Console.WriteLine("BENCHMARK");
+            Console.WriteLine("1: " + NNEvaluatorBenchmark.EstNPS(bmEval1, bigBatchSize: 256).NPSBigBatch);
+            Console.WriteLine("1: " + NNEvaluatorBenchmark.EstNPS(bmEval1, bigBatchSize: 256).NPSBigBatch);
+            if (bmEval2 != null)
+            {
+              Console.WriteLine("2: " + NNEvaluatorBenchmark.EstNPS(bmEval2, bigBatchSize: 256).NPSBigBatch);
+              Console.WriteLine("2: " + NNEvaluatorBenchmark.EstNPS(bmEval2, bigBatchSize: 256).NPSBigBatch);
+            }
+            Console.WriteLine();
           }
-          Console.WriteLine();
         }
 
-        string BASE_NAME = "ERET_VESELY203.epd";//"hard-talkchess-2022.epd";//"lichess_db_puzzle.epd"; //"chad_tactics-100M.epd";//"hard-talkchess-2022.epd";//"hard-talkchess-2022.epd"; //   "endgame2.epd";// "benchmark.epd";// "endgame2.epd";//  eret nice_lcx Stockfish238
+        string BASE_NAME = "hard-talkchess-2022.epd";//"chad_tactics-100M.epd";//"ERET_VESELY203.epd"; //"endgame2.epd";// "lichess_db_puzzle.epd"; "hard-talkchess-2022.epd";    "benchmark.epd";// "endgame2.epd";//  eret nice_lcx Stockfish238
+                                                     //        BASE_NAME = "endgame2.epd";
         ParamsSearch paramsNoFutility = new ParamsSearch() { FutilityPruningStopSearchEnabled = false };
 
         // ===============================================================================
         string suiteGPU = POOLED ? "GPU:0:POOLED=SHARE1" : GPUS_1;
         const bool BIG_TEST = true;
+        GameEngineDef engine1Def = overrideCeresEngine1Def == null ? GameEngineDefFactory.CeresInProcess("Ceres1", NET1, suiteGPU, paramsNoFutility with { }, new ParamsSelect() { })
+                                                               : overrideCeresEngine1Def;
         SuiteTestDef suiteDef =
           new SuiteTestDef("Suite",
                            SoftwareManager.IsLinux ? @$"/mnt/syndev/chess/data/epd/{BASE_NAME}"
                                                    : @$"\\synology\dev\chess\data\epd\{BASE_NAME}",
                            limit1,
-                           GameEngineDefFactory.CeresInProcess("Ceres1", NET1, suiteGPU, paramsNoFutility with { }, new ParamsSelect() { }),
-                           NET2 == null ? null : GameEngineDefFactory.CeresInProcess("Ceres2", NET2, suiteGPU, paramsNoFutility with { }, new ParamsSelect()),
-                           null);// engineDefCeres96);// playerLC0.EngineDef);
+                           engine1Def,
+                           null,//NET2 == null ? null : GameEngineDefFactory.CeresInProcess("Ceres2", NET2, suiteGPU, paramsNoFutility with { }, new ParamsSelect()),
+                         playerCeresV2.EngineDef);
 
-        suiteDef.MaxNumPositions = BIG_TEST ? 2500 : 1000;
-        
+        //                           overrideExternalEngineDef);// engineDefCeres96);// playerLC0.EngineDef);
+
+        suiteDef.DumpEPDInfo = true;
+        suiteDef.MaxNumPositions = 250;// BIG_TEST ? 2500 : 1000;
+
         suiteDef.EPDLichessPuzzleFormat = suiteDef.EPDFileName.ToUpper().Contains("LICHESS");
         if (suiteDef.EPDLichessPuzzleFormat)
         {
@@ -919,7 +942,7 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       }
 
 
-      def.NumGamePairs = 500;
+      def.NumGamePairs = 2 * 5 * 50;// 110; // was:75
       def.ShowGameMoves = false;
 
       //string baseName = "tcec1819";
@@ -938,10 +961,11 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
         //        def.AcceptPosExcludeIfContainsPieceTypeList = [PieceType.Queen, PieceType.Bishop, PieceType.Knight];
       }
 
-      baseName = "tcec_big";
       //baseName = "UHO_Lichess_4852_v1.epd"; // recommended by Kovax
       baseName = "UHO_Lichess_4852_v1_first.epd"; // approximately first 2500 positions for faster loading
-                                                  //baseName = "UHO_Lichess_4582_v1_last_10000.epd";
+      //baseName = "tcec_big";
+      //baseName = "test1.epd";
+      //baseName = "UHO_Lichess_4582_v1_last_10000.epd";
       if (false)
       {
         baseName = "eco_test";
@@ -949,8 +973,8 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       }
 
       //baseName = "endingbook-10man-3181.pgn";
-      //baseName = "endingbook-16man-9609.pgn";
-      //      baseName = "endingbook-12man-4624.pgn";
+//      baseName = "endingbook-16man-9609.pgn";
+      //  baseName = "endingbook-12man-4624.pgn";
 
       string postfix = (baseName.ToUpper().EndsWith(".EPD") || baseName.ToUpper().EndsWith(".PGN")) ? "" : ".pgn";
       def.OpeningsFileName = SoftwareManager.IsLinux ? @$"/mnt/syndev/chess/data/openings/{baseName}{postfix}"
@@ -997,7 +1021,8 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
       }
 
       // Compute and return ELO performance of first player
-      PlayerStat player = results.Players.FirstOrDefault(p => p.Name == "Ceres1");
+      string firstPlayerID = overrideCeresEngine1Def != null ? overrideCeresEngine1Def.ID : "Ceres1";
+      PlayerStat player = results.Players.FirstOrDefault(p => p.Name == firstPlayerID);
       int numDraws = player.NumGames - player.PlayerWins - player.PlayerLosses;
       float eloPerf = EloCalculator.EloDiff(player.PlayerWins, numDraws, player.PlayerLosses);
 

@@ -54,7 +54,7 @@ namespace Ceres.Chess.Positions
     MGPosition finalPosMG;
 
     Position[] positions;
-  
+
 
     /// <summary>
     /// Optionally the next actual move (made after the final position).
@@ -195,6 +195,30 @@ namespace Ceres.Chess.Positions
 
 
     /// <summary>
+    /// Returns if a specified PositionWithHistory is
+    /// or a continuation of this.
+    /// </summary>
+    /// <param name="possibleContinuation"></param>
+    /// <returns></returns>
+    public bool HasContinuationOf(PositionWithHistory possibleContinuation)
+    {
+      Position[] thisPositions = this.Positions;
+      Position[] matchPositions = possibleContinuation.Positions;
+
+      for (int i = 0; i < thisPositions.Length; i++)
+      {
+        if (thisPositions[i] != possibleContinuation.Positions[i])
+        {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+
+
+    /// <summary>
     /// Returns a PositionWithHistory from a specified starting FEN and sequence of move strings in SAN format.
     /// </summary>
     /// <param name="fen"></param>
@@ -305,6 +329,7 @@ namespace Ceres.Chess.Positions
             mgPos.MakeMove(mgMove);
           }
         }
+        ret.InitPositionsAndFinalPosMG();
       }
 
       return ret;
@@ -491,6 +516,26 @@ namespace Ceres.Chess.Positions
     }
 
 
+    /// <summary>
+    /// Returns if there are duplicate positions in the history.
+    /// </summary>
+    /// <typeparam name="M"></typeparam>
+    /// <param name="equivalenceClassMap"></param>
+    /// <returns></returns>
+    public bool ContainsDuplicatePosition<M>(Func<Position, M> equivalenceClassMap) where M : IEquatable<M>
+    {
+      HashSet<M> set = new(Positions.Length);
+      foreach (Position pos in Positions)
+      {
+        if (!set.Add(equivalenceClassMap(pos)))
+        {
+          return true;
+        }
+      }
+      return false;
+    }
+
+
     #region Enumeration
 
     /// <summary>
@@ -536,7 +581,14 @@ namespace Ceres.Chess.Positions
     /// <summary>
     /// Enumerates all the positions in the history.
     /// </summary>
-    public Position[] Positions => positions;
+    public Position[] Positions
+    {
+      get
+      {
+        CheckInit();
+        return positions;
+      }
+    }
 
     #endregion
 
@@ -552,7 +604,7 @@ namespace Ceres.Chess.Positions
       {
         string moveStr = "";
         foreach (MGMove move in Moves)
-        {          
+        {
           moveStr += move.MoveStr(MGMoveNotationStyle.Coordinates) + " ";
         }
         return moveStr;
@@ -632,7 +684,7 @@ namespace Ceres.Chess.Positions
     public bool Equals(PositionWithHistory other)
     {
       // Equality of positions suffices.
-      return other != null 
+      return other != null
           && positions.Length == other.positions.Length
           && positions.SequenceEqual(other.positions);
     }
