@@ -14,24 +14,24 @@
 #region Using directives
 
 using System;
-using System.IO;
-using System.Diagnostics;
-using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
-
-using Ceres.Chess.NNEvaluators.Defs;
-using Chess.Ceres.NNEvaluators;
-using Ceres.Chess.NNFiles;
-using Chess.Ceres.NNEvaluators.TensorRT;
-using Ceres.Chess.UserSettings;
-using Ceres.Chess.NNEvaluators.CUDA;
+using System.Threading.Tasks;
+using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.LC0.NNFiles;
 using Ceres.Chess.LC0.WeightsProtobuf;
-using Ceres.Chess.LC0.Batches;
-using Ceres.Chess.NNEvaluators.Ceres.TPG;
-using Ceres.Chess.NNEvaluators.Ceres;
 using Ceres.Chess.NNBackends.ONNXRuntime;
+using Ceres.Chess.NNEvaluators.Ceres;
+using Ceres.Chess.NNEvaluators.Ceres.TPG;
+using Ceres.Chess.NNEvaluators.CUDA;
+using Ceres.Chess.NNEvaluators.Defs;
+using Ceres.Chess.NNEvaluators.TensorRT;
+using Ceres.Chess.NNFiles;
+using Ceres.Chess.UserSettings;
+using Chess.Ceres.NNEvaluators;
+using Chess.Ceres.NNEvaluators.TensorRT;
 
 #endregion
 
@@ -262,10 +262,13 @@ namespace Ceres.Chess.NNEvaluators
       const int TRT_MAX_BATCH_SIZE = 1024; // See note in ONNXExecutor, possibly configuring profile to include large batches hinders performance.
       const bool ONNX_SCALE_50_MOVE_COUNTER = false; // BT2 already inserts own node to adjust
 
+      bool isTensorRTNative = deviceDef.OverrideEngineType?.Contains("TensorRTNative", StringComparison.OrdinalIgnoreCase) == true;
+
       switch (netDef.Type)
       {
         case NNEvaluatorType.ONNXViaTRT:
         case NNEvaluatorType.ONNXViaORT:
+
           bool viaTRT = netDef.Type == NNEvaluatorType.ONNXViaTRT
              || (deviceDef.OverrideEngineType != null && deviceDef.OverrideEngineType.StartsWith("TensorRT16"));
           int maxONNXBatchSize = viaTRT ? TRT_MAX_BATCH_SIZE : DEFAULT_MAX_BATCH_SIZE;
@@ -280,6 +283,12 @@ namespace Ceres.Chess.NNEvaluators
           if (!fullFN.ToUpper().Contains("ONNX"))
           {
             fullFN += ".onnx";
+          }
+
+          if (isTensorRTNative)
+          {
+            return NNEvaluatorTensorRT.BuildEvaluator(netDef, gpuIDs: [deviceDef.DeviceIndex], options,
+                                                      ONNXNetExecutor.NetTypeEnum.LC0, fullFN);
           }
           ret = new NNEvaluatorONNX(netDef.ShortID, fullFN, null, deviceDef.Type, deviceDef.DeviceIndex, useTRT: viaTRT,
                                             ONNXNetExecutor.NetTypeEnum.LC0, maxONNXBatchSize,
@@ -307,16 +316,16 @@ namespace Ceres.Chess.NNEvaluators
 
         case NNEvaluatorType.Ceres:
           string[] CERES_ENGINE_TYPES = { "CUDA", "CUDA16", "CUDA32",
-                                           "TENSORRT", "TENSORRT16", "TENSORRT32",
-                                           "TORCHSCRIPT"};
+                                          "TENSORRTNATIVE",
+                                          "TENSORRT", "TENSORRT16", "TENSORRT32",
+                                          "TORCHSCRIPT"};
           if (deviceDef.OverrideEngineType != null && !CERES_ENGINE_TYPES.Contains(deviceDef.OverrideEngineType.ToUpper()))
           {
             throw new Exception($"Ceres engine type not specified or invalid: {deviceDef.OverrideEngineType}."
               + System.Environment.NewLine + "Valid types: " + string.Join(", ", CERES_ENGINE_TYPES));
           }
 
-          bool isTorchscipt = deviceDef.OverrideEngineType != null
-                           && deviceDef.OverrideEngineType.ToUpper().Contains("TORCHSCRIPT");
+          bool isTorchscipt = deviceDef.OverrideEngineType?.Contains("TORCHSCRIPT", StringComparison.OrdinalIgnoreCase) == true;
 
           // Temporary hack, Ceres nets requires positions to be retained.
           // TODO: Remove this, or make it an instance variable not global static.
@@ -376,6 +385,15 @@ namespace Ceres.Chess.NNEvaluators
             }
 
             return evaluatorTS;
+          }
+          else if (isTensorRTNative)
+          {
+            if (optionsCeres.HeadOverrides != null)
+            {
+              throw new NotImplementedException("Ceres TensorRT Native evaluator does not yet support head overrides.");
+            }
+
+            return NNEvaluatorTensorRT.BuildEvaluator(netDef, gpuIDs: [deviceDef.DeviceIndex], optionsCeres);
           }
           else
           {
@@ -646,8 +664,6 @@ namespace Ceres.Chess.NNEvaluators
         throw new Exception("DeviceComboType.Single is not expected when number of DeviceIndices is greater than 1.");
       }
 
-      //        if (Params.EstimatePerformanceCharacteristics) ret.CalcStatistics(true);
-
       // TODO: restore implementation, test more to see if faster or memory efficient
       const bool LC0_SERVER_ENABLE_MULTI_GPU = false; // seems somewhat slower
       if (LC0_SERVER_ENABLE_MULTI_GPU
@@ -665,6 +681,23 @@ namespace Ceres.Chess.NNEvaluators
 
       if (def.DeviceCombo != NNEvaluatorDeviceComboType.Single)
       {
+        // Check for special case: Split with TensorRTNative on all devices with identical nets
+        // In this case, use FromDefinition which handles multi-GPU natively
+        if (def.DeviceCombo == NNEvaluatorDeviceComboType.Split
+            && def.Devices.Length > 0
+            && def.Nets.Length > 0)
+        {
+          bool allTensorRTNative = def.Devices.All(d => d.Device.OverrideEngineType?.Contains("TensorRTNative", StringComparison.OrdinalIgnoreCase) == true);
+
+          bool allNetsMatch = def.Nets.Length == 1 || def.Nets.All(n => n.Net.Equals(def.Nets[0].Net));
+
+          if (allTensorRTNative && allNetsMatch)
+          {
+            def.Options = new NNEvaluatorOptionsCeres().OptionsWithOptionsDictApplied(options);
+            return NNEvaluatorTensorRT.FromDefinition(def, def.Options, def.DeviceIndices);
+          }
+        }
+
         return BuildDeviceCombo(def, referenceEvaluator, options);
       }
       else if (def.NetCombo != NNEvaluatorNetComboType.Single)
