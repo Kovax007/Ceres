@@ -139,11 +139,33 @@ namespace Ceres
 
             Ceres.MCTS.Params.ParamsSelect selectParams = new Ceres.MCTS.Params.ParamsSelect();
 
+            // Alias map: Ceres.json config names → actual C# field names
+            Dictionary<string, (Type targetType, string fieldName)> paramAliases = new()
+            {
+                ["PolicyTemperature"] = (typeof(Ceres.MCTS.Params.ParamsSelect), "PolicySoftmax"),
+                ["FPU"] = (typeof(Ceres.MCTS.Params.ParamsSelect), "FPUValueAtRoot"),
+                ["Contempt"] = (typeof(Ceres.MCTS.Params.ParamsSearch), "Contempt"),
+            };
+
             // Apply search parameter overrides from config (for SPSA tuning)
             if (config.SearchParams != null)
             {
                 foreach (var kvp in config.SearchParams)
                 {
+                    // Check alias map first
+                    if (paramAliases.TryGetValue(kvp.Key, out var alias))
+                    {
+                        FieldInfo aliasField = alias.targetType.GetField(alias.fieldName, BindingFlags.Public | BindingFlags.Instance);
+                        if (aliasField != null)
+                        {
+                            object target = alias.targetType == typeof(Ceres.MCTS.Params.ParamsSelect) ? selectParams : searchParams;
+                            aliasField.SetValue(target, (float)kvp.Value);
+                            Console.WriteLine($"Set {alias.targetType.Name}.{alias.fieldName} = {kvp.Value} (alias: {kvp.Key})");
+                            continue;
+                        }
+                    }
+
+                    // Try direct field name match on ParamsSelect, then ParamsSearch
                     FieldInfo selectField = typeof(Ceres.MCTS.Params.ParamsSelect).GetField(kvp.Key, BindingFlags.Public | BindingFlags.Instance);
                     if (selectField != null)
                     {
