@@ -38,6 +38,9 @@ using Ceres.MCTS.Params;
 using Chess.Ceres.PlayEvaluation;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 
 #endregion
 
@@ -56,6 +59,7 @@ namespace Ceres
         public int Engine1NodesPerMove { get; set; }
         public int Engine2NodesPerMove { get; set; }
         public string Engine2ExePath { get; set; }
+        public Dictionary<string, double> SearchParams { get; set; }
     }
 
     public static class SPSATournamentRunner
@@ -133,11 +137,40 @@ namespace Ceres
             searchParams.Execution.FlowDualSelectors = false;
             searchParams.Execution.NodeAnnotationCacheSize = 20_000;
 
+            Ceres.MCTS.Params.ParamsSelect selectParams = new Ceres.MCTS.Params.ParamsSelect();
+
+            // Apply search parameter overrides from config (for SPSA tuning)
+            if (config.SearchParams != null)
+            {
+                foreach (var kvp in config.SearchParams)
+                {
+                    FieldInfo selectField = typeof(Ceres.MCTS.Params.ParamsSelect).GetField(kvp.Key, BindingFlags.Public | BindingFlags.Instance);
+                    if (selectField != null)
+                    {
+                        selectField.SetValue(selectParams, (float)kvp.Value);
+                        Console.WriteLine($"Set ParamsSelect.{kvp.Key} = {kvp.Value}");
+                    }
+                    else
+                    {
+                        FieldInfo searchField = typeof(Ceres.MCTS.Params.ParamsSearch).GetField(kvp.Key, BindingFlags.Public | BindingFlags.Instance);
+                        if (searchField != null)
+                        {
+                            searchField.SetValue(searchParams, (float)kvp.Value);
+                            Console.WriteLine($"Set ParamsSearch.{kvp.Key} = {kvp.Value}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"WARNING: Unknown search parameter '{kvp.Key}', ignoring.");
+                        }
+                    }
+                }
+            }
+
             // Define Ceres engine (in process) with associated neural network and GPU and parameter customizations
             NNEvaluatorDef ceresNNDef = NNEvaluatorDefFactory.FromSpecification(CERES_NET_PATH, CERES_DEVICE);
             GameEngineDefCeres engineDefCeres1 = new GameEngineDefCeres("Ceres1", ceresNNDef, null,
                                                                         searchParams,
-                                                                        new Ceres.MCTS.Params.ParamsSelect(),
+                                                                        selectParams,
                                                                         logFileName: logfile);
 
             // Define players using these engines and specified time control
@@ -170,6 +203,47 @@ namespace Ceres
             PlayerStat sfResults = results.Players[indexCeres == 0 ? 1 : 0];
             float eloDiff = EloCalculator.EloDiff(ceresResults.PlayerWins, ceresResults.Draws, ceresResults.PlayerLosses);
             Console.WriteLine($"CERES W/D/L {ceresResults.PlayerWins} {ceresResults.Draws} {ceresResults.PlayerLosses}");
+
+            // Compute pentanomial statistics by grouping game pairs by opening index.
+            // Result in TournamentGameInfo is from Engine2's perspective.
+            // Ceres is Engine1 (Player1), so we invert: Engine2.Win → Ceres Loss, Engine2.Loss → Ceres Win.
+            string ceresName = ceresResults.Name;
+            int ww = 0, wd = 0, wl = 0, dd = 0, ld = 0, ll = 0;
+            var gamesByOpening = results.GameInfos
+                .GroupBy(g => g.OpeningIndex)
+                .OrderBy(g => g.Key);
+            foreach (var pair in gamesByOpening)
+            {
+                var games = pair.OrderBy(g => g.GameSequenceNum).ToList();
+                if (games.Count != 2) continue;
+
+                // Determine Ceres result for each game in the pair.
+                // Engine2IsWhite tells us player assignment:
+                //   Engine2IsWhite=true  → Engine1 (Ceres) is black, Result is from Engine2 perspective
+                //   Engine2IsWhite=false → Engine1 (Ceres) is white, Result is from Engine2 perspective
+                // In both cases, from Ceres perspective: Win=Loss inverted, Loss=Win inverted, Draw=Draw.
+                int CeresResult(TournamentGameInfo g)
+                {
+                    if (g.Result == TournamentGameResult.Loss) return 1;  // Engine2 lost → Ceres won
+                    if (g.Result == TournamentGameResult.Win) return -1;  // Engine2 won → Ceres lost
+                    return 0; // Draw
+                }
+
+                int r1 = CeresResult(games[0]);
+                int r2 = CeresResult(games[1]);
+                int ceresWins = (r1 == 1 ? 1 : 0) + (r2 == 1 ? 1 : 0);
+                int ceresDraws = (r1 == 0 ? 1 : 0) + (r2 == 0 ? 1 : 0);
+                int ceresLosses = (r1 == -1 ? 1 : 0) + (r2 == -1 ? 1 : 0);
+
+                if (ceresWins == 2) ww++;
+                else if (ceresWins == 1 && ceresDraws == 1) wd++;
+                else if (ceresWins == 1 && ceresLosses == 1) wl++;
+                else if (ceresDraws == 2) dd++;
+                else if (ceresLosses == 1 && ceresDraws == 1) ld++;
+                else if (ceresLosses == 2) ll++;
+            }
+            Console.WriteLine($"PENTANOMIAL {ww} {wd} {wl} {dd} {ld} {ll}");
+
             Console.WriteLine("ELO_DIFFERENCE " + eloDiff);
             System.Environment.Exit(0);
         }
