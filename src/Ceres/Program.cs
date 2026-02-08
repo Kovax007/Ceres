@@ -227,9 +227,7 @@ namespace Ceres
             Console.WriteLine($"CERES W/D/L {ceresResults.PlayerWins} {ceresResults.Draws} {ceresResults.PlayerLosses}");
 
             // Compute pentanomial statistics by grouping game pairs by opening index.
-            // Result in TournamentGameInfo is from Engine2's perspective.
-            // Ceres is Engine1 (Player1), so we invert: Engine2.Win → Ceres Loss, Engine2.Loss → Ceres Win.
-            string ceresName = ceresResults.Name;
+            // Result in TournamentGameInfo is from Engine1's (Player1/Ceres) perspective.
             int ww = 0, wd = 0, wl = 0, dd = 0, ld = 0, ll = 0;
             var gamesByOpening = results.GameInfos
                 .GroupBy(g => g.OpeningIndex)
@@ -239,15 +237,11 @@ namespace Ceres
                 var games = pair.OrderBy(g => g.GameSequenceNum).ToList();
                 if (games.Count != 2) continue;
 
-                // Determine Ceres result for each game in the pair.
-                // Engine2IsWhite tells us player assignment:
-                //   Engine2IsWhite=true  → Engine1 (Ceres) is black, Result is from Engine2 perspective
-                //   Engine2IsWhite=false → Engine1 (Ceres) is white, Result is from Engine2 perspective
-                // In both cases, from Ceres perspective: Win=Loss inverted, Loss=Win inverted, Draw=Draw.
+                // Result is from Engine1 (Ceres) perspective: Win=Ceres won, Loss=Ceres lost.
                 int CeresResult(TournamentGameInfo g)
                 {
-                    if (g.Result == TournamentGameResult.Loss) return 1;  // Engine2 lost → Ceres won
-                    if (g.Result == TournamentGameResult.Win) return -1;  // Engine2 won → Ceres lost
+                    if (g.Result == TournamentGameResult.Win) return 1;   // Ceres won
+                    if (g.Result == TournamentGameResult.Loss) return -1;  // Ceres lost
                     return 0; // Draw
                 }
 
