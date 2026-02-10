@@ -18,6 +18,9 @@
 #include <memory>
 #include <functional>
 #include <cstring>
+#include <atomic>
+#include <unordered_map>
+#include <unordered_set>
 
 // Platform-specific includes for file stat
 #ifdef _WIN32
@@ -114,11 +117,22 @@ namespace
     }
   }
 
+  // Ref-counted shared engine for multi-profile support.
+  // When multiple EngineContexts share a single ICudaEngine,
+  // this struct ensures the engine is only deleted when the last context is freed.
+  struct SharedEngine
+  {
+    nvinfer1::ICudaEngine* engine;
+    std::atomic<int> refCount;
+    SharedEngine(nvinfer1::ICudaEngine* e, int count) : engine(e), refCount(count) {}
+  };
+
   // Engine wrapper struct
   struct EngineContext
   {
     nvinfer1::ICudaEngine* engine = nullptr;
     nvinfer1::IExecutionContext* context = nullptr;
+    SharedEngine* sharedOwner = nullptr;  // Non-null when sharing engine via multi-profile
     int32_t batchSize = 0;
     int32_t deviceId = 0;  // GPU device ID
 
@@ -169,7 +183,20 @@ namespace
         if (buf) cudaFree(buf);
       }
       if (context) delete context;
-      if (engine) delete engine;
+      if (sharedOwner)
+      {
+        // Ref-counted: only delete engine when last context releases it
+        if (sharedOwner->refCount.fetch_sub(1) == 1)
+        {
+          delete sharedOwner->engine;
+          delete sharedOwner;
+        }
+      }
+      else
+      {
+        // Sole owner (backward compat for single-profile code paths)
+        if (engine) delete engine;
+      }
     }
   };
 }
@@ -248,61 +275,252 @@ extern "C"
     options->fp32PostAttentionNorm = 0;
     options->fp32PostAttentionNormStrict = 0;
     options->fp32SmolgenNorm = 0;
+    options->refittable = 0;
   }
 
-  // Helper: print colored console message
-  static void PrintColored(const char* color, const char* message)
+} // end extern "C" (temporarily, for C++ helper functions below)
+
+// Helper: print colored console message
+static void PrintColored(const char* color, const char* message)
+{
+  fprintf(stderr, "%s%s\033[0m\n", color, message);
+}
+
+static void PrintYellow(const char* message)
+{
+  PrintColored("\033[33m", message);
+}
+
+static void PrintGreen(const char* message)
+{
+  PrintColored("\033[32m", message);
+}
+
+// Helper: check if a layer name matches any normalization naming convention.
+static bool HasNormName(const char* layerName)
+{
+  std::string name(layerName);
+  return name.find("rms_norm") != std::string::npos
+    || name.find("ln1") != std::string::npos
+    || name.find("/ln2/") != std::string::npos
+    || name.find("qkvLN") != std::string::npos
+    || name.find("embedding_norm") != std::string::npos
+    || name.find("LayerNorm") != std::string::npos
+    || name.find("layer_norm") != std::string::npos
+    || name.find("rmsnorm") != std::string::npos;
+}
+
+// Check if a layer type performs actual computation (not just data/shape).
+static bool IsComputeLayerType(nvinfer1::LayerType type)
+{
+  return type == nvinfer1::LayerType::kELEMENTWISE
+    || type == nvinfer1::LayerType::kREDUCE
+    || type == nvinfer1::LayerType::kUNARY
+    || type == nvinfer1::LayerType::kNORMALIZATION;
+}
+
+// Build set of residual-stream normalization layer indices.
+// For native kNORMALIZATION layers: mark only those fed by a residual Add.
+// For decomposed norms: find entry points on the residual stream, propagate
+// through the chain, but only mark compute layers (skip kCONSTANT, etc.).
+static std::unordered_set<int32_t> FindResidualStreamNormLayers(
+  const nvinfer1::INetworkDefinition* network, int32_t totalLayers)
+{
+  // Build producer map: tensor name -> producing layer index
+  std::unordered_map<std::string, int32_t> tensorProducer;
+  for (int32_t i = 0; i < totalLayers; ++i)
   {
-    fprintf(stderr, "%s%s\033[0m\n", color, message);
+    auto* layer = network->getLayer(i);
+    for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
+    {
+      auto* tensor = layer->getOutput(j);
+      if (tensor && tensor->getName())
+      {
+        tensorProducer[tensor->getName()] = i;
+      }
+    }
   }
 
-  static void PrintYellow(const char* message)
+  // Count native kNORMALIZATION layers
+  int nativeNormCount = 0;
+  for (int32_t i = 0; i < totalLayers; ++i)
   {
-    PrintColored("\033[33m", message);
+    if (network->getLayer(i)->getType() == nvinfer1::LayerType::kNORMALIZATION)
+      nativeNormCount++;
   }
 
-  static void PrintGreen(const char* message)
+  std::unordered_set<int32_t> residualNormLayers;
+
+  if (nativeNormCount > 0)
   {
-    PrintColored("\033[32m", message);
+    // Path A: native kNORMALIZATION layers exist - mark only those on residual stream
+    for (int32_t i = 0; i < totalLayers; ++i)
+    {
+      auto* layer = network->getLayer(i);
+      if (layer->getType() != nvinfer1::LayerType::kNORMALIZATION)
+        continue;
+
+      auto* inputTensor = layer->getInput(0);
+      if (!inputTensor || !inputTensor->getName())
+        continue;
+
+      auto it = tensorProducer.find(inputTensor->getName());
+      if (it == tensorProducer.end())
+        continue;
+
+      auto* producer = network->getLayer(it->second);
+      for (int depth = 0; depth < 5; ++depth)
+      {
+        std::string rpName(producer->getName());
+        if (rpName.find("ONNXTRT_") != std::string::npos
+          || rpName.find("castHelper") != std::string::npos)
+        {
+          auto* rpInput = producer->getInput(0);
+          if (rpInput && rpInput->getName())
+          {
+            auto rpIt = tensorProducer.find(rpInput->getName());
+            if (rpIt != tensorProducer.end())
+            {
+              producer = network->getLayer(rpIt->second);
+              continue;
+            }
+          }
+        }
+        break;
+      }
+
+      std::string realName(producer->getName());
+      bool isResidualAdd = (producer->getType() == nvinfer1::LayerType::kELEMENTWISE)
+        && (realName.find("add") != std::string::npos
+          || realName.find("Add") != std::string::npos
+          || realName.find("skip") != std::string::npos);
+
+      if (isResidualAdd)
+      {
+        residualNormLayers.insert(i);
+      }
+    }
+    fprintf(stderr, "[TensorRT] Found %d native kNORMALIZATION layers, %d on residual stream\n",
+      nativeNormCount, (int)residualNormLayers.size());
+  }
+  else
+  {
+    // Path B: decomposed norms - mark compute layers in residual-stream norm chains.
+    // Pass 1: find entry-point norm layers fed by residual Add
+    for (int32_t i = 0; i < totalLayers; ++i)
+    {
+      auto* layer = network->getLayer(i);
+      if (!HasNormName(layer->getName()))
+        continue;
+
+      auto* inputTensor = layer->getInput(0);
+      if (!inputTensor || !inputTensor->getName())
+        continue;
+
+      auto it = tensorProducer.find(inputTensor->getName());
+      if (it == tensorProducer.end())
+        continue;
+
+      auto* producer = network->getLayer(it->second);
+      bool producerIsNorm = HasNormName(producer->getName());
+      if (producerIsNorm)
+        continue;
+
+      auto* realProducer = producer;
+      for (int depth = 0; depth < 5; ++depth)
+      {
+        std::string rpName(realProducer->getName());
+        if (rpName.find("ONNXTRT_") != std::string::npos
+          || rpName.find("castHelper") != std::string::npos)
+        {
+          auto* rpInput = realProducer->getInput(0);
+          if (rpInput && rpInput->getName())
+          {
+            auto rpIt = tensorProducer.find(rpInput->getName());
+            if (rpIt != tensorProducer.end())
+            {
+              realProducer = network->getLayer(rpIt->second);
+              continue;
+            }
+          }
+        }
+        break;
+      }
+
+      std::string realName(realProducer->getName());
+      bool isResidualAdd = (realProducer->getType() == nvinfer1::LayerType::kELEMENTWISE)
+        && (realName.find("add") != std::string::npos
+          || realName.find("Add") != std::string::npos
+          || realName.find("skip") != std::string::npos);
+
+      if (isResidualAdd && IsComputeLayerType(layer->getType()))
+      {
+        residualNormLayers.insert(i);
+      }
+    }
+
+    int entryCount = (int)residualNormLayers.size();
+
+    // Pass 2: propagate through norm chain, only marking compute layers
+    bool changed = true;
+    while (changed)
+    {
+      changed = false;
+      for (int32_t i = 0; i < totalLayers; ++i)
+      {
+        if (residualNormLayers.count(i))
+          continue;
+        auto* layer = network->getLayer(i);
+        if (!HasNormName(layer->getName()))
+          continue;
+        if (!IsComputeLayerType(layer->getType()))
+          continue;
+
+        for (int32_t inp = 0; inp < layer->getNbInputs(); ++inp)
+        {
+          auto* inputTensor = layer->getInput(inp);
+          if (!inputTensor || !inputTensor->getName())
+            continue;
+          auto it = tensorProducer.find(inputTensor->getName());
+          if (it != tensorProducer.end() && residualNormLayers.count(it->second))
+          {
+            residualNormLayers.insert(i);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+
+    fprintf(stderr, "[TensorRT] Decomposed norms: %d entry-point + %d chain = %d compute layers on residual stream\n",
+      entryCount, (int)residualNormLayers.size() - entryCount, (int)residualNormLayers.size());
   }
 
-  static void PrintBlue(const char* message)
-  {
-    PrintColored("\033[34m", message);
-  }
+  return residualNormLayers;
+}
 
-  // Helper: check if layer name is a post-attention normalization layer (ln1)
-  // Broad mode: matches any layer with "ln1" in name (includes smolgen ln1)
-  // This converts ~216 layers for a 12-layer network
-  static bool IsPostAttentionNormLayer(const char* layerName)
-  {
-    std::string name(layerName);
-    return name.find("ln1") != std::string::npos;
-  }
+// Helper: strict mode - only match main encoder post-attention ln1
+// Matches: /transformer_layer.X/ln1/...
+// Excludes: /transformer_layer.X/attention/ln1/... (smolgen related)
+// NOTE: This is LC0-specific and does NOT cover Ceres-style nets.
+static bool IsPostAttentionNormLayerStrict(const char* layerName)
+{
+  std::string name(layerName);
+  return name.find("/ln1/") != std::string::npos &&
+    name.find("/attention/ln1/") == std::string::npos;
+}
 
-  // Helper: strict mode - only match main encoder post-attention ln1
-  // Matches: /transformer_layer.X/ln1/...
-  // Excludes: /transformer_layer.X/attention/ln1/... (smolgen related)
-  // NOTE: Testing shows this does NOT fix FP16 accuracy issues!
-  //       The main encoder ln1 layers are NOT the cause of overflow.
-  static bool IsPostAttentionNormLayerStrict(const char* layerName)
-  {
-    std::string name(layerName);
-    // Must contain "/ln1/" but NOT "/attention/ln1/"
-    return name.find("/ln1/") != std::string::npos &&
-      name.find("/attention/ln1/") == std::string::npos;
-  }
+// Helper: smolgen mode - only match smolgen-related ln1 inside attention
+// Matches: /transformer_layer.X/attention/ln1/...
+// NOTE: This is LC0-specific and does NOT cover Ceres-style nets.
+static bool IsSmolgenNormLayer(const char* layerName)
+{
+  std::string name(layerName);
+  return name.find("/attention/ln1/") != std::string::npos;
+}
 
-  // Helper: smolgen mode - only match smolgen-related ln1 inside attention
-  // Matches: /transformer_layer.X/attention/ln1/...
-  // Excludes: /transformer_layer.X/ln1/... (main encoder)
-  // RECOMMENDED: Testing shows this mode achieves the SAME accuracy as broad mode
-  //              while converting ~55% fewer layers (~96 vs ~216 for 12-layer net)
-  static bool IsSmolgenNormLayer(const char* layerName)
-  {
-    std::string name(layerName);
-    return name.find("/attention/ln1/") != std::string::npos;
-  }
+extern "C"
+{
 
   TRT_API TRT_EngineHandle TRT_LoadONNXWithOptions(const char* onnxPath, int32_t batchSize,
     const TRT_BuildOptions* options)
@@ -394,41 +612,49 @@ extern "C"
       config->setFlag(nvinfer1::BuilderFlag::kFP8);
     }
 
+    // Enable refit support if requested
+    if (opts->refittable)
+    {
+      config->setFlag(nvinfer1::BuilderFlag::kREFIT_IDENTICAL);
+      fprintf(stderr, "[TensorRT] Building with REFIT_IDENTICAL support enabled\n");
+    }
+
     // Enable detailed profiling for layer precision inspection
     config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
 
-    // Force FP32 precision for post-attention normalization (ln1) layers if requested
-    // Three modes: broad (fp32PostAttentionNorm) includes all ln1 layers,
-    //              strict (fp32PostAttentionNormStrict) only main encoder ln1 (excludes smolgen)
-    //              smolgen (fp32SmolgenNorm) only smolgen-related ln1 inside attention
+    // Force FP32 precision for normalization layers to prevent FP16 overflow.
+    // Three modes: broad (fp32PostAttentionNorm) = all normalization layers (recommended),
+    //              strict (fp32PostAttentionNormStrict) = only main encoder ln1 (LC0-specific),
+    //              smolgen (fp32SmolgenNorm) = only smolgen attention ln1 (LC0-specific).
     if (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm)
     {
-      config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
 
-      // Determine which filter to use
       const char* modeName = "broad";
       int layersMarked = 0;
       int totalLayers = network->getNbLayers();
 
+      // Compute residual-stream norm layer set for the broad mode
+      auto residualNormSet = FindResidualStreamNormLayers(network.get(), totalLayers);
+
       for (int32_t i = 0; i < totalLayers; ++i)
       {
         auto* layer = network->getLayer(i);
-        const char* layerName = layer->getName();
         bool shouldMark = false;
 
         if (opts->fp32SmolgenNorm)
         {
-          shouldMark = IsSmolgenNormLayer(layerName);
+          shouldMark = IsSmolgenNormLayer(layer->getName());
           modeName = "smolgen";
         }
         else if (opts->fp32PostAttentionNormStrict)
         {
-          shouldMark = IsPostAttentionNormLayerStrict(layerName);
+          shouldMark = IsPostAttentionNormLayerStrict(layer->getName());
           modeName = "strict";
         }
         else
         {
-          shouldMark = IsPostAttentionNormLayer(layerName);
+          shouldMark = residualNormSet.count(i) > 0;
         }
 
         if (shouldMark)
@@ -441,7 +667,7 @@ extern "C"
           layersMarked++;
         }
       }
-      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for post-attention norm (ln1, %s mode)\n",
+      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for normalization (%s mode)\n",
         layersMarked, totalLayers, modeName);
     }
 
@@ -653,6 +879,11 @@ extern "C"
     hash ^= std::hash<int32_t>{}(opts->fp32PostAttentionNorm) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     hash ^= std::hash<int32_t>{}(opts->fp32PostAttentionNormStrict) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     hash ^= std::hash<int32_t>{}(opts->fp32SmolgenNorm) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    // Only include refittable in hash when true, so existing cached files (with false) remain valid
+    if (opts->refittable)
+    {
+      hash ^= std::hash<int32_t>{}(opts->refittable) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    }
     return hash;
   }
 
@@ -2051,6 +2282,680 @@ extern "C"
     if (!handle) return -1;
     auto* ec = static_cast<EngineContext*>(handle);
     return ec->totalOutputElements / ec->batchSize;
+  }
+
+  // =========================================================================
+  // Weight Refitting (for refittable engines)
+  // =========================================================================
+
+  TRT_API int32_t TRT_SetNamedWeights(TRT_EngineHandle handle, const char* weightTensorName,
+    const void* weights, int64_t numElements)
+  {
+    if (!handle)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid handle");
+      return -1;
+    }
+    if (!weightTensorName || !weights)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid weight tensor name or weights pointer");
+      return -2;
+    }
+
+    auto* ec = static_cast<EngineContext*>(handle);
+    if (!EnsureDevice(ec->deviceId))
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set CUDA device " + std::to_string(ec->deviceId));
+      return -3;
+    }
+
+    // Create refitter if not exists
+    nvinfer1::IRefitter* refitter = nvinfer1::createInferRefitter(*ec->engine, g_logger);
+    if (!refitter)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create refitter - engine may not have been built with refittable=1");
+      return -4;
+    }
+
+    // Set the named weights
+    // Weights are expected to be FP16 (Half precision)
+    nvinfer1::Weights trtWeights;
+    trtWeights.type = nvinfer1::DataType::kHALF;
+    trtWeights.values = weights;
+    trtWeights.count = numElements;
+
+    bool success = refitter->setNamedWeights(weightTensorName, trtWeights);
+    if (!success)
+    {
+      delete refitter;
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set weights for tensor: " + std::string(weightTensorName));
+      return -5;
+    }
+
+    // Refit the engine immediately
+    success = refitter->refitCudaEngine();
+    delete refitter;
+
+    if (!success)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to refit CUDA engine after setting weights");
+      return -6;
+    }
+
+    return 0;
+  }
+
+  TRT_API int32_t TRT_RefitEngine(TRT_EngineHandle handle)
+  {
+    if (!handle)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid handle");
+      return -1;
+    }
+
+    auto* ec = static_cast<EngineContext*>(handle);
+    if (!EnsureDevice(ec->deviceId))
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set CUDA device " + std::to_string(ec->deviceId));
+      return -2;
+    }
+
+    // Create refitter
+    nvinfer1::IRefitter* refitter = nvinfer1::createInferRefitter(*ec->engine, g_logger);
+    if (!refitter)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create refitter - engine may not have been built with refittable=1");
+      return -3;
+    }
+
+    // Refit the engine
+    bool success = refitter->refitCudaEngine();
+    delete refitter;
+
+    if (!success)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to refit CUDA engine");
+      return -4;
+    }
+
+    return 0;
+  }
+
+  // =========================================================================
+  // Multi-Profile Engine (shared weights, N execution contexts)
+  // =========================================================================
+
+  // Helper: initialize EngineContext for a specific optimization profile of a shared engine
+  static EngineContext* InitializeEngineContextForProfile(nvinfer1::ICudaEngine* engine,
+    SharedEngine* shared, int32_t profileIndex, int32_t batchSize,
+    bool useCudaGraphs, bool useSpinWait, int32_t deviceId)
+  {
+    nvinfer1::IExecutionContext* context = engine->createExecutionContext();
+    if (!context)
+    {
+      return nullptr;
+    }
+
+    auto* ec = new EngineContext();
+    ec->engine = engine;
+    ec->context = context;
+    ec->sharedOwner = shared;
+    ec->batchSize = batchSize;
+    ec->deviceId = deviceId;
+    ec->useCudaGraphs = useCudaGraphs;
+
+    // Create streams first (needed for setOptimizationProfileAsync)
+    cudaStreamCreate(&ec->streams[0]);
+    cudaStreamCreate(&ec->streams[1]);
+    ec->stream = ec->streams[0];
+
+    // Select the optimization profile for this context (TRT 10+ API)
+    if (profileIndex > 0)
+    {
+      if (!context->setOptimizationProfileAsync(profileIndex, ec->stream))
+      {
+        delete ec;
+        return nullptr;
+      }
+      cudaStreamSynchronize(ec->stream);
+    }
+
+    // Apply execution options
+    if (useSpinWait)
+    {
+      context->setEnqueueEmitsProfile(false);
+      context->setPersistentCacheLimit(0);
+    }
+
+    // First pass: collect input names and set input shapes on context.
+    // This must happen BEFORE querying output shapes, because output dims
+    // depend on input shapes (especially the batch dimension).
+    int32_t nbIO = engine->getNbIOTensors();
+    for (int32_t i = 0; i < nbIO; ++i)
+    {
+      const char* name = engine->getIOTensorName(i);
+      auto mode = engine->getTensorIOMode(name);
+      if (mode != nvinfer1::TensorIOMode::kINPUT)
+      {
+        continue;
+      }
+
+      auto dims = engine->getTensorShape(name);
+      auto dtype = engine->getTensorDataType(name);
+      size_t elemSize = GetElementSize(dtype);
+
+      // Set input shape on context with our batch size
+      nvinfer1::Dims inputDims = dims;
+      if (inputDims.d[0] == -1)
+      {
+        inputDims.d[0] = batchSize;
+      }
+      context->setInputShape(name, inputDims);
+
+      // Compute input size using resolved dims
+      int64_t size = 1;
+      for (int32_t d = 0; d < inputDims.nbDims; ++d)
+      {
+        size *= inputDims.d[d];
+      }
+
+      ec->inputNames.push_back(name);
+      ec->inputSizes.push_back(size);
+      ec->inputElemSizes.push_back(elemSize);
+      ec->totalInputElements += size;
+    }
+
+    // Second pass: collect output info from the CONTEXT (not engine).
+    // After input shapes are set, the context resolves output shapes
+    // for the active profile's batch size.
+    for (int32_t i = 0; i < nbIO; ++i)
+    {
+      const char* name = engine->getIOTensorName(i);
+      auto mode = engine->getTensorIOMode(name);
+      if (mode != nvinfer1::TensorIOMode::kOUTPUT)
+      {
+        continue;
+      }
+
+      auto dtype = engine->getTensorDataType(name);
+      size_t elemSize = GetElementSize(dtype);
+
+      // Query output shape from context (resolved for this profile's batch size)
+      auto dims = context->getTensorShape(name);
+
+      int64_t size = 1;
+      for (int32_t d = 0; d < dims.nbDims; ++d)
+      {
+        int64_t dimVal = (dims.d[d] == -1) ? batchSize : dims.d[d];
+        size *= dimVal;
+      }
+
+      ec->outputNames.push_back(name);
+      ec->outputSizes.push_back(size);
+      ec->outputElemSizes.push_back(elemSize);
+      ec->totalOutputElements += size;
+    }
+
+    // Pre-allocate GPU buffers
+    for (size_t i = 0; i < ec->inputSizes.size(); ++i)
+    {
+      void* buf = nullptr;
+      cudaMalloc(&buf, ec->inputSizes[i] * ec->inputElemSizes[i]);
+      ec->gpuBuffers.push_back(buf);
+    }
+    for (size_t i = 0; i < ec->outputSizes.size(); ++i)
+    {
+      void* buf = nullptr;
+      cudaMalloc(&buf, ec->outputSizes[i] * ec->outputElemSizes[i]);
+      ec->gpuBuffers.push_back(buf);
+    }
+
+    return ec;
+  }
+
+
+  TRT_API int32_t TRT_LoadONNXMultiProfile(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    TRT_EngineHandle* outHandles)
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_initialized)
+    {
+      SetError("TensorRT not initialized");
+      return -1;
+    }
+
+    if (!batchSizes || numProfiles <= 0 || !outHandles)
+    {
+      SetError("Invalid arguments for multi-profile load");
+      return -2;
+    }
+
+    // Handle deviceId
+    if (deviceId < 0)
+    {
+      cudaGetDevice(&deviceId);
+    }
+    else
+    {
+      cudaError_t err = cudaSetDevice(deviceId);
+      if (err != cudaSuccess)
+      {
+        SetError("Failed to set CUDA device " + std::to_string(deviceId));
+        return -3;
+      }
+    }
+
+    // Use defaults if options is null
+    TRT_BuildOptions defaultOptions;
+    TRT_InitBuildOptions(&defaultOptions);
+    const TRT_BuildOptions* opts = options ? options : &defaultOptions;
+
+    // Create builder
+    auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(g_logger));
+    if (!builder)
+    {
+      SetError("Failed to create builder");
+      return -4;
+    }
+
+    // Create network
+    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
+    if (!network)
+    {
+      SetError("Failed to create network");
+      return -5;
+    }
+
+    // Parse ONNX
+    auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, g_logger));
+    if (!parser)
+    {
+      SetError("Failed to create ONNX parser");
+      return -6;
+    }
+
+    if (!parser->parseFromFile(onnxPath, static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    {
+      std::string errors;
+      for (int32_t i = 0; i < parser->getNbErrors(); ++i)
+      {
+        errors += parser->getError(i)->desc();
+        errors += "\n";
+      }
+      SetError("Failed to parse ONNX: " + errors);
+      return -7;
+    }
+
+    // Create builder config
+    auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    if (!config)
+    {
+      SetError("Failed to create builder config");
+      return -8;
+    }
+
+    // Apply build options
+    config->setBuilderOptimizationLevel(opts->builderOptimizationLevel);
+
+    if (opts->tilingOptimizationLevel >= 0)
+    {
+      config->setTilingOptimizationLevel(
+        static_cast<nvinfer1::TilingOptimizationLevel>(opts->tilingOptimizationLevel));
+    }
+
+    if (opts->useBest) config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+    if (opts->useFP16) config->setFlag(nvinfer1::BuilderFlag::kFP16);
+    if (opts->useBF16) config->setFlag(nvinfer1::BuilderFlag::kBF16);
+    if (opts->useFP8) config->setFlag(nvinfer1::BuilderFlag::kFP8);
+
+    if (opts->refittable)
+    {
+      config->setFlag(nvinfer1::BuilderFlag::kREFIT_IDENTICAL);
+      fprintf(stderr, "[TensorRT] Building multi-profile with REFIT_IDENTICAL support enabled\n");
+    }
+
+    config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+
+    // Force FP32 precision for normalization layers to prevent FP16 overflow.
+    if (opts->fp32PostAttentionNorm || opts->fp32PostAttentionNormStrict || opts->fp32SmolgenNorm)
+    {
+      config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
+
+      const char* modeName = "broad";
+      int layersMarked = 0;
+      int totalLayers = network->getNbLayers();
+
+      // Compute residual-stream norm layer set for the broad mode
+      auto residualNormSet = FindResidualStreamNormLayers(network.get(), totalLayers);
+
+      for (int32_t i = 0; i < totalLayers; ++i)
+      {
+        auto* layer = network->getLayer(i);
+        bool shouldMark = false;
+
+        if (opts->fp32SmolgenNorm)
+        {
+          shouldMark = IsSmolgenNormLayer(layer->getName());
+          modeName = "smolgen";
+        }
+        else if (opts->fp32PostAttentionNormStrict)
+        {
+          shouldMark = IsPostAttentionNormLayerStrict(layer->getName());
+          modeName = "strict";
+        }
+        else
+        {
+          shouldMark = residualNormSet.count(i) > 0;
+        }
+
+        if (shouldMark)
+        {
+          layer->setPrecision(nvinfer1::DataType::kFLOAT);
+          for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
+          {
+            layer->setOutputType(j, nvinfer1::DataType::kFLOAT);
+          }
+          layersMarked++;
+        }
+      }
+      fprintf(stderr, "[TensorRT] Marked %d/%d layers as FP32 for normalization (%s mode)\n",
+        layersMarked, totalLayers, modeName);
+    }
+
+    // Create N optimization profiles (one per batch size, Exact mode: min=opt=max)
+    for (int32_t p = 0; p < numProfiles; ++p)
+    {
+      auto profile = builder->createOptimizationProfile();
+      for (int32_t i = 0; i < network->getNbInputs(); ++i)
+      {
+        auto input = network->getInput(i);
+        auto dims = input->getDimensions();
+
+        nvinfer1::Dims minDims = dims, optDims = dims, maxDims = dims;
+        if (dims.d[0] == -1)
+        {
+          minDims.d[0] = batchSizes[p];
+          optDims.d[0] = batchSizes[p];
+          maxDims.d[0] = batchSizes[p];
+        }
+
+        profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN, minDims);
+        profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT, optDims);
+        profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX, maxDims);
+      }
+      config->addOptimizationProfile(profile);
+    }
+
+    // Build a batch sizes description for logging
+    std::string batchDesc;
+    for (int32_t p = 0; p < numProfiles; ++p)
+    {
+      if (p > 0) batchDesc += ",";
+      batchDesc += std::to_string(batchSizes[p]);
+    }
+
+    std::string basename = GetBaseName(onnxPath);
+    char msg[512];
+    snprintf(msg, sizeof(msg), "[TensorRT] Building multi-profile %s: batches=[%s], %d profiles",
+      basename.c_str(), batchDesc.c_str(), numProfiles);
+    PrintYellow(msg);
+
+    // Build serialized engine
+    auto serializedEngine = std::unique_ptr<nvinfer1::IHostMemory>(
+      builder->buildSerializedNetwork(*network, *config));
+    if (!serializedEngine)
+    {
+      SetError("Failed to build multi-profile engine");
+      return -9;
+    }
+
+    // Deserialize engine
+    nvinfer1::ICudaEngine* engine = g_runtime->deserializeCudaEngine(
+      serializedEngine->data(), serializedEngine->size());
+    if (!engine)
+    {
+      SetError("Failed to deserialize multi-profile engine");
+      return -10;
+    }
+
+    // Create shared ownership
+    auto* shared = new SharedEngine(engine, numProfiles);
+
+    // Create N execution contexts, one per profile
+    for (int32_t p = 0; p < numProfiles; ++p)
+    {
+      EngineContext* ec = InitializeEngineContextForProfile(engine, shared, p, batchSizes[p],
+        opts->useCudaGraphs != 0, opts->useSpinWait != 0, deviceId);
+      if (!ec)
+      {
+        // Cleanup already-created contexts (their destructors decrement refcount)
+        for (int32_t j = 0; j < p; ++j)
+        {
+          delete static_cast<EngineContext*>(outHandles[j]);
+          outHandles[j] = nullptr;
+        }
+        // After deleting p contexts, refCount = numProfiles - p (for uncreated contexts).
+        // If engine still alive, force cleanup.
+        if (shared->refCount.load() > 0)
+        {
+          delete engine;
+          delete shared;
+        }
+        SetError("Failed to create execution context for profile " + std::to_string(p));
+        return -11;
+      }
+      outHandles[p] = ec;
+    }
+
+    g_lastError.clear();
+    return 0;
+  }
+
+
+  // Helper: create N EngineContexts from an already-deserialized multi-profile engine
+  static int32_t CreateContextsFromEngine(nvinfer1::ICudaEngine* engine,
+    const int32_t* batchSizes, int32_t numProfiles,
+    bool useCudaGraphs, bool useSpinWait, int32_t deviceId,
+    TRT_EngineHandle* outHandles)
+  {
+    auto* shared = new SharedEngine(engine, numProfiles);
+
+    for (int32_t p = 0; p < numProfiles; ++p)
+    {
+      EngineContext* ec = InitializeEngineContextForProfile(engine, shared, p, batchSizes[p],
+        useCudaGraphs, useSpinWait, deviceId);
+      if (!ec)
+      {
+        for (int32_t j = 0; j < p; ++j)
+        {
+          delete static_cast<EngineContext*>(outHandles[j]);
+          outHandles[j] = nullptr;
+        }
+        if (shared->refCount.load() > 0)
+        {
+          delete engine;
+          delete shared;
+        }
+        return -1;
+      }
+      outHandles[p] = ec;
+    }
+    return 0;
+  }
+
+
+  TRT_API char* TRT_GenerateMultiProfileCacheFilename(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId)
+  {
+    TRT_BuildOptions defaultOpts;
+    TRT_InitBuildOptions(&defaultOpts);
+    const TRT_BuildOptions* opts = options ? options : &defaultOpts;
+
+    std::string basename = GetBaseName(onnxPath);
+    std::string gpuId = GetGPUIdentifier(deviceId);
+    uint64_t hash = HashBuildOptions(opts);
+    int32_t trtVersion = NV_TENSORRT_VERSION;
+
+    // Build batch sizes string: "b1-b2-...-bN"
+    std::string batchStr;
+    for (int32_t i = 0; i < numProfiles; ++i)
+    {
+      if (i > 0) batchStr += "-";
+      batchStr += std::to_string(batchSizes[i]);
+    }
+
+    char buffer[1024];
+    snprintf(buffer, sizeof(buffer), "%s_mp%s_%s_trt%d_%016llx.engine",
+      basename.c_str(), batchStr.c_str(), gpuId.c_str(), trtVersion,
+      static_cast<unsigned long long>(hash));
+
+    return strdup(buffer);
+  }
+
+
+  TRT_API int32_t TRT_LoadONNXMultiProfileCached(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    const char* cacheDir, int32_t forceRebuild,
+    int32_t* outWasCached, TRT_EngineHandle* outHandles)
+  {
+    if (outWasCached) *outWasCached = 0;
+
+    TRT_BuildOptions defaultOpts;
+    TRT_InitBuildOptions(&defaultOpts);
+    const TRT_BuildOptions* opts = options ? options : &defaultOpts;
+
+    // If no cache dir, just build normally
+    if (!cacheDir || cacheDir[0] == '\0')
+    {
+      return TRT_LoadONNXMultiProfile(onnxPath, batchSizes, numProfiles, options, deviceId, outHandles);
+    }
+
+    // Generate cache filename
+    char* cacheFilename = TRT_GenerateMultiProfileCacheFilename(onnxPath, batchSizes, numProfiles, options, deviceId);
+    std::string cachePath = std::string(cacheDir) + "/" + cacheFilename;
+    TRT_FreeString(cacheFilename);
+
+    // Handle deviceId
+    if (deviceId < 0)
+    {
+      cudaGetDevice(&deviceId);
+    }
+    else
+    {
+      cudaError_t err = cudaSetDevice(deviceId);
+      if (err != cudaSuccess)
+      {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        SetError("Failed to set CUDA device " + std::to_string(deviceId));
+        return -1;
+      }
+    }
+
+    // Try loading from cache
+    if (!forceRebuild && FileExists(cachePath.c_str()))
+    {
+      // Check if ONNX file is newer than cache
+      struct stat onnxStat, cacheStat;
+      bool cacheValid = true;
+      if (stat(onnxPath, &onnxStat) == 0 && stat(cachePath.c_str(), &cacheStat) == 0)
+      {
+        if (onnxStat.st_mtime > cacheStat.st_mtime)
+        {
+          cacheValid = false;
+        }
+      }
+
+      if (cacheValid)
+      {
+        // Read engine file
+        std::ifstream file(cachePath, std::ios::binary | std::ios::ate);
+        if (file.is_open())
+        {
+          std::streamsize size = file.tellg();
+          file.seekg(0, std::ios::beg);
+          std::vector<char> buffer(size);
+          if (file.read(buffer.data(), size))
+          {
+            file.close();
+
+            std::lock_guard<std::mutex> lock(g_mutex);
+            nvinfer1::ICudaEngine* engine = g_runtime->deserializeCudaEngine(buffer.data(), buffer.size());
+            if (engine)
+            {
+              int32_t result = CreateContextsFromEngine(engine, batchSizes, numProfiles,
+                opts->useCudaGraphs != 0, opts->useSpinWait != 0, deviceId, outHandles);
+              if (result == 0)
+              {
+                // Build batch sizes string for logging
+                std::string batchDesc;
+                for (int32_t p = 0; p < numProfiles; ++p)
+                {
+                  if (p > 0) batchDesc += ",";
+                  batchDesc += std::to_string(batchSizes[p]);
+                }
+                std::string basename = GetBaseName(onnxPath);
+                char msg[512];
+                snprintf(msg, sizeof(msg), "[TensorRT] Loading multi-profile %s: batches=[%s], %d profiles",
+                  basename.c_str(), batchDesc.c_str(), numProfiles);
+                PrintGreen(msg);
+
+                if (outWasCached) *outWasCached = 1;
+                g_lastError.clear();
+                return 0;
+              }
+              // CreateContextsFromEngine deleted engine on failure
+            }
+          }
+          else
+          {
+            file.close();
+          }
+        }
+        // Fall through to rebuild if cache load failed
+      }
+    }
+
+    // Build from ONNX
+    int32_t result = TRT_LoadONNXMultiProfile(onnxPath, batchSizes, numProfiles, options, deviceId, outHandles);
+    if (result != 0)
+    {
+      return result;
+    }
+
+    // Save to cache (serialize engine from first context)
+    auto* firstEc = static_cast<EngineContext*>(outHandles[0]);
+    nvinfer1::IHostMemory* serialized = firstEc->engine->serialize();
+    if (serialized)
+    {
+      std::ofstream file(cachePath, std::ios::binary);
+      if (file.is_open())
+      {
+        file.write(static_cast<const char*>(serialized->data()), serialized->size());
+        file.close();
+      }
+      else
+      {
+        fprintf(stderr, "[TensorRT WARNING] Failed to save multi-profile engine to cache: %s\n", cachePath.c_str());
+      }
+      delete serialized;
+    }
+
+    return 0;
   }
 
 }

@@ -277,6 +277,39 @@ internal static partial class TensorRTNative
   internal static partial long GetOutputElementsPerPosition(IntPtr handle);
 
   // =========================================================================
+  // Multi-Profile Engine (shared weights, N execution contexts)
+  // =========================================================================
+
+  [LibraryImport(LibraryName, EntryPoint = "TRT_LoadONNXMultiProfile", StringMarshalling = StringMarshalling.Utf8)]
+  internal static unsafe partial int LoadONNXMultiProfile(string onnxPath,
+      int* batchSizes, int numProfiles,
+      ref TensorRTBuildOptions options, int deviceId,
+      IntPtr* outHandles);
+
+  [LibraryImport(LibraryName, EntryPoint = "TRT_LoadONNXMultiProfileCached", StringMarshalling = StringMarshalling.Utf8)]
+  internal static unsafe partial int LoadONNXMultiProfileCached(string onnxPath,
+      int* batchSizes, int numProfiles,
+      ref TensorRTBuildOptions options, int deviceId,
+      string cacheDir, int forceRebuild,
+      out int wasCached, IntPtr* outHandles);
+
+  [LibraryImport(LibraryName, EntryPoint = "TRT_GenerateMultiProfileCacheFilename", StringMarshalling = StringMarshalling.Utf8)]
+  internal static unsafe partial IntPtr GenerateMultiProfileCacheFilename(string onnxPath,
+      int* batchSizes, int numProfiles,
+      ref TensorRTBuildOptions options, int deviceId);
+
+  // =========================================================================
+  // Weight Refitting (for refittable engines)
+  // =========================================================================
+
+  [LibraryImport(LibraryName, EntryPoint = "TRT_SetNamedWeights", StringMarshalling = StringMarshalling.Utf8)]
+  internal static unsafe partial int SetNamedWeights(IntPtr handle, string weightTensorName,
+                                                      Half* weights, long numElements);
+
+  [LibraryImport(LibraryName, EntryPoint = "TRT_RefitEngine")]
+  internal static partial int RefitEngine(IntPtr handle);
+
+  // =========================================================================
   // Helper methods
   // =========================================================================
 
