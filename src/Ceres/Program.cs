@@ -199,6 +199,11 @@ namespace Ceres
                 }
             }
 
+            // Dump applied search parameters for verification
+            Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsSelect>(selectParams, new ParamsSelect(), false));
+            Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsSearch>(searchParams, new ParamsSearch(), false));
+            Console.WriteLine(ObjUtils.FieldValuesDumpString<ParamsSearchExecution>(searchParams.Execution, new ParamsSearchExecution(), false));
+
             // Define Ceres engine (in process) with associated neural network and GPU and parameter customizations
             NNEvaluatorDef ceresNNDef = NNEvaluatorDefFactory.FromSpecification(CERES_NET_PATH, CERES_DEVICE);
             GameEngineDefCeres engineDefCeres1 = new GameEngineDefCeres("Ceres1", ceresNNDef, null,
