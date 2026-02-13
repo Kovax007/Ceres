@@ -1,8 +1,8 @@
-CXX = g++
-CXXFLAGS = -std=c++17 -fPIC -O2 -Wall -fvisibility=hidden
-CUDA_PATH = /usr/local/cuda-13.0
-INCLUDES = -I/usr/include/aarch64-linux-gnu -I$(CUDA_PATH)/targets/sbsa-linux/include
-LDFLAGS = -shared -L/usr/lib/aarch64-linux-gnu -L$(CUDA_PATH)/targets/sbsa-linux/lib
+CXX = clang++
+CXXFLAGS = -std=c++17 -fPIC -O3 -Wall -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2
+CUDA_PATH = /usr/local/cuda-12.5
+INCLUDES = -I$(CUDA_PATH)/include
+LDFLAGS = -shared -L$(CUDA_PATH)/lib64 -Wl,-z,relro,-z,now
 LIBS = -lnvinfer -lnvonnxparser -lcudart
 
 TARGET = libTensorRTWrapper.so

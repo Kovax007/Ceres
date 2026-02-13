@@ -59,6 +59,7 @@ namespace Ceres
         public int Engine1NodesPerMove { get; set; }
         public int Engine2NodesPerMove { get; set; }
         public string Engine2ExePath { get; set; }
+        public int Engine2Threads { get; set; } = 1;
         public Dictionary<string, double> SearchParams { get; set; }
     }
 
@@ -126,6 +127,7 @@ namespace Ceres
             const string logfile = "ceres.log.txt"; //null;
 
             // Define Stockfish engine (via UCI) 
+            int SF_THREADS = config.Engine2Threads;
             GameEngineDefUCI sfEngine = new GameEngineDefUCI("SF", new GameEngineUCISpec("SF", SF_EXE_PATH, SF_THREADS, SF_TB_SIZE_MB, TB_DIR));
 
             // Turn on early search termination, and turn off overlapping executors (not needed for small searches).

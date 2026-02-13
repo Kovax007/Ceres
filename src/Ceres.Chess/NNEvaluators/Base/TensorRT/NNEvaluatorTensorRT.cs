@@ -937,8 +937,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
     NNEvaluatorTensorRT trtNativeEngine = new(netFileName,
                                               netType,
                                               EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range,
-                                              EXACT_BATCHES ? [1, 8, 20, 42, 64, 88, 116, 240]
-                                                            : [96, 1024],
+                                              new int[] { 8, 32, 64 },                                   
                                               buildOptions,
                                               gpuIDs: gpuIDs,
                                               useCudaGraphs: EXACT_BATCHES,
