@@ -226,12 +226,9 @@ public sealed class EnginePool : IDisposable
     }
     else // Exact mode
     {
-      // sizes defines exact batch sizes, sorted descending for processing
+      // Sort ascending for consistent cache filenames (must match PreBuildUnifiedEngineWithTimingCache)
       Array.Sort(sizes);
-      Array.Reverse(sizes);
 
-      // Build a single multi-profile engine with shared weights across all batch sizes.
-      // This eliminates N-fold weight duplication in VRAM and requires only one cache file.
       string ext = System.IO.Path.GetExtension(onnxPath).ToLowerInvariant();
       TensorRTEngine[] multiEngines;
       if (ext == ".engine" || ext == ".plan")
@@ -241,9 +238,13 @@ public sealed class EnginePool : IDisposable
       }
       else
       {
+        // Single multi-profile engine with shared weights across all batch sizes
         multiEngines = this.trt.LoadMultiProfileEngineWithCache(
           onnxPath, sizes, options, cacheDir, deviceId);
       }
+
+      // Sort engines by batch size descending (required by scheduler)
+      Array.Sort(multiEngines, (a, b) => b.BatchSize.CompareTo(a.BatchSize));
 
       foreach (TensorRTEngine engine in multiEngines)
       {

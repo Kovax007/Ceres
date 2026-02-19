@@ -2537,22 +2537,38 @@ extern "C"
   }
 
 
-  TRT_API int32_t TRT_LoadONNXMultiProfile(const char* onnxPath,
+  // Internal helper: build multi-profile engine, optionally with timing cache.
+  // inputTimingCachePath: if non-null and file exists, loads timing cache for faster building.
+  // outputTimingCachePath: if non-null, saves the timing cache after build.
+  static int32_t BuildMultiProfileEngineInternal(const char* onnxPath,
     const int32_t* batchSizes, int32_t numProfiles,
     const TRT_BuildOptions* options, int32_t deviceId,
+    const char* inputTimingCachePath,
+    const char* outputTimingCachePath,
     TRT_EngineHandle* outHandles)
   {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // Thread-safe error setter for parallel builds across GPUs.
+    // The function-wide g_mutex lock has been removed to allow concurrent
+    // engine builds on different GPUs. Only shared state (g_initialized,
+    // g_runtime, g_lastError) is protected by brief scoped locks.
+    auto SetErrorLocked = [](const std::string& error) {
+      std::lock_guard<std::mutex> lk(g_mutex);
+      g_lastError = error;
+    };
 
-    if (!g_initialized)
+    // Brief lock to verify initialization
     {
-      SetError("TensorRT not initialized");
-      return -1;
+      std::lock_guard<std::mutex> lock(g_mutex);
+      if (!g_initialized)
+      {
+        SetError("TensorRT not initialized");
+        return -1;
+      }
     }
 
     if (!batchSizes || numProfiles <= 0 || !outHandles)
     {
-      SetError("Invalid arguments for multi-profile load");
+      SetErrorLocked("Invalid arguments for multi-profile load");
       return -2;
     }
 
@@ -2566,7 +2582,7 @@ extern "C"
       cudaError_t err = cudaSetDevice(deviceId);
       if (err != cudaSuccess)
       {
-        SetError("Failed to set CUDA device " + std::to_string(deviceId));
+        SetErrorLocked("Failed to set CUDA device " + std::to_string(deviceId));
         return -3;
       }
     }
@@ -2580,7 +2596,7 @@ extern "C"
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(g_logger));
     if (!builder)
     {
-      SetError("Failed to create builder");
+      SetErrorLocked("Failed to create builder");
       return -4;
     }
 
@@ -2588,7 +2604,7 @@ extern "C"
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
     if (!network)
     {
-      SetError("Failed to create network");
+      SetErrorLocked("Failed to create network");
       return -5;
     }
 
@@ -2596,7 +2612,7 @@ extern "C"
     auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, g_logger));
     if (!parser)
     {
-      SetError("Failed to create ONNX parser");
+      SetErrorLocked("Failed to create ONNX parser");
       return -6;
     }
 
@@ -2608,7 +2624,7 @@ extern "C"
         errors += parser->getError(i)->desc();
         errors += "\n";
       }
-      SetError("Failed to parse ONNX: " + errors);
+      SetErrorLocked("Failed to parse ONNX: " + errors);
       return -7;
     }
 
@@ -2616,7 +2632,7 @@ extern "C"
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config)
     {
-      SetError("Failed to create builder config");
+      SetErrorLocked("Failed to create builder config");
       return -8;
     }
 
@@ -2712,6 +2728,42 @@ extern "C"
       config->addOptimizationProfile(profile);
     }
 
+    // Set up timing cache for faster builds.
+    // If an input timing cache file is provided, load it to skip tactic benchmarking.
+    // Otherwise, create an empty timing cache to capture benchmarking results.
+    nvinfer1::ITimingCache* timingCache = nullptr;
+    if (inputTimingCachePath && inputTimingCachePath[0] != '\0' && FileExists(inputTimingCachePath))
+    {
+      std::ifstream tcFile(inputTimingCachePath, std::ios::binary | std::ios::ate);
+      if (tcFile.is_open())
+      {
+        std::streamsize tcSize = tcFile.tellg();
+        tcFile.seekg(0, std::ios::beg);
+        std::vector<char> tcData(tcSize);
+        if (tcFile.read(tcData.data(), tcSize))
+        {
+          timingCache = config->createTimingCache(tcData.data(), tcData.size());
+          if (timingCache)
+          {
+            config->setTimingCache(*timingCache, false);
+            fprintf(stderr, "[TensorRT] Loaded timing cache (%lld bytes) from %s\n",
+              (long long)tcSize, inputTimingCachePath);
+          }
+        }
+        tcFile.close();
+      }
+    }
+
+    if (!timingCache)
+    {
+      // Create empty timing cache so we can export results after build
+      timingCache = config->createTimingCache(nullptr, 0);
+      if (timingCache)
+      {
+        config->setTimingCache(*timingCache, false);
+      }
+    }
+
     // Build a batch sizes description for logging
     std::string batchDesc;
     for (int32_t p = 0; p < numProfiles; ++p)
@@ -2731,16 +2783,45 @@ extern "C"
       builder->buildSerializedNetwork(*network, *config));
     if (!serializedEngine)
     {
-      SetError("Failed to build multi-profile engine");
+      delete timingCache;
+      SetErrorLocked("Failed to build multi-profile engine");
       return -9;
     }
 
-    // Deserialize engine
-    nvinfer1::ICudaEngine* engine = g_runtime->deserializeCudaEngine(
-      serializedEngine->data(), serializedEngine->size());
+    // Save timing cache after build (captures tactic benchmarking results)
+    if (outputTimingCachePath && outputTimingCachePath[0] != '\0')
+    {
+      // Re-retrieve timing cache from config (builder may have updated it)
+      const nvinfer1::ITimingCache* builtCache = config->getTimingCache();
+      if (builtCache)
+      {
+        auto* tcSerialized = builtCache->serialize();
+        if (tcSerialized)
+        {
+          std::ofstream tcOut(outputTimingCachePath, std::ios::binary);
+          if (tcOut.is_open())
+          {
+            tcOut.write(static_cast<const char*>(tcSerialized->data()), tcSerialized->size());
+            tcOut.close();
+            fprintf(stderr, "[TensorRT] Saved timing cache (%lld bytes) to %s\n",
+              (long long)tcSerialized->size(), outputTimingCachePath);
+          }
+          delete tcSerialized;
+        }
+      }
+    }
+    delete timingCache;
+
+    // Deserialize engine (g_runtime is shared and NOT thread-safe, needs mutex)
+    nvinfer1::ICudaEngine* engine;
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      engine = g_runtime->deserializeCudaEngine(
+        serializedEngine->data(), serializedEngine->size());
+    }
     if (!engine)
     {
-      SetError("Failed to deserialize multi-profile engine");
+      SetErrorLocked("Failed to deserialize multi-profile engine");
       return -10;
     }
 
@@ -2767,14 +2848,27 @@ extern "C"
           delete engine;
           delete shared;
         }
-        SetError("Failed to create execution context for profile " + std::to_string(p));
+        SetErrorLocked("Failed to create execution context for profile " + std::to_string(p));
         return -11;
       }
       outHandles[p] = ec;
     }
 
-    g_lastError.clear();
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_lastError.clear();
+    }
     return 0;
+  }
+
+
+  TRT_API int32_t TRT_LoadONNXMultiProfile(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    TRT_EngineHandle* outHandles)
+  {
+    return BuildMultiProfileEngineInternal(onnxPath, batchSizes, numProfiles,
+      options, deviceId, nullptr, nullptr, outHandles);
   }
 
 
@@ -3059,6 +3153,279 @@ extern "C"
     PrintGreen(msg);
 
     g_lastError.clear();
+    return 0;
+  }
+
+
+  TRT_API int32_t TRT_LoadONNXMultiProfileCachedWithTimingCache(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    const char* cacheDir, int32_t forceRebuild,
+    const char* inputTimingCachePath,
+    const char* outputTimingCachePath,
+    int32_t* outWasCached, TRT_EngineHandle* outHandles)
+  {
+    if (outWasCached) *outWasCached = 0;
+
+    TRT_BuildOptions defaultOpts;
+    TRT_InitBuildOptions(&defaultOpts);
+    const TRT_BuildOptions* opts = options ? options : &defaultOpts;
+
+    // If no cache dir, just build with timing cache support
+    if (!cacheDir || cacheDir[0] == '\0')
+    {
+      return BuildMultiProfileEngineInternal(onnxPath, batchSizes, numProfiles, options, deviceId,
+        inputTimingCachePath, outputTimingCachePath, outHandles);
+    }
+
+    // Generate cache filename
+    char* cacheFilename = TRT_GenerateMultiProfileCacheFilename(onnxPath, batchSizes, numProfiles, options, deviceId);
+    std::string cachePath = std::string(cacheDir) + "/" + cacheFilename;
+    TRT_FreeString(cacheFilename);
+
+    // Handle deviceId
+    if (deviceId < 0)
+    {
+      cudaGetDevice(&deviceId);
+    }
+    else
+    {
+      cudaError_t err = cudaSetDevice(deviceId);
+      if (err != cudaSuccess)
+      {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        SetError("Failed to set CUDA device " + std::to_string(deviceId));
+        return -1;
+      }
+    }
+
+    // Try loading from cache (same logic as TRT_LoadONNXMultiProfileCached)
+    if (!forceRebuild && FileExists(cachePath.c_str()))
+    {
+      struct stat onnxStat, cacheStat;
+      bool cacheValid = true;
+      if (stat(onnxPath, &onnxStat) == 0 && stat(cachePath.c_str(), &cacheStat) == 0)
+      {
+        if (onnxStat.st_mtime > cacheStat.st_mtime)
+        {
+          cacheValid = false;
+        }
+      }
+
+      if (cacheValid)
+      {
+        std::ifstream file(cachePath, std::ios::binary | std::ios::ate);
+        if (file.is_open())
+        {
+          std::streamsize size = file.tellg();
+          file.seekg(0, std::ios::beg);
+          std::vector<char> buffer(size);
+          if (file.read(buffer.data(), size))
+          {
+            file.close();
+
+            std::lock_guard<std::mutex> lock(g_mutex);
+            nvinfer1::ICudaEngine* engine = g_runtime->deserializeCudaEngine(buffer.data(), buffer.size());
+            if (engine)
+            {
+              int32_t result = CreateContextsFromEngine(engine, batchSizes, numProfiles,
+                opts->useCudaGraphs != 0, opts->useSpinWait != 0, deviceId, outHandles);
+              if (result == 0)
+              {
+                std::string batchDesc;
+                for (int32_t p = 0; p < numProfiles; ++p)
+                {
+                  if (p > 0) batchDesc += ",";
+                  batchDesc += std::to_string(batchSizes[p]);
+                }
+                std::string basename = GetBaseName(onnxPath);
+                char msg[512];
+                snprintf(msg, sizeof(msg), "[TensorRT] Loading multi-profile %s: batches=[%s], %d profiles",
+                  basename.c_str(), batchDesc.c_str(), numProfiles);
+                PrintGreen(msg);
+
+                if (outWasCached) *outWasCached = 1;
+                g_lastError.clear();
+                return 0;
+              }
+            }
+          }
+          else
+          {
+            file.close();
+          }
+        }
+      }
+    }
+
+    // Build from ONNX with timing cache support
+    int32_t result = BuildMultiProfileEngineInternal(onnxPath, batchSizes, numProfiles, options, deviceId,
+      inputTimingCachePath, outputTimingCachePath, outHandles);
+    if (result != 0)
+    {
+      return result;
+    }
+
+    // Save to cache (serialize engine from first context)
+    auto* firstEc = static_cast<EngineContext*>(outHandles[0]);
+    nvinfer1::IHostMemory* serialized = firstEc->engine->serialize();
+    if (serialized)
+    {
+      std::ofstream file(cachePath, std::ios::binary);
+      if (file.is_open())
+      {
+        file.write(static_cast<const char*>(serialized->data()), serialized->size());
+        file.close();
+      }
+      else
+      {
+        fprintf(stderr, "[TensorRT WARNING] Failed to save multi-profile engine to cache: %s\n", cachePath.c_str());
+      }
+      delete serialized;
+    }
+
+    return 0;
+  }
+
+
+  TRT_API int32_t TRT_CombineTimingCacheFiles(const char* inputPathsCommaSeparated,
+    const char* outputPath)
+  {
+    if (!inputPathsCommaSeparated || !outputPath)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid arguments for CombineTimingCacheFiles");
+      return -1;
+    }
+
+    // Parse comma-separated input paths
+    std::vector<std::string> inputPaths;
+    {
+      std::string paths(inputPathsCommaSeparated);
+      size_t pos = 0;
+      while (pos < paths.size())
+      {
+        size_t comma = paths.find(',', pos);
+        if (comma == std::string::npos) comma = paths.size();
+        std::string path = paths.substr(pos, comma - pos);
+        if (!path.empty())
+        {
+          inputPaths.push_back(path);
+        }
+        pos = comma + 1;
+      }
+    }
+
+    if (inputPaths.empty())
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("No input timing cache paths provided");
+      return -2;
+    }
+
+    // Need a builder + config to create timing cache objects
+    auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(g_logger));
+    if (!builder)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create builder for timing cache combine");
+      return -3;
+    }
+
+    auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    if (!config)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create builder config for timing cache combine");
+      return -4;
+    }
+
+    // Create empty combined timing cache
+    nvinfer1::ITimingCache* combined = config->createTimingCache(nullptr, 0);
+    if (!combined)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create empty timing cache");
+      return -5;
+    }
+
+    // Read and combine each input timing cache
+    int32_t filesLoaded = 0;
+    for (const auto& path : inputPaths)
+    {
+      std::ifstream tcFile(path, std::ios::binary | std::ios::ate);
+      if (!tcFile.is_open())
+      {
+        fprintf(stderr, "[TensorRT WARNING] Could not open timing cache file: %s\n", path.c_str());
+        continue;
+      }
+
+      std::streamsize tcSize = tcFile.tellg();
+      tcFile.seekg(0, std::ios::beg);
+      std::vector<char> tcData(tcSize);
+      if (!tcFile.read(tcData.data(), tcSize))
+      {
+        tcFile.close();
+        fprintf(stderr, "[TensorRT WARNING] Could not read timing cache file: %s\n", path.c_str());
+        continue;
+      }
+      tcFile.close();
+
+      nvinfer1::ITimingCache* loaded = config->createTimingCache(tcData.data(), tcData.size());
+      if (!loaded)
+      {
+        fprintf(stderr, "[TensorRT WARNING] Could not deserialize timing cache: %s\n", path.c_str());
+        continue;
+      }
+
+      bool ok = combined->combine(*loaded, false);
+      delete loaded;
+
+      if (ok)
+      {
+        filesLoaded++;
+        fprintf(stderr, "[TensorRT] Combined timing cache from %s (%lld bytes)\n",
+          path.c_str(), (long long)tcSize);
+      }
+      else
+      {
+        fprintf(stderr, "[TensorRT WARNING] Failed to combine timing cache: %s\n", path.c_str());
+      }
+    }
+
+    if (filesLoaded == 0)
+    {
+      delete combined;
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("No timing cache files could be loaded");
+      return -6;
+    }
+
+    // Serialize combined cache to output file
+    auto* serialized = combined->serialize();
+    delete combined;
+
+    if (!serialized)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to serialize combined timing cache");
+      return -7;
+    }
+
+    std::ofstream outFile(outputPath, std::ios::binary);
+    if (!outFile.is_open())
+    {
+      delete serialized;
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to open output file for combined timing cache: " + std::string(outputPath));
+      return -8;
+    }
+
+    outFile.write(static_cast<const char*>(serialized->data()), serialized->size());
+    outFile.close();
+    delete serialized;
+
+    fprintf(stderr, "[TensorRT] Combined %d timing caches -> %s\n", filesLoaded, outputPath);
     return 0;
   }
 

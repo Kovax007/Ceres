@@ -298,6 +298,17 @@ internal static partial class TensorRTNative
       int* batchSizes, int numProfiles,
       ref TensorRTBuildOptions options, int deviceId);
 
+  [LibraryImport(LibraryName, EntryPoint = "TRT_LoadONNXMultiProfileCachedWithTimingCache", StringMarshalling = StringMarshalling.Utf8)]
+  internal static unsafe partial int LoadONNXMultiProfileCachedWithTimingCache(string onnxPath,
+      int* batchSizes, int numProfiles,
+      ref TensorRTBuildOptions options, int deviceId,
+      string cacheDir, int forceRebuild,
+      string inputTimingCachePath, string outputTimingCachePath,
+      out int wasCached, IntPtr* outHandles);
+
+  [LibraryImport(LibraryName, EntryPoint = "TRT_CombineTimingCacheFiles", StringMarshalling = StringMarshalling.Utf8)]
+  internal static partial int CombineTimingCacheFiles(string inputPathsCommaSeparated, string outputPath);
+
   [LibraryImport(LibraryName, EntryPoint = "TRT_LoadMultiProfileEngineFile", StringMarshalling = StringMarshalling.Utf8)]
   internal static unsafe partial int LoadMultiProfileEngineFile(string enginePath,
       int* batchSizes, int numProfiles,

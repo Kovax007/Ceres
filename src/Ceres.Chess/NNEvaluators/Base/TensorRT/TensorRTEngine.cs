@@ -213,6 +213,68 @@ public sealed class TensorRTEngine : IDisposable
 
 
   /// <summary>
+  /// Build a single multi-profile TensorRT engine with shared weights and timing cache support.
+  /// Like LoadMultiProfileWithCache, but with timing cache I/O for faster builds.
+  /// inputTimingCachePath: if non-null, loads timing cache to skip tactic benchmarking.
+  /// outputTimingCachePath: if non-null, saves timing cache after build.
+  /// On cache hit (engine already cached), timing cache paths are ignored.
+  /// </summary>
+  public static unsafe TensorRTEngine[] LoadMultiProfileWithCacheAndTimingCache(string onnxPath, int[] batchSizes,
+      TensorRTBuildOptions options, int deviceId = -1, string cacheDir = null,
+      string inputTimingCachePath = null, string outputTimingCachePath = null,
+      bool forceRebuild = false)
+  {
+    int numProfiles = batchSizes.Length;
+    IntPtr* handles = stackalloc IntPtr[numProfiles];
+
+    int wasCached;
+    int result;
+    fixed (int* sizesPtr = batchSizes)
+    {
+      result = TensorRTNative.LoadONNXMultiProfileCachedWithTimingCache(onnxPath, sizesPtr, numProfiles,
+          ref options, deviceId, cacheDir, forceRebuild ? 1 : 0,
+          inputTimingCachePath, outputTimingCachePath,
+          out wasCached, handles);
+    }
+
+    if (result != 0)
+    {
+      string error = TensorRTNative.GetLastErrorString();
+      throw new InvalidOperationException($"Failed to load multi-profile ONNX with timing cache ({result}): {error ?? "unknown error"}");
+    }
+
+    TensorRTEngine[] engines = new TensorRTEngine[numProfiles];
+    for (int i = 0; i < numProfiles; i++)
+    {
+      engines[i] = new TensorRTEngine(handles[i], batchSizes[i], onnxPath, wasCached != 0);
+    }
+    return engines;
+  }
+
+
+  /// <summary>
+  /// Get the multi-profile cache filename for given parameters.
+  /// </summary>
+  public static unsafe string GetMultiProfileCacheFilename(string onnxPath, int[] batchSizes,
+      TensorRTBuildOptions options, int deviceId = -1)
+  {
+    IntPtr ptr;
+    fixed (int* sizesPtr = batchSizes)
+    {
+      ptr = TensorRTNative.GenerateMultiProfileCacheFilename(onnxPath, sizesPtr, batchSizes.Length,
+          ref options, deviceId);
+    }
+    if (ptr == IntPtr.Zero)
+    {
+      throw new InvalidOperationException("Failed to generate multi-profile cache filename");
+    }
+    string filename = Marshal.PtrToStringAnsi(ptr) ?? "";
+    TensorRTNative.FreeString(ptr);
+    return filename;
+  }
+
+
+  /// <summary>
   /// Load a pre-built multi-profile engine file (.engine) directly.
   /// Deserializes the engine and creates N execution contexts, one per batch size.
   /// Bypasses ONNX parsing and cache validation — useful for loading

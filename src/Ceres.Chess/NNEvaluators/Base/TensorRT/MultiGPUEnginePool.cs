@@ -16,6 +16,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -141,6 +142,263 @@ public sealed class MultiGPUEnginePool : IDisposable
   public float[][] ExecutionTimesPerGPU => executionTimesPerGPU;
 
   /// <summary>
+  /// Pre-builds a unified engine using a 3-phase approach:
+  ///   Phase 1: Parallel workers build small groups + export timing caches
+  ///   Phase 2: Combine timing caches into one
+  ///   Phase 3: Build unified engine with combined timing cache (fast)
+  /// After this method completes, the unified engine is in the cache directory
+  /// and can be loaded by EnginePool via the standard cache path.
+  /// </summary>
+  private static void PreBuildUnifiedEngineWithTimingCache(
+      TensorRT trt, string onnxPath, int[] allBatchSizes,
+      TensorRTBuildOptions options, int[] deviceIds, string cacheDir)
+  {
+    // Check if unified engine already exists in cache
+    string unifiedCacheFile = TensorRTEngine.GetMultiProfileCacheFilename(
+        onnxPath, allBatchSizes, options, deviceIds[0]);
+    string unifiedCachePath = Path.Combine(cacheDir, unifiedCacheFile);
+    if (File.Exists(unifiedCachePath))
+    {
+      Console.WriteLine($"  Unified engine already cached: {unifiedCacheFile}");
+      return;
+    }
+
+    string workerPath = FindWorkerBinary();
+    if (workerPath == null)
+    {
+      Console.WriteLine("  WARNING: trt_build_worker not found, falling back to in-process build.");
+      PreBuildInProcess(trt, onnxPath, allBatchSizes, options, deviceIds[0], cacheDir);
+      return;
+    }
+
+    // Phase 1: Parallel workers build groups + export timing caches
+    int numGroups = Math.Min(deviceIds.Length, allBatchSizes.Length);
+    int[][] groups = SplitIntoGroups(allBatchSizes, numGroups);
+    string[] timingCachePaths = new string[numGroups];
+
+    Console.WriteLine($"  Phase 1: Parallel engine build ({numGroups} groups across GPUs [{string.Join(", ", deviceIds[..numGroups])}])");
+
+    System.Diagnostics.Process[] processes = new System.Diagnostics.Process[numGroups];
+    for (int i = 0; i < numGroups; i++)
+    {
+      string batchArg = string.Join(",", groups[i]);
+      timingCachePaths[i] = Path.Combine(cacheDir, $"timing_cache_gpu{deviceIds[i]}.bin");
+
+      Console.WriteLine($"  GPU {deviceIds[i]}: spawning worker for profiles [{batchArg}]");
+
+      string arguments = string.Join(" ",
+        $"\"{onnxPath}\"",
+        deviceIds[i],
+        $"\"{cacheDir}\"",
+        batchArg,
+        options.BuilderOptimizationLevel,
+        options.TilingOptimizationLevel,
+        options.UseSpinWait,
+        options.UseCudaGraphs,
+        options.UseFP16,
+        options.UseBF16,
+        options.UseFP8,
+        options.UseBest,
+        options.FP32PostAttentionNorm,
+        options.FP32PostAttentionNormStrict,
+        options.FP32SmolgenNorm,
+        options.Refittable,
+        $"\"{timingCachePaths[i]}\"");
+
+      System.Diagnostics.ProcessStartInfo psi = new()
+      {
+        FileName = workerPath,
+        Arguments = arguments,
+        UseShellExecute = false,
+        RedirectStandardError = true,
+        RedirectStandardOutput = true,
+      };
+
+      string workerDir = Path.GetDirectoryName(workerPath);
+      string existingLdPath = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") ?? "";
+      psi.Environment["LD_LIBRARY_PATH"] = workerDir + ":" + existingLdPath;
+
+      processes[i] = System.Diagnostics.Process.Start(psi);
+    }
+
+    // Wait for all worker processes to complete
+    bool allSucceeded = true;
+    for (int i = 0; i < numGroups; i++)
+    {
+      System.Diagnostics.Process proc = processes[i];
+      string stderr = proc.StandardError.ReadToEnd();
+      string stdout = proc.StandardOutput.ReadToEnd();
+      proc.WaitForExit();
+
+      if (!string.IsNullOrEmpty(stderr))
+      {
+        Console.Error.Write(stderr);
+      }
+
+      if (proc.ExitCode != 0)
+      {
+        Console.WriteLine($"  ERROR: Worker for GPU {deviceIds[i]} failed with exit code {proc.ExitCode}");
+        if (!string.IsNullOrEmpty(stdout))
+        {
+          Console.WriteLine(stdout);
+        }
+        allSucceeded = false;
+      }
+
+      proc.Dispose();
+    }
+
+    if (!allSucceeded)
+    {
+      throw new InvalidOperationException("One or more parallel engine build workers failed. Check error output above.");
+    }
+
+    // Phase 2: Combine timing caches
+    string[] existingCaches = timingCachePaths.Where(File.Exists).ToArray();
+    if (existingCaches.Length == 0)
+    {
+      Console.WriteLine("  WARNING: No timing cache files produced. Building unified engine without timing cache.");
+      PreBuildInProcess(trt, onnxPath, allBatchSizes, options, deviceIds[0], cacheDir);
+      return;
+    }
+
+    string combinedTimingCachePath = Path.Combine(cacheDir, "combined_timing_cache.bin");
+    Console.WriteLine($"  Phase 2: Combining {existingCaches.Length} timing caches...");
+
+    int combineResult = TensorRTNative.CombineTimingCacheFiles(
+        string.Join(",", existingCaches), combinedTimingCachePath);
+    if (combineResult != 0)
+    {
+      string error = TensorRTNative.GetLastErrorString();
+      Console.WriteLine($"  WARNING: Failed to combine timing caches ({combineResult}): {error}. Building without timing cache.");
+      PreBuildInProcess(trt, onnxPath, allBatchSizes, options, deviceIds[0], cacheDir);
+      CleanupTimingCacheFiles(timingCachePaths, combinedTimingCachePath);
+      return;
+    }
+
+    // Phase 3: Build unified engine with combined timing cache (single GPU)
+    Console.WriteLine($"  Phase 3: Building unified {allBatchSizes.Length}-profile engine with timing cache on GPU {deviceIds[0]}...");
+    TensorRTEngine[] engines = TensorRTEngine.LoadMultiProfileWithCacheAndTimingCache(
+        onnxPath, allBatchSizes, options, deviceIds[0], cacheDir,
+        inputTimingCachePath: combinedTimingCachePath, outputTimingCachePath: null);
+
+    // Dispose handles — we only need the cache file on disk
+    foreach (TensorRTEngine engine in engines)
+    {
+      engine.Dispose();
+    }
+
+    Console.WriteLine($"  Unified engine built and cached: {unifiedCacheFile}");
+
+    // Cleanup: delete group engine cache files + timing cache files
+    CleanupTimingCacheFiles(timingCachePaths, combinedTimingCachePath);
+    CleanupGroupEngineCacheFiles(onnxPath, groups, options, deviceIds, cacheDir);
+  }
+
+
+  /// <summary>
+  /// Fallback: build unified engine in-process without timing cache.
+  /// </summary>
+  private static void PreBuildInProcess(
+      TensorRT trt, string onnxPath, int[] allBatchSizes,
+      TensorRTBuildOptions options, int deviceId, string cacheDir)
+  {
+    Console.WriteLine($"  Building unified {allBatchSizes.Length}-profile engine in-process on GPU {deviceId}...");
+    TensorRTEngine[] engines = TensorRTEngine.LoadMultiProfileWithCache(
+        onnxPath, allBatchSizes, options, deviceId, cacheDir);
+
+    foreach (TensorRTEngine engine in engines)
+    {
+      engine.Dispose();
+    }
+  }
+
+
+  /// <summary>
+  /// Delete timing cache files (temporary build artifacts).
+  /// </summary>
+  private static void CleanupTimingCacheFiles(string[] timingCachePaths, string combinedPath)
+  {
+    foreach (string path in timingCachePaths)
+    {
+      try { if (File.Exists(path)) File.Delete(path); } catch { }
+    }
+    try { if (File.Exists(combinedPath)) File.Delete(combinedPath); } catch { }
+  }
+
+
+  /// <summary>
+  /// Delete group engine cache files (no longer needed after unified engine is built).
+  /// </summary>
+  private static void CleanupGroupEngineCacheFiles(string onnxPath, int[][] groups,
+      TensorRTBuildOptions options, int[] deviceIds, string cacheDir)
+  {
+    for (int i = 0; i < groups.Length; i++)
+    {
+      try
+      {
+        string groupCacheFile = TensorRTEngine.GetMultiProfileCacheFilename(
+            onnxPath, groups[i], options, deviceIds[i]);
+        string groupCachePath = Path.Combine(cacheDir, groupCacheFile);
+        if (File.Exists(groupCachePath))
+        {
+          File.Delete(groupCachePath);
+          Console.WriteLine($"  Cleaned up group engine cache: {groupCacheFile}");
+        }
+      }
+      catch { }
+    }
+  }
+
+
+  /// <summary>
+  /// Finds the trt_build_worker binary in known locations.
+  /// </summary>
+  private static string FindWorkerBinary()
+  {
+    string[] searchPaths = new[]
+    {
+      // Next to the running application (artifacts dir)
+      Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "trt_build_worker"),
+      // Next to the native library in the source tree
+      Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Native", "trt_build_worker"),
+    };
+
+    foreach (string path in searchPaths)
+    {
+      if (File.Exists(path))
+      {
+        return path;
+      }
+    }
+
+    return null;
+  }
+
+
+  /// <summary>
+  /// Distributes items as evenly as possible across the specified number of groups.
+  /// </summary>
+  private static int[][] SplitIntoGroups(int[] items, int numGroups)
+  {
+    int[][] groups = new int[numGroups][];
+    int baseSize = items.Length / numGroups;
+    int remainder = items.Length % numGroups;
+    int offset = 0;
+
+    for (int i = 0; i < numGroups; i++)
+    {
+      int size = baseSize + (i < remainder ? 1 : 0);
+      groups[i] = new int[size];
+      Array.Copy(items, offset, groups[i], 0, size);
+      offset += size;
+    }
+
+    return groups;
+  }
+
+
+  /// <summary>
   /// Constructor.
   /// </summary>
   public MultiGPUEnginePool(TensorRT trt, string onnxPath, int[][] sizesPerGPU, EnginePoolMode mode,
@@ -156,14 +414,33 @@ public sealed class MultiGPUEnginePool : IDisposable
     this.mode = mode;
     this.sizesPerGPU = sizesPerGPU;
 
-    // Load engines in parallel across GPUs when enabled, multi-GPU, and all device IDs are unique
-    // (duplicate device IDs can occur for testing purposes and require sequential loading)
     bool hasDuplicateDevices = deviceIds.Length != deviceIds.Distinct().Count();
-    bool useParallel = NNEvaluatorTensorRT.PARALLEL_ENGINE_LOAD_ENABLED
-                       && deviceIds.Length > 1
-                       && !hasDuplicateDevices;
 
-    if (useParallel)
+    // Parallel engine BUILD with timing cache: split batch sizes into groups, build each
+    // on a different GPU via worker processes, combine timing caches, then build a single
+    // unified engine. Only for ONNX sources (not pre-built .engine files), Exact mode,
+    // multi-GPU with unique device IDs.
+    string ext = System.IO.Path.GetExtension(onnxPath).ToLowerInvariant();
+    bool isOnnxBuild = ext != ".engine" && ext != ".plan";
+    bool useParallelBuild = isOnnxBuild
+                            && mode == EnginePoolMode.Exact
+                            && deviceIds.Length > 1
+                            && !hasDuplicateDevices;
+
+    if (useParallelBuild)
+    {
+      int[] sortedSizes = (int[])sizesPerGPU[0].Clone();
+      Array.Sort(sortedSizes);
+      PreBuildUnifiedEngineWithTimingCache(trt, onnxPath, sortedSizes, options, deviceIds, cacheDir);
+      // Unified engine is now in cache — EnginePool will find it via standard cache lookup
+    }
+
+    // Load engines: parallel LOADING across GPUs (separate from parallel building above)
+    bool useParallelLoad = NNEvaluatorTensorRT.PARALLEL_ENGINE_LOAD_ENABLED
+                           && deviceIds.Length > 1
+                           && !hasDuplicateDevices;
+
+    if (useParallelLoad)
     {
       // Pre-allocate array for thread-safe parallel assignment
       EnginePool[] poolsArray = new EnginePool[deviceIds.Length];

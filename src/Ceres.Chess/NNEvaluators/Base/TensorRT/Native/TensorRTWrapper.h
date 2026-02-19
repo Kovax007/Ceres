@@ -298,6 +298,27 @@ extern "C"
     const int32_t* batchSizes, int32_t numProfiles,
     const TRT_BuildOptions* options, int32_t deviceId);
 
+  // Multi-profile engine with caching + timing cache support.
+  // Like TRT_LoadONNXMultiProfileCached but with timing cache I/O for faster builds.
+  // inputTimingCachePath: if non-null and file exists, loads timing cache to skip tactic benchmarking.
+  // outputTimingCachePath: if non-null, saves the timing cache after build.
+  // On cache hit, timing cache paths are ignored (engine loaded directly from cache).
+  TRT_API int32_t TRT_LoadONNXMultiProfileCachedWithTimingCache(const char* onnxPath,
+    const int32_t* batchSizes, int32_t numProfiles,
+    const TRT_BuildOptions* options, int32_t deviceId,
+    const char* cacheDir, int32_t forceRebuild,
+    const char* inputTimingCachePath,
+    const char* outputTimingCachePath,
+    int32_t* outWasCached, TRT_EngineHandle* outHandles);
+
+  // Combine multiple timing cache files into one.
+  // inputPathsCommaSeparated: comma-separated list of timing cache file paths
+  // outputPath: path to write the combined timing cache
+  // Returns 0 on success, negative on error.
+  TRT_API int32_t TRT_CombineTimingCacheFiles(
+    const char* inputPathsCommaSeparated,
+    const char* outputPath);
+
   // Load a pre-built multi-profile engine file (.engine) directly.
   // Deserializes the engine and creates N execution contexts, one per batch size.
   // This bypasses ONNX parsing and cache validation — useful for loading
