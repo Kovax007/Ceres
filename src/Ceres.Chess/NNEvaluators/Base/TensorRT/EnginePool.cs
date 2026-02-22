@@ -226,18 +226,18 @@ public sealed class EnginePool : IDisposable
     }
     else // Exact mode
     {
-      // Sort ascending for consistent cache filenames (must match PreBuildUnifiedEngineWithTimingCache)
-      Array.Sort(sizes);
-
       string ext = System.IO.Path.GetExtension(onnxPath).ToLowerInvariant();
       TensorRTEngine[] multiEngines;
       if (ext == ".engine" || ext == ".plan")
       {
-        // Load pre-built engine file directly (bypasses ONNX parsing and cache)
+        // Load pre-built engine file directly — sizes must match engine's profile order
         multiEngines = this.trt.LoadMultiProfileEngineFile(onnxPath, sizes, options, deviceId);
       }
       else
       {
+        // Sort ascending for consistent cache filenames (must match PreBuildUnifiedEngineWithTimingCache)
+        Array.Sort(sizes);
+
         // Single multi-profile engine with shared weights across all batch sizes
         multiEngines = this.trt.LoadMultiProfileEngineWithCache(
           onnxPath, sizes, options, cacheDir, deviceId);
