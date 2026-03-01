@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -392,7 +393,11 @@ namespace Ceres.Chess.NNEvaluators
         // Extract values to copy buffers
         for (int i = 0; i < bufferedResult.NumPos; i++)
         {
-          ExtractToNNEvaluatorResult(out ret[i], bufferedResult, i);
+          // Only extract position if needed for VCapture (when ply-bin outputs are available).
+          MGPosition? mgPos = bufferedResult.HasPlyBinOutputs && !positions.Positions.IsEmpty
+                              ? positions.Positions.Span[i]
+                              : null;
+          ExtractToNNEvaluatorResult(out ret[i], bufferedResult, i, mgPos);
         }
 
         return ret;
@@ -421,7 +426,8 @@ namespace Ceres.Chess.NNEvaluators
     /// <param name="result"></param>
     /// <param name="batch"></param>
     /// <param name="batchIndex"></param>
-    public void ExtractToNNEvaluatorResult(out NNEvaluatorResult result, IPositionEvaluationBatch batch, int batchIndex)
+    /// <param name="mgPos">Optional position for computing king squares (for VCapture).</param>
+    public void ExtractToNNEvaluatorResult(out NNEvaluatorResult result, IPositionEvaluationBatch batch, int batchIndex, MGPosition? mgPos = null)
     {
       float w = batch.GetWinP(batchIndex);
       float l = IsWDL ? batch.GetLossP(batchIndex) : float.NaN;
@@ -458,11 +464,61 @@ namespace Ceres.Chess.NNEvaluators
         }
       }
 
+      Half[] plyBinMove = null;
+      Half[] plyBinCapture = null;
+      if (batch.HasPlyBinOutputs)
+      {
+        ReadOnlySpan<Half> moveSpan = batch.GetPlyBinMoveProbs(batchIndex);
+        if (!moveSpan.IsEmpty)
+        {
+          plyBinMove = moveSpan.ToArray();
+        }
+        ReadOnlySpan<Half> captureSpan = batch.GetPlyBinCaptureProbs(batchIndex);
+        if (!captureSpan.IsEmpty)
+        {
+          plyBinCapture = captureSpan.ToArray();
+        }
+      }
+
+      Half[] punimSelf = null;
+      Half[] punimOpponent = null;
+      if (batch.HasPunimOutputs)
+      {
+        ReadOnlySpan<Half> selfSpan = batch.GetPunimSelfProbs(batchIndex);
+        if (!selfSpan.IsEmpty)
+        {
+          punimSelf = selfSpan.ToArray();
+        }
+        ReadOnlySpan<Half> opponentSpan = batch.GetPunimOpponentProbs(batchIndex);
+        if (!opponentSpan.IsEmpty)
+        {
+          punimOpponent = opponentSpan.ToArray();
+        }
+      }
+
+      // Extract king squares for VCapture calculation if position is available and capture probs exist.
+      // The NN outputs capture probs in side-to-move perspective (board is rank-flipped for black),
+      // so king squares must also be rank-flipped for black-to-move positions.
+      byte ourKingSquare = 0;
+      byte theirKingSquare = 0;
+      if (batch.HasPlyBinOutputs && mgPos.HasValue && plyBinCapture != null)
+      {
+        (ourKingSquare, theirKingSquare) = mgPos.Value.KingSquares;
+        if (mgPos.Value.BlackToMove)
+        {
+          ourKingSquare = (byte)(ourKingSquare ^ 56);
+          theirKingSquare = (byte)(theirKingSquare ^ 56);
+        }
+      }
+
       result = new NNEvaluatorResult(w, l, w1, l1, w2, l2, m, uncertaintyV, uncertaintyP,
                                      policyRef.policies.Span[policyRef.index],
                                      HasAction ? actionRef.actions.Span[actionRef.index] : default,
                                      activations, stateInfo, extraStat0, extraStat1,
-                                     rawNetworkOutputs, RawNetworkOutputNames);
+                                     rawNetworkOutputs, RawNetworkOutputNames,
+                                     plyBinMove, plyBinCapture,
+                                     punimSelf, punimOpponent,
+                                     ourKingSquare, theirKingSquare);
     }
 
     #endregion

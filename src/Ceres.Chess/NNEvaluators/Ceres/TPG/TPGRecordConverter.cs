@@ -116,6 +116,14 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         ConvertToTPGEvalInfo(targetInfo.Value, ref tpgRecord, validate);
       }
 
+#if USE_V2_TPG_RECORD
+      if (targetInfo != null)
+      {
+        tpgRecord.PlyUntilSquareChangePiece = targetInfo.Value.PlyUntilSquareChangePiece;
+        tpgRecord.PlyUntilSquarePieceCapture = targetInfo.Value.PlyUntilSquarePieceCapture;
+      }
+#endif
+
       if (policyVector is not null)
       {
         ConvertToTPGRecordPolicies(in policyVector, minLegalMoveProbability, ref tpgRecord);
@@ -357,6 +365,11 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       Debug.Assert(qPositiveBlunders == targetInfo.ForwardSumPositiveBlunders);
 #endif
 
+#if USE_V2_TPG_RECORD
+      tpgRecord.PlyUntilSquareChangePiece = targetInfo.PlyUntilSquareChangePiece;
+      tpgRecord.PlyUntilSquarePieceCapture = targetInfo.PlyUntilSquarePieceCapture;
+#endif
+
       // Write squares.
       ConvertToTPGRecordSquares(trainingPos.PositionWithBoards, includeHistory, tpgRecord.Squares,
                                 pliesSinceLastPieceMoveBySquare, emitPlySinceLastMovePerSquare,
@@ -510,11 +523,11 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         // TODO: make more efficient
         if (FILL_IN)
         {
-          historyPos1 = historyPos2 = historyPos3 = historyPos4 = historyPos5 = historyPos6 = historyPos6 = historyPos7 = thisPosition;
+          historyPos1 = historyPos2 = historyPos3 = historyPos4 = historyPos5 = historyPos6 = historyPos7 = thisPosition;
         }
         else
         {
-          historyPos1 = historyPos2 = historyPos3 = historyPos4 = historyPos5 = historyPos6 = historyPos6 = historyPos7 = default;
+          historyPos1 = historyPos2 = historyPos3 = historyPos4 = historyPos5 = historyPos6 = historyPos7 = default;
         }
       }
 
@@ -572,6 +585,10 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
 
 
       tpgRecord.PolicyIndexInParent = targetInfo.PolicyIndexInParent;
+
+      // Copy PUNIM (ply until next irreversible move) values.
+      tpgRecord.PUNIMSelf = targetInfo.PUNIMSelf;
+      tpgRecord.PUNIMOpponent = targetInfo.PUNIMOpponent;
     }
   }
 }

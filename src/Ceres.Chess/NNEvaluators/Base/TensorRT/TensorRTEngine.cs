@@ -28,6 +28,13 @@ namespace Ceres.Chess.NNEvaluators.TensorRT;
 public sealed class TensorRTEngine : IDisposable
 {
   /// <summary>
+  /// Alignment for output tensor elements in the flat buffer (must match OUTPUT_TENSOR_ALIGN_ELEMS in C++).
+  /// </summary>
+  const int OUTPUT_TENSOR_ALIGN_ELEMS = 128;
+
+  static long AlignUp(long value, long alignment) => ((value + alignment - 1) / alignment) * alignment;
+
+  /// <summary>
   /// Batch size this engine was built for.
   /// </summary>
   public int BatchSize;
@@ -93,7 +100,7 @@ public sealed class TensorRTEngine : IDisposable
     TotalOutputSize = 0;
     for (int i = 0; i < NumOutputs; i++)
     {
-      TotalOutputSize += TensorRTNative.GetOutputSize(this.handle, i);
+      TotalOutputSize += AlignUp(TensorRTNative.GetOutputSize(this.handle, i), OUTPUT_TENSOR_ALIGN_ELEMS);
     }
   }
 
@@ -140,7 +147,7 @@ public sealed class TensorRTEngine : IDisposable
     TotalOutputSize = 0;
     for (int i = 0; i < NumOutputs; i++)
     {
-      TotalOutputSize += TensorRTNative.GetOutputSize(handle, i);
+      TotalOutputSize += AlignUp(TensorRTNative.GetOutputSize(handle, i), OUTPUT_TENSOR_ALIGN_ELEMS);
     }
   }
 
@@ -268,7 +275,7 @@ public sealed class TensorRTEngine : IDisposable
     {
       throw new InvalidOperationException("Failed to generate multi-profile cache filename");
     }
-    string filename = Marshal.PtrToStringAnsi(ptr) ?? "";
+    string filename = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(ptr) ?? "";
     TensorRTNative.FreeString(ptr);
     return filename;
   }
@@ -442,6 +449,11 @@ public sealed class TensorRTEngine : IDisposable
   public bool UsesCudaGraphs => TensorRTNative.UsesCudaGraphs(handle) == 1;
 
   /// <summary>
+  /// Disable CUDA graphs for this engine (fallback to direct enqueue).
+  /// </summary>
+  public void DisableCudaGraphs() => TensorRTNative.DisableCudaGraphs(handle);
+
+  /// <summary>
   /// Returns true if the CUDA graph for the specified stream has already been captured.
   /// </summary>
   /// <param name="streamIdx">Stream index (0 or 1)</param>
@@ -601,7 +613,7 @@ public sealed class TensorRTEngine : IDisposable
     {
       fixed (Half* outputPtr = output)
       {
-        int result = TensorRTNative.InferHostDynamic(handle, inputPtr, actualInputElements, outputPtr, actualOutputElements, actualBatchSize);
+                                                 int result = TensorRTNative.InferHostDynamic(handle, inputPtr, actualInputElements, outputPtr, actualOutputElements, actualBatchSize);
         if (result != 0)
         {
           string error = TensorRTNative.GetLastErrorString();
@@ -713,7 +725,11 @@ public sealed class TensorRTEngine : IDisposable
     int result = TensorRTNative.CopyToGPUOnStream(handle, streamIdx, gpuDst, pinnedSrc, bytes);
     if (result != 0)
     {
-      throw new InvalidOperationException($"CopyToGPUOnStream failed on stream {streamIdx}");
+      string error = TensorRTNative.GetLastErrorString();
+      throw new InvalidOperationException(
+        $"CopyToGPUOnStream failed (rc={result}) on stream {streamIdx}, " +
+        $"batch={BatchSize}, handle={handle}, dst={gpuDst}, src={pinnedSrc}, bytes={bytes}" +
+        (error != null ? $": {error}" : ""));
     }
   }
 

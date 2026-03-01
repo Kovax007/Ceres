@@ -149,6 +149,30 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     /// Neural net index (0...1857) of the move played from prior move in game (or -1 if none).
     /// </summary>
     public short PolicyIndexInParent;
+
+    /// <summary>
+    /// Ply until next irreversible move by self (one-hot encoded over 8 bins).
+    /// An irreversible move is a pawn move or capture.
+    /// </summary>
+    public byte PUNIMSelf;
+
+    /// <summary>
+    /// Ply until next irreversible move by opponent (one-hot encoded over 8 bins).
+    /// An irreversible move is a pawn move or capture.
+    /// </summary>
+    public byte PUNIMOpponent;
+
+#if USE_V2_TPG_RECORD
+    /// <summary>
+    /// Per-square ply-bin encoding of the number of half-moves until the piece occupancy changes.
+    /// </summary>
+    public PlyBinPerSquare64 PlyUntilSquareChangePiece;
+
+    /// <summary>
+    /// Per-square ply-bin encoding of the number of half-moves until a capture occurs on that square.
+    /// </summary>
+    public PlyBinPerSquare64 PlyUntilSquarePieceCapture;
+#endif
   }
 
 }

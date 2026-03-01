@@ -18,7 +18,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics.Tensors;
 using System.Threading.Tasks;
-
+using Ceres.Base.CUDA;
 using Ceres.Base.DataTypes;
 using Ceres.Base.Threading;
 using Ceres.Chess.EncodedPositions;
@@ -32,6 +32,7 @@ using Ceres.Chess.NNEvaluators.Ceres;
 using Ceres.Chess.NNEvaluators.Ceres.TPG;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.UserSettings;
+using Microsoft.ML.OnnxRuntime;
 
 #endregion
 
@@ -97,6 +98,20 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private int mlhTensorIndex;
   private int uncVTensorIndex;
   private int uncPTensorIndex;
+  private int pieceMoveTensorIndex = -1;
+  private int pieceCaptureTensorIndex = -1;
+  private int punimSelfTensorIndex = -1;
+  private int punimOpponentTensorIndex = -1;
+
+  // Per-position sizes for ply-bin tensors
+  private int pieceMoveSizePerPos;
+  private int pieceCaptureSizePerPos;
+  private bool hasPlyBinOutputs;
+
+  // Per-position sizes for PUNIM tensors
+  private int punimSelfSizePerPos;
+  private int punimOpponentSizePerPos;
+  private bool hasPunimOutputs;
 
   private readonly int inputElementsPerPosition;
   private readonly int outputElementsPerPosition;
@@ -115,6 +130,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
   [ThreadStatic]
   private static float[] threadLocalOutputFloatBuffer;
   private int outputFloatBufferSize; // Required size, stored for thread-local allocation
+
+  // Pre-allocated ply-bin result buffers
+  private Half[] plyBinMoveBuffer;
+  private Half[] plyBinCaptureBuffer;
+
+  // Pre-allocated PUNIM result buffers
+  private Half[] punimSelfBuffer;
+  private Half[] punimOpponentBuffer;
 
   // Pre-allocated result buffers to reduce GC pressure
   private FP16[] wBuffer;
@@ -136,7 +159,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private readonly bool hasUncertaintyP;
   private readonly bool hasValueSecondary;
 
-  // Warmup tracking
+  // Warmup tracking (static lock ensures only one Warmup runs at a time across all instances)
   private bool haveWarmedUp;
 
   /// <inheritdoc/>
@@ -225,7 +248,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
     EngineNetworkID = System.IO.Path.GetFileNameWithoutExtension(onnxFileName);
 
     // Build per-GPU sizes: use provided sizesPerGPU or replicate batchSizes for all GPUs
-    int[][] effectiveSizesPerGPU = new int[gpuIDs.Length][];
+    int[][] effectiveSizesPerGPU = new int[GpuIDs.Length][];
     for (int i = 0; i < GpuIDs.Length; i++)
     {
       effectiveSizesPerGPU[i] = AdjustToSM(GpuIDs[i], batchSizes);
@@ -357,6 +380,22 @@ public class NNEvaluatorTensorRT : NNEvaluator
           uncPTensorIndex = tensorIndex;
           uncPSize = sizePerPos;
           break;
+        case "piece_move":
+          pieceMoveTensorIndex = tensorIndex;
+          pieceMoveSizePerPos = sizePerPos;
+          break;
+        case "piece_capture":
+          pieceCaptureTensorIndex = tensorIndex;
+          pieceCaptureSizePerPos = sizePerPos;
+          break;
+        case "punim_self":
+          punimSelfTensorIndex = tensorIndex;
+          punimSelfSizePerPos = sizePerPos;
+          break;
+        case "punim_opponent":
+          punimOpponentTensorIndex = tensorIndex;
+          punimOpponentSizePerPos = sizePerPos;
+          break;
       }
       tensorIndex++;
     }
@@ -366,6 +405,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
     hasUncertaintyV = uncVSize > 0;
     hasUncertaintyP = uncPSize > 0;
     hasValueSecondary = value2Size > 0 || (SUBSTITUTE_VALUE3_INTO_VALUE2_IF_FOUND && value3Size > 0);
+    hasPlyBinOutputs = pieceMoveSizePerPos == 512 && pieceCaptureSizePerPos == 512;
+    hasPunimOutputs = punimSelfSizePerPos == 8 && punimOpponentSizePerPos == 8;
 
     if (netType == ONNXNetExecutor.NetTypeEnum.TPG)
     {
@@ -382,7 +423,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       inputHalfBuffer = new Half[maxBatchSize * inputElementsPerPosition];
     }
 
-    outputFloatBufferSize = largestEngineBatchSize * outputElementsPerPosition;
+    outputFloatBufferSize = (int)pool.MaxTotalOutputSize;
 
     // Pre-allocate result buffers
     wBuffer = new FP16[maxBatchSize];
@@ -395,6 +436,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
     uncVBuffer = hasUncertaintyV ? new FP16[maxBatchSize] : Array.Empty<FP16>();
     uncPBuffer = hasUncertaintyP ? new FP16[maxBatchSize] : Array.Empty<FP16>();
     policiesBuffer = new CompressedPolicyVector[maxBatchSize];
+    plyBinMoveBuffer = hasPlyBinOutputs ? new Half[maxBatchSize * 512] : Array.Empty<Half>();
+    plyBinCaptureBuffer = hasPlyBinOutputs ? new Half[maxBatchSize * 512] : Array.Empty<Half>();
+    punimSelfBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
+    punimOpponentBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
 
     // Cache ParallelOptions to avoid allocation per batch
     cachedParallelOptions = new ParallelOptions
@@ -406,11 +451,13 @@ public class NNEvaluatorTensorRT : NNEvaluator
     Warmup();
   }
 
+  private static readonly object warmupLock = new();
 
   /// <summary>
   /// Performs warmup by running dummy evaluations at each defined batch size.
   /// Only executes on first call; subsequent calls are no-ops.
   /// </summary>
+
   public override void Warmup()
   {
     if (haveWarmedUp)
@@ -418,38 +465,46 @@ public class NNEvaluatorTensorRT : NNEvaluator
       return;
     }
 
-    // Determine batch sizes to warm up based on pool mode
-    int[] warmupSizes;
-    if (PoolMode == EnginePoolMode.Range)
+    lock (warmupLock)
     {
-      // For Range mode, warm up at each range maximum
-      warmupSizes = BatchSizes;
-    }
-    else
-    {
-      // For Exact mode, warm up at each exact batch size
-      warmupSizes = BatchSizes;
-    }
-
-    // Allocate dummy input buffers for warmup
-    int maxWarmupSize = warmupSizes.Max();
-    Half[] dummyOutputBuffer = new Half[maxWarmupSize * outputElementsPerPosition];
-
-    foreach (int batchSize in warmupSizes)
-    {
-      if (useByteInputs)
+      if (haveWarmedUp)
       {
-        byte[] dummyInput = new byte[batchSize * inputElementsPerPosition];
-        pool.ProcessBytes(dummyInput, dummyOutputBuffer, batchSize);
+        return;
+      }
+
+      // Determine batch sizes to warm up based on pool mode
+      int[] warmupSizes;
+      if (PoolMode == EnginePoolMode.Range)
+      {
+        // For Range mode, warm up at each range maximum
+        warmupSizes = BatchSizes;
       }
       else
       {
-        Half[] dummyInput = new Half[batchSize * inputElementsPerPosition];
-        pool.Process(dummyInput, dummyOutputBuffer, batchSize);
+        // For Exact mode, warm up at each exact batch size
+        warmupSizes = BatchSizes;
       }
-    }
 
-    haveWarmedUp = true;
+      // Allocate dummy input buffers for warmup
+      int maxWarmupSize = warmupSizes.Max();
+      Half[] dummyOutputBuffer = new Half[maxWarmupSize * outputElementsPerPosition];
+
+      foreach (int batchSize in warmupSizes)
+      {
+        if (useByteInputs)
+        {
+          byte[] dummyInput = new byte[batchSize * inputElementsPerPosition];
+          pool.ProcessBytes(dummyInput, dummyOutputBuffer, batchSize);
+        }
+        else
+        {
+          Half[] dummyInput = new Half[batchSize * inputElementsPerPosition];
+          pool.Process(dummyInput, dummyOutputBuffer, batchSize);
+        }
+      }
+
+      haveWarmedUp = true;
+    }
   }
 
 
@@ -508,6 +563,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
     FP16[] uncP = uncPBuffer;
     CompressedPolicyVector[] policies = policiesBuffer;
     CompressedActionVector[] actions = Array.Empty<CompressedActionVector>();
+    Half[] plyBinMove = plyBinMoveBuffer;
+    Half[] plyBinCapture = plyBinCaptureBuffer;
+    Half[] punimSelf = punimSelfBuffer;
+    Half[] punimOpponent = punimOpponentBuffer;
 
     // Get option values for value head temperature
     float valueHead1Temperature = Options?.ValueHead1Temperature ?? 1.0f;
@@ -531,6 +590,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
       ExtractSubBatchResults(batch, globalStartPosition, positionCount, engineBatchSize,
                              threadLocalOutputFloatBuffer, w, l, w2, l2, m, uncV, uncP, policies,
+                             plyBinMove, plyBinCapture, punimSelf, punimOpponent,
                              valueHead1Temperature, valueHead2Temperature,
                              valueHead1TemperatureScaling, valueHead2TemperatureScaling,
                              NetType == ONNXNetExecutor.NetTypeEnum.TPG);
@@ -603,7 +663,110 @@ public class NNEvaluatorTensorRT : NNEvaluator
       uncertaintyP: uncP,
       states: default,
       activations: default,
-      stats: default);
+      stats: default,
+      plyBinMoveProbs: hasPlyBinOutputs ? plyBinMove : default,
+      plyBinCaptureProbs: hasPlyBinOutputs ? plyBinCapture : default,
+      punimSelfProbs: hasPunimOutputs ? punimSelf : default,
+      punimOpponentProbs: hasPunimOutputs ? punimOpponent : default);
+  }
+
+
+  /// <summary>
+  /// Computes inverse hyperbolic tangent (artanh).
+  /// </summary>
+  private static float Atanh(float x) => 0.5f * MathF.Log((1f + x) / (1f - x));
+
+
+  /// <summary>
+  /// Applies softmax-based temperature scaling to WDL logits.
+  /// </summary>
+  private static (float W, float L) ApplySoftmaxTemperature(float vW, float vD, float vL, float invTemp)
+  {
+    float maxV = MathF.Max(vW, MathF.Max(vD, vL));
+    float expW = MathF.Exp((vW - maxV) * invTemp);
+    float expD = MathF.Exp((vD - maxV) * invTemp);
+    float expL = MathF.Exp((vL - maxV) * invTemp);
+    float sumV = expW + expD + expL;
+    return (expW / sumV, expL / sumV);
+  }
+
+
+  /// <summary>
+  /// Applies temperature scaling to a WDL (win/draw/loss) distribution,
+  /// compressing or sharpening the value (W-L) while preserving the draw probability.
+  ///
+  /// Temperature operates in arctanh (logit) space on V = W - L, then redistributes
+  /// W and L symmetrically around the fixed draw mass.
+  ///
+  /// Parameters:
+  ///   w, d, l      - Original win/draw/loss probabilities (should sum to 1).
+  ///   temperature  - Temperature. t=1 returns original values unchanged.
+  ///                  t>1 compresses V toward 0 (more uncertain).
+  ///                  t&lt;1 pushes V toward ±1 (more decisive).
+  ///   drawFactor   - Controls how much the draw probability resists temperature [0, 1].
+  ///                  0: drawish positions are heavily resistant to temperature changes,
+  ///                     preserving the natural buffering effect of high draw probability.
+  ///                  1: temperature acts with full force regardless of draw probability,
+  ///                     as if operating purely in value space.
+  ///                  Values in between blend smoothly between these two extremes.
+  /// </summary>
+  private static (float W, float L) ApplyTanhTemperature(float w, float d, float l, float temperature, float drawFactor)
+  {
+    float v = Math.Clamp(w - l, -0.9999f, 0.9999f);
+
+    // Draws resist temperature change, modulated by drawFactor
+    // drawFactor=1: full bypass (temperature acts with full force)
+    // drawFactor=0: draws fully dampen temperature effect
+    float damping = MathF.Pow(1f - d, 1f - drawFactor);
+    float tEff = 1f + (temperature - 1f) * damping;
+
+    float vt = MathF.Tanh(Atanh(v) / tEff);
+
+    // Preserve original draw, redistribute W/L to hit new V
+    float delta = 1f - d;
+    float newW = (delta + vt) / 2f;
+    float newL = (delta - vt) / 2f;
+    return (newW, newL);
+  }
+
+
+  /// <summary>
+  /// Extracts WDL values from logits and applies appropriate temperature scaling.
+  /// When temperatureScaling > 0: uses softmax with dynamic temperature based on uncertainty.
+  /// When temperatureScaling < 0: uses tanh-based scaling with dynamic temperature based on uncertainty.
+  /// When temperatureScaling == 0: uses softmax with fixed base temperature.
+  /// </summary>
+  private static (float W, float L) ExtractAndScaleWDL(float vW, float vD, float vL,
+                                                        float baseTemperature, float temperatureScaling,
+                                                        float uncertaintyV, bool wdlIsLogistic)
+  {
+    if (temperatureScaling < 0)
+    {
+      // Tanh-based scaling: first convert logits to probabilities, then apply tanh scaling
+      float effectiveTemp = baseTemperature + uncertaintyV * (-temperatureScaling);
+
+      // Convert logits to probabilities first (softmax with temp=1)
+      float maxV = MathF.Max(vW, MathF.Max(vD, vL));
+      float expW = MathF.Exp(vW - maxV);
+      float expD = MathF.Exp(vD - maxV);
+      float expL = MathF.Exp(vL - maxV);
+      float sumV = expW + expD + expL;
+      float probW = expW / sumV;
+      float probD = expD / sumV;
+      float probL = expL / sumV;
+
+      const float DRAW_FACTOR = 0.3f;
+      return ApplyTanhTemperature(probW, probD, probL, effectiveTemp, DRAW_FACTOR);
+    }
+    else
+    {
+      // Softmax-based scaling
+      float effectiveTemp = temperatureScaling > 0
+                          ? baseTemperature + uncertaintyV * temperatureScaling
+                          : baseTemperature;
+      float invTemp = 1.0f / effectiveTemp;
+      return ApplySoftmaxTemperature(vW, vD, vL, invTemp);
+    }
   }
 
 
@@ -616,6 +779,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
                                       float[] subBatchOutput,
                                       FP16[] w, FP16[] l, FP16[] w2, FP16[] l2, FP16[] m, FP16[] uncV, FP16[] uncP,
                                       CompressedPolicyVector[] policies,
+                                      Half[] plyBinMove, Half[] plyBinCapture,
+                                      Half[] punimSelf, Half[] punimOpponent,
                                       float valueHead1Temperature, float valueHead2Temperature,
                                       float valueHead1TemperatureScaling, float valueHead2TemperatureScaling,
                                       bool wdlIsLogistic)
@@ -628,6 +793,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
     int mlhOffset = 0;
     int uncVOffset = 0;
     int uncPOffset = 0;
+    int pieceMoveOffset = 0;
+    int pieceCaptureOffset = 0;
+    int punimSelfOffset = 0;
+    int punimOpponentOffset = 0;
 
     int currentOffset = 0;
     for (int t = 0; t < outputInfos.Length; t++)
@@ -663,8 +832,29 @@ public class NNEvaluatorTensorRT : NNEvaluator
       {
         uncPOffset = currentOffset;
       }
+      else if (t == pieceMoveTensorIndex)
+      {
+        pieceMoveOffset = currentOffset;
+      }
+      else if (t == pieceCaptureTensorIndex)
+      {
+        pieceCaptureOffset = currentOffset;
+      }
+      else if (t == punimSelfTensorIndex)
+      {
+        punimSelfOffset = currentOffset;
+      }
+      else if (t == punimOpponentTensorIndex)
+      {
+        punimOpponentOffset = currentOffset;
+      }
 
-      currentOffset += tensorSize;
+      // Align to 256-byte boundary (128 fp16 elements) to match
+      // OUTPUT_TENSOR_ALIGN_ELEMS in TensorRTWrapper.cpp.
+      // Required for CUDA graphs: small tensors (e.g. 8-element PUNIM)
+      // would otherwise cause misaligned addresses during graph capture.
+      const int ALIGN = 128;
+      currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
     }
 
     // Substitute value3 into value2 if enabled and value3 is present
@@ -672,10 +862,6 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
     // Get policy temperature once
     float policyTemperature = Options?.PolicyTemperature ?? 1.0f;
-
-    // Pre-compute inverse temperatures to avoid division in hot loop
-    float invTemp1 = 1.0f / valueHead1Temperature;
-    float invTemp2 = 1.0f / valueHead2Temperature;
 
     // Capture batch data for parallel access
     ReadOnlyMemory<MGMoveList> moves = batch.Moves;
@@ -691,7 +877,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       if (hasM)
       {
         int posMlhOffset = mlhOffset + i * mlhSize;
-        m[resultIndex] = (FP16)subBatchOutput[posMlhOffset];
+        m[resultIndex] = (FP16)MathF.Max(subBatchOutput[posMlhOffset] * 100, 0); // NetTransformer.MLH_DIVISOR = 100
       }
 
       // ===== Extract Uncertainty V =====
@@ -720,19 +906,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
           float vD = subBatchOutput[posValueOffset + 1];
           float vL = subBatchOutput[posValueOffset + 2];
 
-          if (valueHead1TemperatureScaling > 0)
-          {
-            invTemp1 = 1.0f / (valueHead1Temperature + uncertaintyV * valueHead1TemperatureScaling);
-          }
-
-          float maxV = MathF.Max(vW, MathF.Max(vD, vL));
-          float expW = MathF.Exp((vW - maxV) * invTemp1);
-          float expD = MathF.Exp((vD - maxV) * invTemp1);
-          float expL = MathF.Exp((vL - maxV) * invTemp1);
-          float sumV = expW + expD + expL;
-
-          w[resultIndex] = (FP16)(expW / sumV);
-          l[resultIndex] = (FP16)(expL / sumV);
+          (float wVal, float lVal) = ExtractAndScaleWDL(vW, vD, vL,
+                                                         valueHead1Temperature, valueHead1TemperatureScaling,
+                                                         uncertaintyV, wdlIsLogistic);
+          w[resultIndex] = (FP16)wVal;
+          l[resultIndex] = (FP16)lVal;
         }
         else
         {
@@ -755,19 +933,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
         float vD2 = subBatchOutput[posValue2Offset + 1];
         float vL2 = subBatchOutput[posValue2Offset + 2];
 
-        if (valueHead2TemperatureScaling > 0)
-        {
-          invTemp2 = 1.0f / (valueHead2Temperature + uncertaintyV * valueHead2TemperatureScaling);
-        }
-
-        float maxV2 = MathF.Max(vW2, MathF.Max(vD2, vL2));
-        float expW2 = MathF.Exp((vW2 - maxV2) * invTemp2);
-        float expD2 = MathF.Exp((vD2 - maxV2) * invTemp2);
-        float expL2 = MathF.Exp((vL2 - maxV2) * invTemp2);
-        float sumV2 = expW2 + expD2 + expL2;
-
-        w2[resultIndex] = (FP16)(expW2 / sumV2);
-        l2[resultIndex] = (FP16)(expL2 / sumV2);
+        (float w2Val, float l2Val) = ExtractAndScaleWDL(vW2, vD2, vL2,
+                                                         valueHead2Temperature, valueHead2TemperatureScaling,
+                                                         uncertaintyV, wdlIsLogistic: true);
+        w2[resultIndex] = (FP16)w2Val;
+        l2[resultIndex] = (FP16)l2Val;
       }
 
       // ===== Extract Policy =====
@@ -830,6 +1000,130 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
       SideType side = positions.Span[batchIndex].SideToMove;
       CompressedPolicyVector.Initialize(ref policies[resultIndex], side, indices, logits, alreadySorted: false);
+
+      // ===== Extract Ply-Bin Outputs (if present) =====
+      if (hasPlyBinOutputs)
+      {
+        int destOffset = resultIndex * 512;
+
+        // piece_move: softmax per square (8 bins), reverse bin order
+        int posPieceMoveOffset = pieceMoveOffset + i * pieceMoveSizePerPos;
+        for (int sq = 0; sq < 64; sq++)
+        {
+          int srcBase = posPieceMoveOffset + sq * 8;
+          int dstBase = destOffset + sq * 8;
+
+          float max = subBatchOutput[srcBase];
+          for (int b = 1; b < 8; b++)
+          {
+            float v = subBatchOutput[srcBase + b];
+            if (v > max) max = v;
+          }
+
+          float expSum = 0;
+          Span<float> exps = stackalloc float[8];
+          for (int b = 0; b < 8; b++)
+          {
+            float e = MathF.Exp(subBatchOutput[srcBase + b] - max);
+            exps[b] = e;
+            expSum += e;
+          }
+
+          float invSum = 1.0f / expSum;
+          for (int b = 0; b < 8; b++)
+          {
+            plyBinMove[dstBase + b] = (Half)(exps[7 - b] * invSum);
+          }
+        }
+
+        // piece_capture: softmax per square (8 bins), reverse bin order
+        int posPieceCaptureOffset = pieceCaptureOffset + i * pieceCaptureSizePerPos;
+        for (int sq = 0; sq < 64; sq++)
+        {
+          int srcBase = posPieceCaptureOffset + sq * 8;
+          int dstBase = destOffset + sq * 8;
+
+          float max = subBatchOutput[srcBase];
+          for (int b = 1; b < 8; b++)
+          {
+            float v = subBatchOutput[srcBase + b];
+            if (v > max) max = v;
+          }
+
+          float expSum = 0;
+          Span<float> exps = stackalloc float[8];
+          for (int b = 0; b < 8; b++)
+          {
+            float e = MathF.Exp(subBatchOutput[srcBase + b] - max);
+            exps[b] = e;
+            expSum += e;
+          }
+
+          float invSum = 1.0f / expSum;
+          for (int b = 0; b < 8; b++)
+          {
+            plyBinCapture[dstBase + b] = (Half)(exps[7 - b] * invSum);
+          }
+        }
+      }
+
+      // ===== Extract PUNIM Outputs (if present) =====
+      if (hasPunimOutputs)
+      {
+        int punimDestOffset = resultIndex * 8;
+
+        // punim_self: softmax of 8 bins, reverse bin order
+        int posPunimSelfOffset = punimSelfOffset + i * punimSelfSizePerPos;
+        {
+          float max = subBatchOutput[posPunimSelfOffset];
+          for (int b = 1; b < 8; b++)
+          {
+            float v = subBatchOutput[posPunimSelfOffset + b];
+            if (v > max) max = v;
+          }
+
+          float expSum = 0;
+          Span<float> exps = stackalloc float[8];
+          for (int b = 0; b < 8; b++)
+          {
+            float e = MathF.Exp(subBatchOutput[posPunimSelfOffset + b] - max);
+            exps[b] = e;
+            expSum += e;
+          }
+
+          float invSum = 1.0f / expSum;
+          for (int b = 0; b < 8; b++)
+          {
+            punimSelf[punimDestOffset + b] = (Half)(exps[7 - b] * invSum);
+          }
+        }
+
+        // punim_opponent: softmax of 8 bins, reverse bin order
+        int posPunimOpponentOffset = punimOpponentOffset + i * punimOpponentSizePerPos;
+        {
+          float max = subBatchOutput[posPunimOpponentOffset];
+          for (int b = 1; b < 8; b++)
+          {
+            float v = subBatchOutput[posPunimOpponentOffset + b];
+            if (v > max) max = v;
+          }
+
+          float expSum = 0;
+          Span<float> exps = stackalloc float[8];
+          for (int b = 0; b < 8; b++)
+          {
+            float e = MathF.Exp(subBatchOutput[posPunimOpponentOffset + b] - max);
+            exps[b] = e;
+            expSum += e;
+          }
+
+          float invSum = 1.0f / expSum;
+          for (int b = 0; b < 8; b++)
+          {
+            punimOpponent[punimDestOffset + b] = (Half)(exps[7 - b] * invSum);
+          }
+        }
+      }
     });
   }
 
@@ -900,7 +1194,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   }
 
 
-  internal static NNEvaluatorTensorRT BuildEvaluator(NNEvaluatorNetDef netDef,
+  public static NNEvaluatorTensorRT BuildEvaluator(NNEvaluatorNetDef netDef,
                                                      int[] gpuIDs,
                                                      NNEvaluatorOptions options,
                                                      ONNXNetExecutor.NetTypeEnum netType = ONNXNetExecutor.NetTypeEnum.TPG,
@@ -938,7 +1232,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
     NNEvaluatorTensorRT trtNativeEngine = new(netFileName,
                                               netType,
                                               EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range,
-                                              new int[] { 4, 8 },
+                                              new int[] { 1, 2, 4, 8 },
                                               buildOptions,
                                               gpuIDs: gpuIDs,
                                               useCudaGraphs: EXACT_BATCHES,

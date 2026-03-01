@@ -51,6 +51,8 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   private readonly bool hasAction;
   private readonly bool hasValueSecondary;
   private readonly bool hasState;
+  private readonly bool hasPlyBinOutputs;
+  private readonly bool hasPunimOutputs;
 
   /// <summary>
   /// Constructor.
@@ -80,6 +82,8 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
     hasAction = batches[0].HasAction;
     hasValueSecondary = batches[0].HasValueSecondary;
     hasState = batches[0].HasState;
+    hasPlyBinOutputs = batches[0].HasPlyBinOutputs;
+    hasPunimOutputs = batches[0].HasPunimOutputs;
   }
 
 
@@ -96,6 +100,10 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   bool IPositionEvaluationBatch.HasValueSecondary => hasValueSecondary;
 
   bool IPositionEvaluationBatch.HasState => hasState;
+
+  bool IPositionEvaluationBatch.HasPlyBinOutputs => hasPlyBinOutputs;
+
+  bool IPositionEvaluationBatch.HasPunimOutputs => hasPunimOutputs;
 
   /// <summary>
   /// Number of positions in batch.
@@ -228,6 +236,30 @@ internal class PositionsEvaluationBatchMerged : IPositionEvaluationBatch
   {
     (int batchIndex, int localIndex) = GetIndices(index);
     return Batches[batchIndex].GetState(localIndex);
+  }
+
+  public ReadOnlySpan<Half> GetPlyBinMoveProbs(int index)
+  {
+    (int batchIndex, int localIndex) = GetIndices(index);
+    return Batches[batchIndex].GetPlyBinMoveProbs(localIndex);
+  }
+
+  public ReadOnlySpan<Half> GetPlyBinCaptureProbs(int index)
+  {
+    (int batchIndex, int localIndex) = GetIndices(index);
+    return Batches[batchIndex].GetPlyBinCaptureProbs(localIndex);
+  }
+
+  public ReadOnlySpan<Half> GetPunimSelfProbs(int index)
+  {
+    (int batchIndex, int localIndex) = GetIndices(index);
+    return Batches[batchIndex].GetPunimSelfProbs(localIndex);
+  }
+
+  public ReadOnlySpan<Half> GetPunimOpponentProbs(int index)
+  {
+    (int batchIndex, int localIndex) = GetIndices(index);
+    return Batches[batchIndex].GetPunimOpponentProbs(localIndex);
   }
 
   public IEnumerator<NNPositionEvaluationBatchMember> GetEnumerator()

@@ -97,5 +97,26 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
     }
 
     public static float MLHDecoded(float mlh) => MathF.Pow(mlh / MLH_SCALING_FACTOR, 2);
+
+    /// <summary>
+    /// Encodes a ply count into a one-hot byte over 8 ply-distance bins.
+    /// Used for encoding PUNIM (ply until next irreversible move) and other per-square ply data.
+    /// </summary>
+    /// <param name="plyCount">The ply count to encode. Pass -1 or 0 for "never".</param>
+    /// <returns>A one-hot encoded byte where exactly one bit is set.</returns>
+    public static byte EncodePlyBin(int plyCount)
+    {
+      return plyCount switch
+      {
+        <= 0  => 0x80,  // never
+        <= 2  => 0x01,  // [1-2]
+        <= 4  => 0x02,  // [3-4]
+        <= 10 => 0x04,  // [5-10]
+        <= 22 => 0x08,  // [11-22]
+        <= 40 => 0x10,  // [23-40]
+        <= 65 => 0x20,  // [41-65]
+        _     => 0x40   // [66+]
+      };
+    }
   }
 }

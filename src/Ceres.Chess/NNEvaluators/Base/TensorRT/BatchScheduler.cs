@@ -117,7 +117,9 @@ public static class BatchScheduler
       }
       return new ScheduleResult(emptyPlan, 0, 0, 0)
       {
-        MakespanMs = 0f, MultiGpuPenaltyMs = 0f, TotalEstimatedMs = 0f
+        MakespanMs = 0f,
+        MultiGpuPenaltyMs = 0f,
+        TotalEstimatedMs = 0f
       };
     }
 
@@ -504,10 +506,12 @@ public static class BatchScheduler
   /// <summary>
   /// Single-GPU scheduling: finds the batch sequence minimizing total inference time.
   /// Uses DP over position counts with pipeline overlap credits.
-  /// Only managed allocation is the returned result array; working buffers
-  /// use stackalloc.
+  /// When concurrent=true, also evaluates concurrent cost (pairs on separate CUDA streams)
+  /// for diagnostic output. The plan itself is unchanged; the caller controls execution strategy.
+  /// Only managed allocation is the returned result array; working buffers use stackalloc.
   /// </summary>
-  public static int[] ScheduleSingleGPU(ReadOnlySpan<int> engineSizes, ReadOnlySpan<float> executionTimes, int targetBatch, int deviceIndex = -1)
+  public static int[] ScheduleSingleGPU(ReadOnlySpan<int> engineSizes, ReadOnlySpan<float> executionTimes,
+                                         int targetBatch, int deviceIndex = -1, bool concurrent = false)
   {
     if (targetBatch <= 0 || engineSizes.Length == 0)
     {
@@ -574,7 +578,89 @@ public static class BatchScheduler
       Console.WriteLine($"  OPTIMIZED_PLAN [{label}]: {N} -> [{string.Join(", ", result)}] total={batched} padding={batched - N} time={time:F1}ms");
     }
 
+    // When concurrent execution is enabled, evaluate concurrent cost for diagnostics.
+    // The plan itself is unchanged; the caller controls execution via NUM_COMPUTE_STREAMS.
+    if (concurrent && result.Length > 1 && VERBOSE_DETAILS)
+    {
+      float seqCost = ComputeSequentialCost(result, engineSizes, executionTimes);
+      float concCost = ComputeConcurrentCost(result, engineSizes, executionTimes);
+      string concLabel = deviceIndex >= 0 ? $"device {deviceIndex}" : "single GPU";
+      Console.WriteLine($"  CONCURRENT_EVAL [{concLabel}]: seq={seqCost:F2}ms conc={concCost:F2}ms plan=[{string.Join(", ", result)}]");
+    }
+
     return result;
+  }
+
+
+  /// <summary>
+  /// Per-concurrent-pair overhead in milliseconds. Accounts for launching both H2D + compute
+  /// on two streams, syncing both, then D2H. Less than 2x PER_BATCH_OVERHEAD_MS because
+  /// the two launches happen in quick succession.
+  /// </summary>
+  public const float PER_CONCURRENT_PAIR_OVERHEAD_MS = 0.3f;
+
+
+  /// <summary>
+  /// Computes the estimated sequential cost for a batch plan.
+  /// </summary>
+  private static float ComputeSequentialCost(int[] plan, ReadOnlySpan<int> engineSizes, ReadOnlySpan<float> executionTimes)
+  {
+    float total = 0;
+    for (int i = 0; i < plan.Length; i++)
+    {
+      total += LookupTime(plan[i], engineSizes, executionTimes);
+    }
+    if (plan.Length > 1)
+    {
+      total += (plan.Length - 1) * PER_BATCH_OVERHEAD_MS;
+    }
+    return total;
+  }
+
+
+  /// <summary>
+  /// Computes the estimated concurrent cost for a batch plan (pairs execute concurrently).
+  /// </summary>
+  private static float ComputeConcurrentCost(int[] plan, ReadOnlySpan<int> engineSizes, ReadOnlySpan<float> executionTimes)
+  {
+    float total = 0;
+    int numPairs = 0;
+
+    for (int i = 0; i < plan.Length; i += 2)
+    {
+      float timeA = LookupTime(plan[i], engineSizes, executionTimes);
+      if (i + 1 < plan.Length)
+      {
+        // Pair: concurrent execution
+        float timeB = LookupTime(plan[i + 1], engineSizes, executionTimes);
+        total += Math.Max(timeA, timeB);
+        numPairs++;
+      }
+      else
+      {
+        // Odd batch runs alone
+        total += timeA;
+      }
+    }
+
+    total += numPairs * PER_CONCURRENT_PAIR_OVERHEAD_MS;
+    return total;
+  }
+
+
+  /// <summary>
+  /// Looks up the execution time for a given batch size.
+  /// </summary>
+  private static float LookupTime(int batchSize, ReadOnlySpan<int> engineSizes, ReadOnlySpan<float> executionTimes)
+  {
+    for (int i = 0; i < engineSizes.Length; i++)
+    {
+      if (engineSizes[i] == batchSize)
+      {
+        return executionTimes[i];
+      }
+    }
+    return executionTimes[0]; // Fallback (shouldn't happen)
   }
 
 
