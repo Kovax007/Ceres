@@ -330,6 +330,36 @@ internal static partial class TensorRTNative
   internal static partial int RefitEngine(IntPtr handle);
 
   // =========================================================================
+  // Batch Weight Refitting (for worker mode)
+  // =========================================================================
+
+  /// <summary>
+  /// Atomically refit multiple named weights in a single refitter session.
+  /// All fused weight dependencies must be included by the caller.
+  /// Returns 0 on success, -5 if fused dependencies are missing.
+  /// </summary>
+  [LibraryImport(LibraryName, EntryPoint = "TRT_BatchRefitWeights")]
+  internal static unsafe partial int BatchRefitWeights(IntPtr handle,
+      byte** weightNames, void** weightDataPtrs, long* weightCounts,
+      int numWeights, int* outRefittedCount);
+
+  /// <summary>
+  /// Discover fused dependency weight names required alongside the caller's weights.
+  /// Calls getWeightsPrototype + getMissingWeights on a temporary refitter without
+  /// modifying the engine.  outJson receives an allocated JSON array; free with FreeString.
+  /// </summary>
+  [LibraryImport(LibraryName, EntryPoint = "TRT_GetFusedDeps")]
+  internal static unsafe partial int GetFusedDeps(IntPtr handle,
+      byte** weightNames, int numWeights, out IntPtr outJson);
+
+  /// <summary>
+  /// Invalidate all captured CUDA graphs on this engine context.
+  /// Must be called on EACH handle after batch refit for multi-profile engines.
+  /// </summary>
+  [LibraryImport(LibraryName, EntryPoint = "TRT_InvalidateCudaGraphs")]
+  internal static partial int InvalidateCudaGraphs(IntPtr handle);
+
+  // =========================================================================
   // Helper methods
   // =========================================================================
 

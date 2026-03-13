@@ -280,7 +280,8 @@ namespace Ceres.Chess.NNEvaluators
 
           NNEvaluatorOptions options = new NNEvaluatorOptions().OptionsWithOptionsDictApplied(optionsDict);
 
-          if (!fullFN.ToUpper().Contains("ONNX"))
+          string extUpperFN = Path.GetExtension(fullFN).ToUpper();
+          if (extUpperFN != ".ONNX" && extUpperFN != ".ENGINE" && extUpperFN != ".PLAN")
           {
             fullFN += ".onnx";
           }

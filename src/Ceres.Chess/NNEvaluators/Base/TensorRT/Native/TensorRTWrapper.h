@@ -362,4 +362,34 @@ extern "C"
   // Refit the engine after setting weights. Must be called after TRT_SetNamedWeights
   // to apply the weight changes. Returns 0 on success, negative on error.
   TRT_API int32_t TRT_RefitEngine(TRT_EngineHandle handle);
+
+  // =========================================================================
+  // Batch Weight Refitting (for worker mode)
+  // =========================================================================
+
+  // Atomically refit multiple named weights in a single refitter session.
+  // All fused weight dependencies must be included by the caller.
+  // weightNames: array of C strings (weight tensor names)
+  // weightDataPtrs: array of pointers to FP16 weight data
+  // weightCounts: array of element counts per weight
+  // numWeights: number of entries in the arrays
+  // outRefittedCount: if non-null, receives number of weights successfully set
+  // Returns 0 on success, negative on error (-5 = missing fused dependencies).
+  TRT_API int32_t TRT_BatchRefitWeights(TRT_EngineHandle handle,
+    const char** weightNames, const void** weightDataPtrs, const int64_t* weightCounts,
+    int32_t numWeights, int32_t* outRefittedCount);
+
+  // Discover fused dependency weight names required alongside the caller's weights.
+  // Creates a temporary refitter, sets caller weights to zero arrays, queries getMissingWeights().
+  // Does NOT call refitCudaEngine() — engine state is unchanged.
+  // outJson: receives allocated JSON array string ["name1",...]; free with TRT_FreeString.
+  // Returns 0 on success, negative on error.
+  TRT_API int32_t TRT_GetFusedDeps(TRT_EngineHandle handle,
+    const char** weightNames, int32_t numWeights, char** outJson);
+
+  // Invalidate all captured CUDA graphs on this engine context.
+  // Must be called on EACH handle after batch refit for multi-profile engines.
+  // Forces re-capture on the next inference call.
+  // Returns 0 on success, negative on error.
+  TRT_API int32_t TRT_InvalidateCudaGraphs(TRT_EngineHandle handle);
 }

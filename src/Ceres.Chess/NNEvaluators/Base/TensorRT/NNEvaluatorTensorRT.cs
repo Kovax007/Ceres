@@ -1180,7 +1180,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
     {
       string pathLc0Networks = CeresUserSettingsManager.Settings.DirLC0Networks;
       overrideFN = Path.Combine(CeresUserSettingsManager.Settings.DirLC0Networks, netDef.NetworkID);
-      if (!overrideFN.ToUpper().Contains("ONNX"))
+      string extUpperOverride = Path.GetExtension(overrideFN).ToUpper();
+      if (extUpperOverride != ".ONNX" && extUpperOverride != ".ENGINE" && extUpperOverride != ".PLAN")
       {
         overrideFN += ".onnx";
       }

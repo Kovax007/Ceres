@@ -57,6 +57,12 @@ namespace Ceres.Features.Tournaments
     /// </summary>
     public TournamentGameQueueManager QueueManager;
 
+    /// <summary>
+    /// Optional callback invoked live after each game pair completes (from game threads).
+    /// Fires concurrently when NumConcurrent > 1 — implementations must be thread-safe.
+    /// </summary>
+    public Action<TournamentGameInfo, TournamentGameInfo> PerGamePairCallback { get; set; }
+
 
     /// <summary>
     /// Constructor.

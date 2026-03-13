@@ -31,7 +31,7 @@ namespace Ceres.Features.Tournaments
     {
       try
       {
-        gameTest.RunGameTests(threadIndex, (int numOpeningsAvailable) => GetNextOpeningIndexForLocalThread(numOpeningsAvailable, Def.NumGamePairs ?? int.MaxValue));
+        gameTest.RunGameTests(threadIndex, (int numOpeningsAvailable) => GetNextOpeningIndexForLocalThread(numOpeningsAvailable, Def.NumGamePairs ?? int.MaxValue), PerGamePairCallback);
       }
       catch (Exception exc)
       {

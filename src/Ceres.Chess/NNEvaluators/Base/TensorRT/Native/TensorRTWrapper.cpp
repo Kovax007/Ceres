@@ -229,8 +229,8 @@ extern "C"
 
     if (g_initialized)
     {
-      SetError("TensorRT already initialized");
-      return -1;
+      // Idempotent — already initialized, treat as success.
+      return 0;
     }
 
     g_runtime = nvinfer1::createInferRuntime(g_logger);
@@ -2492,6 +2492,292 @@ extern "C"
 
     return 0;
   }
+
+  // =========================================================================
+  // Batch Weight Refitting (for worker mode)
+  // =========================================================================
+
+  /// Atomically refit multiple named weights on the engine in a single refitter session.
+  /// This is required because TRT fuses layers — setting only some weights of a fused group
+  /// leaves missing dependencies. The caller (Python orchestrator) must provide ALL weights
+  /// including fused dependencies resolved from the ONNX model.
+  ///
+  /// weightNames: array of null-terminated UTF-8 weight tensor names
+  /// weightDataPtrs: array of pointers to FP16 weight data (one per name)
+  /// weightCounts: array of element counts (one per name)
+  /// numWeights: number of entries in the arrays
+  ///
+  /// Returns 0 on success, negative on error.
+  /// On success, outRefittedCount is set to the number of weights successfully set.
+  TRT_API int32_t TRT_BatchRefitWeights(TRT_EngineHandle handle,
+    const char** weightNames, const void** weightDataPtrs, const int64_t* weightCounts,
+    int32_t numWeights, int32_t* outRefittedCount)
+  {
+    if (outRefittedCount) *outRefittedCount = 0;
+
+    if (!handle)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid handle");
+      return -1;
+    }
+    if (!weightNames || !weightDataPtrs || !weightCounts || numWeights <= 0)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid weight arrays or count");
+      return -2;
+    }
+
+    auto* ec = static_cast<EngineContext*>(handle);
+    if (!EnsureDevice(ec->deviceId))
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set CUDA device " + std::to_string(ec->deviceId));
+      return -3;
+    }
+
+    // Create a single refitter for the entire batch
+    nvinfer1::IRefitter* refitter = nvinfer1::createInferRefitter(*ec->engine, g_logger);
+    if (!refitter)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create refitter - engine may not have been built with refittable=1");
+      return -4;
+    }
+
+    // Set all weights on the refitter
+    int32_t setCount = 0;
+    for (int32_t i = 0; i < numWeights; ++i)
+    {
+      if (!weightNames[i] || !weightDataPtrs[i])
+      {
+        fprintf(stderr, "[TRT BatchRefit] Skipping null entry at index %d\n", i);
+        continue;
+      }
+
+      nvinfer1::Weights trtWeights;
+      trtWeights.type = nvinfer1::DataType::kHALF;
+      trtWeights.values = weightDataPtrs[i];
+      trtWeights.count = weightCounts[i];
+
+      bool ok = refitter->setNamedWeights(weightNames[i], trtWeights);
+      if (!ok)
+      {
+        fprintf(stderr, "[TRT BatchRefit] WARNING: Failed to set weight '%s' (count=%lld)\n",
+          weightNames[i], (long long)weightCounts[i]);
+      }
+      else
+      {
+        ++setCount;
+      }
+    }
+
+    // Check for missing weights (fused dependencies the caller didn't provide)
+    // TRT 10 API: getMissingWeights(0, nullptr) returns count, then call again with buffer
+    int32_t missingCount = refitter->getMissingWeights(0, nullptr);
+    if (missingCount > 0)
+    {
+      std::vector<const char*> missingNames(missingCount);
+      refitter->getMissingWeights(missingCount, missingNames.data());
+
+      std::string missing;
+      for (int32_t i = 0; i < std::min(missingCount, 5); ++i)
+      {
+        if (i > 0) missing += ", ";
+        missing += missingNames[i];
+      }
+      if (missingCount > 5) missing += " ... (" + std::to_string(missingCount) + " total)";
+
+      delete refitter;
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Refit has " + std::to_string(missingCount) + " missing weights (fused deps): " + missing);
+      return -5;
+    }
+
+    // Execute the refit — all weight data pointers must remain valid until this returns
+    bool success = refitter->refitCudaEngine();
+    delete refitter;
+
+    if (!success)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("refitCudaEngine() returned false after setting " + std::to_string(setCount) + " weights");
+      return -6;
+    }
+
+    if (outRefittedCount) *outRefittedCount = setCount;
+    return 0;
+  }
+
+
+  /// Discover the "fused dependency" weight names that must accompany the caller's
+  /// weights for a successful TRT_BatchRefitWeights call.
+  ///
+  /// Creates a temporary refitter, sets the caller's weights to zero-filled arrays
+  /// (using getWeightsPrototype for the correct element counts), then calls
+  /// getMissingWeights() to find additional required weights.  The refitter is
+  /// destroyed WITHOUT calling refitCudaEngine(), so the engine state is unchanged.
+  ///
+  /// weightNames:  array of C strings — the weights the caller intends to supply
+  /// numWeights:   length of weightNames array
+  /// outJson:      receives a pointer to a newly-allocated JSON array string of the
+  ///               form ["name1","name2",...].  Caller must free with TRT_FreeString.
+  ///               Set to nullptr if no fused deps are required.
+  ///
+  /// Returns 0 on success, negative on error.
+  TRT_API int32_t TRT_GetFusedDeps(TRT_EngineHandle handle,
+    const char** weightNames, int32_t numWeights, char** outJson)
+  {
+    if (outJson) *outJson = nullptr;
+
+    if (!handle)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid handle");
+      return -1;
+    }
+
+    auto* ec = static_cast<EngineContext*>(handle);
+    if (!EnsureDevice(ec->deviceId))
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set CUDA device " + std::to_string(ec->deviceId));
+      return -3;
+    }
+
+    nvinfer1::IRefitter* refitter = nvinfer1::createInferRefitter(*ec->engine, g_logger);
+    if (!refitter)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to create refitter — engine may not have been built with refittable=1");
+      return -4;
+    }
+
+    // For each user weight, get its prototype count and set a zero-filled FP16 array.
+    // We keep buffers alive until getMissingWeights() returns.
+    std::vector<std::vector<uint16_t>> zeroBuffers;
+    zeroBuffers.reserve(numWeights);
+
+    for (int32_t i = 0; i < numWeights; ++i)
+    {
+      if (!weightNames[i]) continue;
+
+      nvinfer1::Weights proto = refitter->getWeightsPrototype(weightNames[i]);
+      if (proto.count <= 0)
+      {
+        // Weight name not found in this engine — skip silently
+        continue;
+      }
+
+      zeroBuffers.emplace_back(static_cast<size_t>(proto.count), uint16_t(0));
+      nvinfer1::Weights w;
+      w.type  = nvinfer1::DataType::kHALF;
+      w.values = zeroBuffers.back().data();
+      w.count  = proto.count;
+      refitter->setNamedWeights(weightNames[i], w);
+    }
+
+    // Query missing fused dependencies.
+    // IMPORTANT: getMissingWeights() returns const char* into refitter-owned memory.
+    // We MUST copy the strings into owned std::string objects BEFORE deleting the refitter.
+    int32_t missingCount = refitter->getMissingWeights(0, nullptr);
+    std::vector<std::string> missingNames;
+    if (missingCount > 0)
+    {
+      std::vector<const char*> rawPtrs(missingCount);
+      refitter->getMissingWeights(missingCount, rawPtrs.data());
+      missingNames.reserve(missingCount);
+      for (int32_t i = 0; i < missingCount; ++i)
+      {
+        missingNames.emplace_back(rawPtrs[i] ? rawPtrs[i] : "");
+      }
+    }
+
+    // Discard refitter WITHOUT calling refitCudaEngine() — engine state unchanged.
+    // All strings already copied above so no dangling pointers.
+    delete refitter;
+
+    // Serialize owned strings to JSON array: ["name1","name2",...]
+    std::string json = "[";
+    for (int32_t i = 0; i < missingCount; ++i)
+    {
+      if (i > 0) json += ",";
+      json += "\"";
+      for (char c : missingNames[i])
+      {
+        if (c == '"' || c == '\\') json += '\\';
+        json += c;
+      }
+      json += "\"";
+    }
+    json += "]";
+
+    char* result = new char[json.size() + 1];
+    std::memcpy(result, json.c_str(), json.size() + 1);
+    if (outJson) *outJson = result;
+    return 0;
+  }
+
+
+  /// Invalidate all captured CUDA graphs on this engine context.
+  /// After weight refit, captured graphs may reference stale kernel parameters.
+  /// This forces re-capture on the next inference call.
+  ///
+  /// For multi-profile engines, this must be called on EACH handle (execution context)
+  /// that shares the refitted engine.
+  ///
+  /// Returns 0 on success, negative on error.
+  TRT_API int32_t TRT_InvalidateCudaGraphs(TRT_EngineHandle handle)
+  {
+    if (!handle)
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Invalid handle");
+      return -1;
+    }
+
+    auto* ec = static_cast<EngineContext*>(handle);
+    if (!EnsureDevice(ec->deviceId))
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      SetError("Failed to set CUDA device " + std::to_string(ec->deviceId));
+      return -2;
+    }
+
+    // Destroy per-stream captured graphs and reset flags
+    for (int i = 0; i < 3; ++i)
+    {
+      if (ec->streamGraphExecs[i])
+      {
+        cudaGraphExecDestroy(ec->streamGraphExecs[i]);
+        ec->streamGraphExecs[i] = nullptr;
+      }
+      if (ec->streamGraphs[i])
+      {
+        cudaGraphDestroy(ec->streamGraphs[i]);
+        ec->streamGraphs[i] = nullptr;
+      }
+      ec->streamGraphsCaptured[i] = false;
+      ec->streamCapturedInput[i] = nullptr;
+      ec->streamCapturedOutput[i] = nullptr;
+    }
+
+    // Destroy legacy single-stream graph (if any)
+    if (ec->graphExec)
+    {
+      cudaGraphExecDestroy(ec->graphExec);
+      ec->graphExec = nullptr;
+    }
+    if (ec->graph)
+    {
+      cudaGraphDestroy(ec->graph);
+      ec->graph = nullptr;
+    }
+    ec->graphCaptured = false;
+
+    return 0;
+  }
+
 
   // =========================================================================
   // Multi-Profile Engine (shared weights, N execution contexts)

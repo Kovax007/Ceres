@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 #endregion
 
@@ -151,6 +152,18 @@ public sealed class TensorRTEngine : IDisposable
     }
   }
 
+
+  /// <summary>
+  /// Initialize the TRT runtime (calls TRT_Init). Safe to call multiple times —
+  /// returns false if already initialized (non-zero return from native), true on first init.
+  /// Must be called before any engine load in contexts (e.g. worker mode) where the
+  /// normal NNEvaluatorTensorRT initialization path is not used.
+  /// </summary>
+  public static bool EnsureInitialized()
+  {
+    int result = TensorRTNative.Init();
+    return result == 0;
+  }
 
   /// <summary>
   /// Load a pre-built engine file (.engine).
@@ -956,6 +969,173 @@ public sealed class TensorRTEngine : IDisposable
     {
       string error = TensorRTNative.GetLastErrorString();
       throw new InvalidOperationException($"Failed to refit engine ({result}): {error ?? "unknown error"}");
+    }
+  }
+
+
+  /// <summary>
+  /// Atomically refit multiple named weights in a single TRT refitter session.
+  /// All fused weight dependencies must be included by the caller (the Python
+  /// orchestrator resolves these from the ONNX model).
+  /// After successful refit, call InvalidateCudaGraphs() on all handles sharing this engine.
+  /// </summary>
+  /// <param name="weights">Dictionary mapping weight tensor names to FP16 weight arrays</param>
+  /// <returns>Number of weights successfully set</returns>
+  /// <exception cref="InvalidOperationException">If refit fails (e.g., missing fused deps, non-refittable engine)</exception>
+  public unsafe int BatchRefitWeights(Dictionary<string, Half[]> weights)
+  {
+    if (weights == null || weights.Count == 0)
+    {
+      throw new ArgumentException("Weights dictionary cannot be null or empty", nameof(weights));
+    }
+
+    int numWeights = weights.Count;
+
+    // Allocate arrays for native call
+    byte*[] namesPtrs = new byte*[numWeights];
+    void*[] dataPtrs = new void*[numWeights];
+    long[] counts = new long[numWeights];
+
+    // Pin all weight arrays and encode names as UTF-8
+    GCHandle[] dataHandles = new GCHandle[numWeights];
+    byte[][] nameBytes = new byte[numWeights][];
+    GCHandle[] nameHandles = new GCHandle[numWeights];
+
+    try
+    {
+      int i = 0;
+      foreach (var kvp in weights)
+      {
+        // Encode name as null-terminated UTF-8
+        nameBytes[i] = System.Text.Encoding.UTF8.GetBytes(kvp.Key + '\0');
+        nameHandles[i] = GCHandle.Alloc(nameBytes[i], GCHandleType.Pinned);
+        namesPtrs[i] = (byte*)nameHandles[i].AddrOfPinnedObject();
+
+        // Pin weight data
+        dataHandles[i] = GCHandle.Alloc(kvp.Value, GCHandleType.Pinned);
+        dataPtrs[i] = (void*)dataHandles[i].AddrOfPinnedObject();
+        counts[i] = kvp.Value.Length;
+
+        i++;
+      }
+
+      int refittedCount;
+      int result;
+      fixed (byte** namesPtr = namesPtrs)
+      fixed (void** dataPtr = dataPtrs)
+      fixed (long* countsPtr = counts)
+      {
+        result = TensorRTNative.BatchRefitWeights(handle, namesPtr, dataPtr, countsPtr,
+            numWeights, &refittedCount);
+      }
+
+      if (result != 0)
+      {
+        string error = TensorRTNative.GetLastErrorString();
+        throw new InvalidOperationException(
+            $"BatchRefitWeights failed ({result}): {error ?? "unknown error"}");
+      }
+
+      return refittedCount;
+    }
+    finally
+    {
+      // Unpin everything
+      for (int j = 0; j < numWeights; j++)
+      {
+        if (dataHandles[j].IsAllocated) dataHandles[j].Free();
+        if (nameHandles[j].IsAllocated) nameHandles[j].Free();
+      }
+    }
+  }
+
+
+  /// <summary>
+  /// Discover the fused dependency weight names that must accompany the caller's
+  /// weights for a successful BatchRefitWeights call.
+  ///
+  /// Creates a temporary refitter internally, sets the supplied weights to zero-filled
+  /// arrays, queries getMissingWeights(), then destroys the refitter WITHOUT calling
+  /// refitCudaEngine() — the engine state is completely unchanged.
+  ///
+  /// Returns a list of weight names (fused deps) not present in <paramref name="weightNames"/>
+  /// that TRT requires. On a second call with the same user-weight set the list is identical
+  /// (deterministic), so callers may cache the result.
+  /// </summary>
+  /// <param name="weightNames">Names of the weights the caller intends to supply</param>
+  /// <returns>List of additional fused-dep weight names required</returns>
+  public unsafe List<string> GetFusedDeps(IEnumerable<string> weightNames)
+  {
+    string[] names = weightNames as string[] ?? [.. weightNames];
+    int numWeights = names.Length;
+
+    byte[][] nameBytes = new byte[numWeights][];
+    GCHandle[] nameHandles = new GCHandle[numWeights];
+    byte*[] namesPtrs = new byte*[numWeights];
+
+    try
+    {
+      for (int i = 0; i < numWeights; i++)
+      {
+        nameBytes[i] = System.Text.Encoding.UTF8.GetBytes(names[i] + '\0');
+        nameHandles[i] = GCHandle.Alloc(nameBytes[i], GCHandleType.Pinned);
+        namesPtrs[i] = (byte*)nameHandles[i].AddrOfPinnedObject();
+      }
+
+      IntPtr jsonPtr;
+      int result;
+      fixed (byte** namesPtr = namesPtrs)
+      {
+        result = TensorRTNative.GetFusedDeps(handle, namesPtr, numWeights, out jsonPtr);
+      }
+
+      if (result != 0)
+      {
+        string error = TensorRTNative.GetLastErrorString();
+        throw new InvalidOperationException(
+            $"GetFusedDeps failed ({result}): {error ?? "unknown error"}");
+      }
+
+      // Parse JSON array ["name1","name2",...]
+      string json = Marshal.PtrToStringUTF8(jsonPtr) ?? "[]";
+      TensorRTNative.FreeString(jsonPtr);
+
+      // Simple JSON array parse — names cannot contain '"' or '\'
+      var result_list = new List<string>();
+      json = json.Trim();
+      if (json.Length > 2) // more than just "[]"
+      {
+        string inner = json.Substring(1, json.Length - 2); // strip [ ]
+        foreach (string token in inner.Split(','))
+        {
+          string t = token.Trim();
+          if (t.StartsWith('"') && t.EndsWith('"'))
+            result_list.Add(t.Substring(1, t.Length - 2));
+        }
+      }
+      return result_list;
+    }
+    finally
+    {
+      for (int j = 0; j < numWeights; j++)
+        if (nameHandles[j].IsAllocated) nameHandles[j].Free();
+    }
+  }
+
+
+  /// <summary>
+  /// Invalidate all captured CUDA graphs on this engine context.
+  /// Must be called after BatchRefitWeights() to force graph re-capture on next inference.
+  /// For multi-profile engines, call on EACH handle sharing the refitted engine.
+  /// </summary>
+  public void InvalidateCudaGraphs()
+  {
+    int result = TensorRTNative.InvalidateCudaGraphs(handle);
+    if (result != 0)
+    {
+      string error = TensorRTNative.GetLastErrorString();
+      throw new InvalidOperationException(
+          $"InvalidateCudaGraphs failed ({result}): {error ?? "unknown error"}");
     }
   }
 
