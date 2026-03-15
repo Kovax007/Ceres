@@ -23,6 +23,7 @@ using System.Threading;
 using System.Threading.Tasks;
 
 using Ceres.Chess.NNEvaluators.TensorRT;
+using Ceres.Chess.UserSettings;
 
 #endregion
 
@@ -418,15 +419,19 @@ public class WorkerServer
       // Create a temporary tournament runner for this command.
       // The runner uses the worker's stored book path and Ceres settings (if loaded via prior INIT).
       // For net-vs-net, ceresNetPath/opponentExe are not used — RunNetVsNetAsync builds its own engines.
+      // Load Ceres settings for tablebase dir etc. (needed even without prior INIT)
+      if (!string.IsNullOrEmpty(_localConfig.CeresJsonPath))
+        CeresUserSettingsManager.LoadFromFile(_localConfig.CeresJsonPath);
+
       var runner = new WorkerTournamentRunner(
           ceresNetPath: "",  // Not used for net-vs-net
-          ceresJsonPath: "", // Not used for net-vs-net (settings already loaded or will use defaults)
+          ceresJsonPath: _localConfig.CeresJsonPath,
           opponentExe: "",
           opponentNodes: 0,
           opponentThreads: 0,
           engineNodes: config.NodesPerMove,
           gpuId: _gpuId,
-          bookPath: "",
+          bookPath: _localConfig.BookPath,
           searchParams: config.SearchParams ?? new Dictionary<string, double>());
 
       var result = await runner.RunNetVsNetAsync(

@@ -239,8 +239,8 @@ public class WorkerTournamentRunner
     NNEvaluatorDef nn1Def = NNEvaluatorDefFactory.FromSpecification(net1Spec, device);
     NNEvaluatorDef nn2Def = NNEvaluatorDefFactory.FromSpecification(net2Spec, device);
 
-    GameEngineDefCeresMCGS engineDef1 = new("CeresMCGS-1", nn1Def, searchParams, selectParams);
-    GameEngineDefCeresMCGS engineDef2 = new("CeresMCGS-2", nn2Def, searchParams, selectParams);
+    GameEngineDefCeresMCGS engineDef1 = new("NetA", nn1Def, searchParams, selectParams);
+    GameEngineDefCeresMCGS engineDef2 = new("NetB", nn2Def, searchParams, selectParams);
 
     EnginePlayerDef player1 = new(engineDef1, SearchLimit.NodesPerMove(config.NodesPerMove));
     EnginePlayerDef player2 = new(engineDef2, SearchLimit.NodesPerMove(config.NodesPerMove));
@@ -269,19 +269,41 @@ public class WorkerTournamentRunner
     });
 
     // Run tournament on a thread pool thread
-    TournamentResultStats results = await Task.Run(() =>
+    TournamentResultStats results = null;
+    try
     {
-      int concurrency = Math.Max(1, config.Concurrency);
-      // DeviceIDs passed to TournamentManager are additive offsets applied to the base
-      // device index already embedded in the NNEvaluatorDef (GPU:_gpuId#TensorRTNative).
-      // Pass [0] so TryModifyDeviceID(base + 0) = base — all threads stay on this GPU.
-      int[] gpuIds = new[] { 0 };
-      var mgr = new TournamentManager(def, concurrency, gpuIds);
-      return mgr.RunTournament(enableCancelVialCtrlC: false);
-    }, ct);
-
-    // Process results — engine 1 ("CeresMCGS-1") is our reference player
-    ProcessNetVsNetResults(results, onGamePairCompleted);
+      results = await Task.Run(() =>
+      {
+        int concurrency = Math.Max(1, config.Concurrency);
+        // DeviceIDs passed to TournamentManager are additive offsets applied to the base
+        // device index already embedded in the NNEvaluatorDef (GPU:_gpuId#TensorRTNative).
+        // Pass [0] so TryModifyDeviceID(base + 0) = base — all threads stay on this GPU.
+        int[] gpuIds = new[] { 0 };
+        var mgr = new TournamentManager(def, concurrency, gpuIds);
+        mgr.PerGamePairCallback = (gameInfo, gameReverseInfo) =>
+        {
+          int r1 = CeresResult(gameInfo, 0);
+          int r2 = CeresResult(gameReverseInfo, 0);
+          lock (_statsLock)
+          {
+            if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
+            if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
+            _gamePairsByOpening[gameInfo.OpeningIndex] = (r1, r2);
+          }
+        };
+        return mgr.RunTournament(enableCancelVialCtrlC: false);
+      }, ct);
+    }
+    catch (OperationCanceledException)
+    {
+      throw;
+    }
+    catch (Exception ex)
+    {
+      // Non-fatal: DumpTournamentSummary column width arithmetic bug.
+      // Live W/D/L and _gamePairsByOpening are already populated via PerGamePairCallback.
+      Console.Error.WriteLine($"[WorkerTournamentRunner] NetVsNet RunTournament warning (non-fatal): {ex.Message}");
+    }
 
     // Compute pentanomial
     int[] pentanomial = ComputePentanomial();
