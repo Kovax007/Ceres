@@ -32,33 +32,26 @@ namespace Ceres.MCGS.Worker;
 /// </summary>
 public enum WorkerCommand : byte
 {
-  Init      = 0x01,
-  Refit     = 0x02,
-  Play      = 0x03,
-  Stop      = 0x04,
-  Status    = 0x05,
-  Shutdown  = 0x06,
-  ProbeDeps = 0x07,  // Discover fused TRT weight dependencies (no engine state change)
-  Serialize = 0x08   // Serialize current engine weights to a file on the worker host
+  Init     = 0x01,
+  Refit    = 0x02,
+  Play     = 0x03,
+  Stop     = 0x04,
+  Status   = 0x05,
+  Shutdown = 0x06,
+  ProbeDeps = 0x07,
+  Serialize = 0x08,
+  NetVsNet  = 0x09
 }
 
 
 /// <summary>
 /// Server-local configuration loaded from a worker_config.json at startup.
-/// Contains everything needed to launch one worker instance: network identity
-/// (gpu, port, bind address) plus server-specific paths (SF, book, Ceres.json).
-///
-/// Launch: Ceres.MCGS --worker --worker-config /path/to/worker_config_gpu0.json
-/// Optional overrides: --gpu N  --port P  --host ADDR
 /// </summary>
 public class WorkerLocalConfig
 {
-  // Network identity
   public int    GpuId    { get; set; } = 0;
   public int    Port     { get; set; } = 5100;
   public string BindHost { get; set; } = "0.0.0.0";
-
-  // Server-specific paths — used as fallback when INIT sends empty strings
   public string CeresJsonPath { get; set; } = "";
   public string OpponentExe   { get; set; } = "";
   public string BookPath      { get; set; } = "";
@@ -78,22 +71,20 @@ public class WorkerLocalConfig
 
 /// <summary>
 /// Configuration sent with the INIT command.
-/// Server-local paths (BookPath, OpponentExe, CeresJsonPath) are optional here —
-/// the worker falls back to its WorkerLocalConfig if these arrive empty.
 /// </summary>
 public class InitConfig
 {
   public string EnginePath { get; set; }
-  public string BookPath { get; set; } = "";
+  public string BookPath { get; set; }
   public int[] BatchSizes { get; set; }
   public bool UseCudaGraphs { get; set; } = true;
-  public string OpponentExe { get; set; } = "";
+  public string OpponentExe { get; set; }
   public int OpponentNodes { get; set; }
   public int OpponentThreads { get; set; } = 2;
   public int EngineNodes { get; set; }
   public string NetPrefix { get; set; } = "";
   public string NetOptions { get; set; } = "";
-  public string CeresJsonPath { get; set; } = "";
+  public string CeresJsonPath { get; set; }
   public string TablesDir { get; set; }
   public Dictionary<string, double> SearchParams { get; set; }
 }
@@ -141,44 +132,21 @@ public class TournamentResult
 
 
 /// <summary>
-/// Request payload for the PROBE_DEPS command (JSON).
+/// Configuration sent with the NETVSNET command.
+/// Runs a Ceres-vs-Ceres tournament between two networks.
 /// </summary>
-public class ProbeDepsRequest
+public class NetVsNetConfig
 {
-  public List<string> WeightNames { get; set; }
-}
-
-
-/// <summary>
-/// Response for the PROBE_DEPS command.
-/// </summary>
-public class ProbeDepsResult
-{
-  public string Status { get; set; }         // "ok" or "error"
-  public List<string> FusedDeps { get; set; }
-  public int UserWeights { get; set; }        // echo back count for sanity
-  public string Error { get; set; }
-}
-
-
-/// <summary>
-/// Request payload for the SERIALIZE command (JSON).
-/// </summary>
-public class SerializeRequest
-{
-  public string OutputPath { get; set; }
-}
-
-
-/// <summary>
-/// Response for the SERIALIZE command.
-/// </summary>
-public class SerializeResult
-{
-  public string Status { get; set; }   // "ok" or "error"
-  public string OutputPath { get; set; }
-  public long SizeBytes { get; set; }
-  public string Error { get; set; }
+  public string Net1Path { get; set; }        // ONNX/engine path on worker filesystem
+  public string Net1Options { get; set; }     // e.g. "cudagraphs=true;BF16=true;V1TEMP=0.6989"
+  public string Net1Prefix { get; set; }      // e.g. "ONNX_TRT:" for LC0 nets, "" for Ceres nets
+  public string Net2Path { get; set; }
+  public string Net2Options { get; set; }
+  public string Net2Prefix { get; set; }
+  public int NodesPerMove { get; set; }       // same for both engines
+  public int NumGamePairs { get; set; }
+  public int Concurrency { get; set; }
+  public Dictionary<string, double> SearchParams { get; set; }  // applied to both engines
 }
 
 
@@ -210,12 +178,11 @@ public class RefitResult
 /// </summary>
 public class WorkerStatus
 {
-  public string State { get; set; }  // "idle", "playing", "refitting", "uninitialized"
+  public string State { get; set; }  // "idle", "playing", "refitting"
   public string PerturbationId { get; set; }
   public int GamesPlayed { get; set; }
   public int[] WDL { get; set; }
   public int GpuId { get; set; }
-  public int[] Pentanomial { get; set; }  // [WW, WD, WL, DD, LD, LL], null until first pair completes
 }
 
 
@@ -319,10 +286,9 @@ public static class WorkerProtocol
       offset += 4;
 
       // Read FP16 data (numElements * 2 bytes)
-      // Half is not a primitive type so Buffer.BlockCopy won't work — use MemoryMarshal instead.
       int dataBytes = numElements * 2;
       Half[] data = new Half[numElements];
-      payload.AsSpan(offset, dataBytes).CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(data.AsSpan()));
+      Buffer.BlockCopy(payload, offset, data, 0, dataBytes);
       offset += dataBytes;
 
       weights.Add(new RefitWeightEntry { Name = name, Data = data });

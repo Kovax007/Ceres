@@ -50,17 +50,6 @@ public class WorkerRefitter
 
 
   /// <summary>
-  /// Discover fused dependency weight names for the given user weight names.
-  /// Calls TRT_GetFusedDeps via the first engine handle — engine state is unchanged.
-  /// Returns the JSON array string of fused dep names.
-  /// </summary>
-  public List<string> GetFusedDeps(IEnumerable<string> userWeightNames)
-  {
-    return _engines[0].GetFusedDeps(userWeightNames);
-  }
-
-
-  /// <summary>
   /// Refit the engine with new weights and invalidate CUDA graphs on all handles.
   ///
   /// The weight dictionary must contain ALL weights including fused dependencies

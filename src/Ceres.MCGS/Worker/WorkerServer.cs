@@ -45,7 +45,6 @@ public class WorkerServer
 {
   private readonly int _port;
   private readonly int _gpuId;
-  private readonly string _bindHost;
   private readonly WorkerLocalConfig _localConfig;
   private readonly CancellationTokenSource _shutdownCts = new();
 
@@ -54,14 +53,13 @@ public class WorkerServer
   private WorkerRefitter _refitter;
   private WorkerTournamentRunner _tournamentRunner;
   private CancellationTokenSource _tournamentCts;
+  private Task<TournamentResult> _tournamentTask;
 
-  // Worker state — protected by _stateLock for reads/writes from concurrent connections
-  private readonly object _stateLock = new();
-  private volatile string _state = "uninitialized";  // uninitialized, idle, playing, refitting
+  // Worker state
+  private string _state = "uninitialized";  // uninitialized, idle, playing, refitting
   private string _currentPerturbationId;
-
-  // Semaphore: only one REFIT or PLAY allowed at a time
-  private readonly SemaphoreSlim _opSemaphore = new(1, 1);
+  private int _gamesPlayed;
+  private int[] _currentWDL = new[] { 0, 0, 0 };
 
 
   public WorkerServer(int port, int gpuId, WorkerLocalConfig localConfig = null, string bindHost = "0.0.0.0")
@@ -69,7 +67,6 @@ public class WorkerServer
     _port = port;
     _gpuId = gpuId;
     _localConfig = localConfig ?? new WorkerLocalConfig();
-    _bindHost = bindHost;
   }
 
 
@@ -78,8 +75,7 @@ public class WorkerServer
   /// </summary>
   public async Task RunAsync()
   {
-    IPAddress bindAddr = _bindHost == "0.0.0.0" ? IPAddress.Any : IPAddress.Parse(_bindHost);
-    TcpListener listener = new(bindAddr, _port);
+    TcpListener listener = new(IPAddress.Any, _port);
     listener.Start();
     Console.WriteLine($"[Worker GPU:{_gpuId}] Listening on port {_port}");
 
@@ -99,24 +95,19 @@ public class WorkerServer
 
         Console.WriteLine($"[Worker GPU:{_gpuId}] Client connected from {client.Client.RemoteEndPoint}");
 
-        // Handle each connection concurrently so STOP/STATUS can arrive on a new connection
-        // while PLAY is streaming results on the primary connection.
-        _ = Task.Run(async () =>
+        try
         {
-          try
-          {
-            await HandleClientAsync(client, _shutdownCts.Token);
-          }
-          catch (Exception ex)
-          {
-            Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Client error: {ex.Message}");
-          }
-          finally
-          {
-            client.Close();
-            Console.WriteLine($"[Worker GPU:{_gpuId}] Client disconnected");
-          }
-        });
+          await HandleClientAsync(client, _shutdownCts.Token);
+        }
+        catch (Exception ex)
+        {
+          Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Client error: {ex.Message}");
+        }
+        finally
+        {
+          client.Close();
+          Console.WriteLine($"[Worker GPU:{_gpuId}] Client disconnected");
+        }
       }
     }
     finally
@@ -168,12 +159,8 @@ public class WorkerServer
           await HandleStatusAsync(stream, ct);
           break;
 
-        case WorkerCommand.ProbeDeps:
-          await HandleProbeDepAsync(stream, payload, ct);
-          break;
-
-        case WorkerCommand.Serialize:
-          await HandleSerializeAsync(stream, payload, ct);
+        case WorkerCommand.NetVsNet:
+          await HandleNetVsNetAsync(stream, payload, ct);
           break;
 
         case WorkerCommand.Shutdown:
@@ -193,19 +180,8 @@ public class WorkerServer
     {
       var config = WorkerProtocol.ParseJson<InitConfig>(payload);
 
-      // Fill server-local paths from local config if orchestrator didn't provide them
-      if (string.IsNullOrEmpty(config.BookPath))      config.BookPath      = _localConfig.BookPath;
-      if (string.IsNullOrEmpty(config.OpponentExe))   config.OpponentExe   = _localConfig.OpponentExe;
-      if (string.IsNullOrEmpty(config.CeresJsonPath)) config.CeresJsonPath = _localConfig.CeresJsonPath;
-
       Console.WriteLine($"[Worker GPU:{_gpuId}] Loading engine from {config.EnginePath}");
       var sw = Stopwatch.StartNew();
-
-      // Initialize TRT runtime if not already done (required before any engine load).
-      // In the normal Ceres flow this happens inside NNEvaluatorTensorRT; in worker
-      // mode we call it explicitly here.
-      bool firstInit = TensorRTEngine.EnsureInitialized();
-      Console.WriteLine($"[Worker GPU:{_gpuId}] TRT runtime {(firstInit ? "initialized" : "already initialized")}");
 
       // Load multi-profile engine on this GPU
       int[] batchSizes = config.BatchSizes ?? new[] { 1, 2, 4, 8 };
@@ -229,6 +205,11 @@ public class WorkerServer
       {
         netSpec += "|" + config.NetOptions;
       }
+
+      // Apply local config fallbacks for server-specific paths
+      if (string.IsNullOrEmpty(config.BookPath))      config.BookPath      = _localConfig.BookPath;
+      if (string.IsNullOrEmpty(config.OpponentExe))   config.OpponentExe   = _localConfig.OpponentExe;
+      if (string.IsNullOrEmpty(config.CeresJsonPath)) config.CeresJsonPath = _localConfig.CeresJsonPath;
 
       // Initialize tournament runner
       _tournamentRunner = new WorkerTournamentRunner(
@@ -279,13 +260,12 @@ public class WorkerServer
       return;
     }
 
-    // Acquire semaphore — prevents REFIT while PLAY is running (non-blocking)
-    if (!await _opSemaphore.WaitAsync(0, ct))
+    if (_state == "playing")
     {
       await WorkerProtocol.SendResponseAsync(stream, new RefitResult
       {
         Status = "error",
-        Error = "Worker busy — PLAY in progress. Send STOP first."
+        Error = "Cannot refit while tournament is running — send STOP first"
       }, ct);
       return;
     }
@@ -309,10 +289,6 @@ public class WorkerServer
         Error = ex.Message
       }, ct);
     }
-    finally
-    {
-      _opSemaphore.Release();
-    }
   }
 
 
@@ -332,34 +308,37 @@ public class WorkerServer
       return;
     }
 
-    // Acquire semaphore — only one REFIT or PLAY at a time (non-blocking check)
-    if (!await _opSemaphore.WaitAsync(0, ct))
+    if (_state == "playing")
     {
       await WorkerProtocol.SendResponseAsync(stream, new
       {
         type = "error",
-        error = "Worker busy — REFIT or PLAY already in progress"
+        error = "Tournament already running"
       }, ct);
       return;
     }
 
     var playConfig = WorkerProtocol.ParseJson<PlayConfig>(payload);
-    string perturbationId = playConfig.PerturbationId;
-    lock (_stateLock) { _currentPerturbationId = perturbationId; }
+    _currentPerturbationId = playConfig.PerturbationId;
+    _gamesPlayed = 0;
+    _currentWDL = new[] { 0, 0, 0 };
     _state = "playing";
 
     _tournamentCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
     try
     {
-      // Run tournament — game pairs streamed to orchestrator after tournament completes.
-      // Live W/D/L and pentanomial are tracked inside WorkerTournamentRunner via
-      // TournamentManager.PerGamePairCallback (queryable via STATUS during play).
+      // Run tournament and stream results
       var result = await _tournamentRunner.RunAsync(
           playConfig,
           onGamePairCompleted: async (gamePairResult) =>
           {
-            // Stream each completed game pair back to the orchestrator.
+            _gamesPlayed = gamePairResult.CumulativeWDL[0] +
+                           gamePairResult.CumulativeWDL[1] +
+                           gamePairResult.CumulativeWDL[2];
+            _currentWDL = gamePairResult.CumulativeWDL;
+
+            // Stream game pair result to orchestrator
             try
             {
               await WorkerProtocol.SendResponseAsync(stream, gamePairResult, ct);
@@ -372,45 +351,130 @@ public class WorkerServer
           ct: _tournamentCts.Token);
 
       _state = "idle";
+
+      // Send final result
       await WorkerProtocol.SendResponseAsync(stream, result, ct);
     }
     catch (OperationCanceledException)
     {
       _state = "idle";
+      // Tournament was stopped — send partial results
       var (wins, draws, losses) = _tournamentRunner.GetCurrentWDL();
-      int[] penta = _tournamentRunner.GetLivePentanomial();
       await WorkerProtocol.SendResponseAsync(stream, new TournamentResult
       {
         Type = "stopped",
-        PerturbationId = perturbationId,
+        PerturbationId = _currentPerturbationId,
         Wins = wins,
         Draws = draws,
         Losses = losses,
-        GamesPlayed = wins + draws + losses,
-        Pentanomial = penta
+        GamesPlayed = wins + draws + losses
       }, ct);
     }
     catch (Exception ex)
     {
       _state = "idle";
-      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Tournament error: {ex}");
-      var (wins, draws, losses) = _tournamentRunner?.GetCurrentWDL() ?? (0, 0, 0);
-      int[] penta = _tournamentRunner?.GetLivePentanomial();
+      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Tournament error: {ex.Message}");
       await WorkerProtocol.SendResponseAsync(stream, new
       {
         type = "error",
-        perturbation_id = perturbationId,
+        perturbation_id = _currentPerturbationId,
         error = ex.Message,
-        wins,
-        draws,
-        losses,
-        games_played = wins + draws + losses,
-        pentanomial = penta
+        games_completed = _gamesPlayed
       }, ct);
     }
-    finally
+  }
+
+
+  /// <summary>
+  /// NETVSNET: Run a Ceres-vs-Ceres tournament between two networks.
+  /// Self-contained — does not require prior INIT. Uses the worker's GPU and local config.
+  /// </summary>
+  private async Task HandleNetVsNetAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  {
+    if (_state == "playing")
     {
-      _opSemaphore.Release();
+      await WorkerProtocol.SendResponseAsync(stream, new
+      {
+        type = "error",
+        error = "Cannot start NETVSNET while tournament is running — send STOP first"
+      }, ct);
+      return;
+    }
+
+    var previousState = _state;
+    _state = "playing";
+    _gamesPlayed = 0;
+    _currentWDL = new[] { 0, 0, 0 };
+    _currentPerturbationId = "netvsnet";
+
+    _tournamentCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+    try
+    {
+      var config = WorkerProtocol.ParseJson<NetVsNetConfig>(payload);
+      Console.WriteLine($"[Worker GPU:{_gpuId}] NETVSNET: {config.Net1Path} vs {config.Net2Path}, " +
+                        $"{config.NumGamePairs} pairs @ {config.NodesPerMove} nodes");
+
+      // Create a temporary tournament runner for this command.
+      // The runner uses the worker's stored book path and Ceres settings (if loaded via prior INIT).
+      // For net-vs-net, ceresNetPath/opponentExe are not used — RunNetVsNetAsync builds its own engines.
+      var runner = new WorkerTournamentRunner(
+          ceresNetPath: "",  // Not used for net-vs-net
+          ceresJsonPath: "", // Not used for net-vs-net (settings already loaded or will use defaults)
+          opponentExe: "",
+          opponentNodes: 0,
+          opponentThreads: 0,
+          engineNodes: config.NodesPerMove,
+          gpuId: _gpuId,
+          bookPath: "",
+          searchParams: config.SearchParams ?? new Dictionary<string, double>());
+
+      var result = await runner.RunNetVsNetAsync(
+          config,
+          onGamePairCompleted: async (gamePairResult) =>
+          {
+            _gamesPlayed = gamePairResult.CumulativeWDL[0] +
+                           gamePairResult.CumulativeWDL[1] +
+                           gamePairResult.CumulativeWDL[2];
+            _currentWDL = gamePairResult.CumulativeWDL;
+
+            try
+            {
+              await WorkerProtocol.SendResponseAsync(stream, gamePairResult, ct);
+            }
+            catch (Exception ex)
+            {
+              Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Failed to stream NETVSNET game pair: {ex.Message}");
+            }
+          },
+          ct: _tournamentCts.Token);
+
+      _state = previousState;
+      await WorkerProtocol.SendResponseAsync(stream, result, ct);
+    }
+    catch (OperationCanceledException)
+    {
+      _state = previousState;
+      await WorkerProtocol.SendResponseAsync(stream, new TournamentResult
+      {
+        Type = "stopped",
+        PerturbationId = "netvsnet",
+        Wins = _currentWDL[0],
+        Draws = _currentWDL[1],
+        Losses = _currentWDL[2],
+        GamesPlayed = _currentWDL[0] + _currentWDL[1] + _currentWDL[2]
+      }, ct);
+    }
+    catch (Exception ex)
+    {
+      _state = previousState;
+      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] NETVSNET error: {ex.Message}");
+      await WorkerProtocol.SendResponseAsync(stream, new
+      {
+        type = "error",
+        error = ex.Message,
+        games_completed = _gamesPlayed
+      }, ct);
     }
   }
 
@@ -447,116 +511,14 @@ public class WorkerServer
   /// </summary>
   private async Task HandleStatusAsync(NetworkStream stream, CancellationToken ct)
   {
-    string perturbationId;
-    lock (_stateLock) { perturbationId = _currentPerturbationId; }
-
-    int gamesPlayed = _tournamentRunner?.GetLiveGamesPlayed() ?? 0;
-    var (w, d, l) = _tournamentRunner != null ? _tournamentRunner.GetCurrentWDL() : (0, 0, 0);
-    int[] penta = _tournamentRunner?.GetLivePentanomial();
-
     await WorkerProtocol.SendResponseAsync(stream, new WorkerStatus
     {
       State = _state,
-      PerturbationId = perturbationId,
-      GamesPlayed = gamesPlayed,
-      WDL = new[] { w, d, l },
-      GpuId = _gpuId,
-      Pentanomial = penta
+      PerturbationId = _currentPerturbationId,
+      GamesPlayed = _gamesPlayed,
+      WDL = _currentWDL,
+      GpuId = _gpuId
     }, ct);
-  }
-
-
-  /// <summary>
-  /// PROBE_DEPS: Discover fused TRT dependency names for the supplied weight names.
-  /// The engine state is NOT modified — this is a read-only query.
-  /// </summary>
-  private async Task HandleProbeDepAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
-  {
-    if (_refitter == null)
-    {
-      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
-      {
-        Status = "error",
-        Error = "Worker not initialized — send INIT first"
-      }, ct);
-      return;
-    }
-
-    try
-    {
-      var req = WorkerProtocol.ParseJson<ProbeDepsRequest>(payload);
-      List<string> fusedDeps = _refitter.GetFusedDeps(req.WeightNames);
-
-      Console.WriteLine($"[Worker GPU:{_gpuId}] ProbeDeps: {req.WeightNames.Count} user weights → {fusedDeps.Count} fused deps");
-
-      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
-      {
-        Status = "ok",
-        FusedDeps = fusedDeps,
-        UserWeights = req.WeightNames.Count
-      }, ct);
-    }
-    catch (Exception ex)
-    {
-      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] ProbeDeps error: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
-      {
-        Status = "error",
-        Error = ex.Message
-      }, ct);
-    }
-  }
-
-
-  /// <summary>
-  /// SERIALIZE: Save the current engine weights to a file on the worker host.
-  /// Useful for validation: refit then serialize, evaluate the resulting engine file with Ceres.
-  /// </summary>
-  private async Task HandleSerializeAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
-  {
-    if (_engines == null)
-    {
-      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
-      {
-        Status = "error",
-        Error = "Worker not initialized — send INIT first"
-      }, ct);
-      return;
-    }
-
-    try
-    {
-      var req = WorkerProtocol.ParseJson<SerializeRequest>(payload);
-      if (string.IsNullOrEmpty(req.OutputPath))
-        throw new ArgumentException("output_path must be non-empty");
-
-      // Ensure destination directory exists
-      string dir = Path.GetDirectoryName(req.OutputPath);
-      if (!string.IsNullOrEmpty(dir))
-        Directory.CreateDirectory(dir);
-
-      // Serialize via the first engine handle (all profiles share the same ICudaEngine)
-      _engines[0].SaveEngine(req.OutputPath);
-      long sizeBytes = new FileInfo(req.OutputPath).Length;
-
-      Console.WriteLine($"[Worker GPU:{_gpuId}] Serialized engine to {req.OutputPath} ({sizeBytes / 1024 / 1024.0:F1} MB)");
-
-      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
-      {
-        Status = "ok",
-        OutputPath = req.OutputPath,
-        SizeBytes = sizeBytes
-      }, ct);
-    }
-    catch (Exception ex)
-    {
-      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Serialize error: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
-      {
-        Status = "error",
-        Error = ex.Message
-      }, ct);
-    }
   }
 
 
@@ -591,13 +553,7 @@ public class WorkerServer
 
   /// <summary>
   /// Entry point for launching a worker from the command line.
-  ///
-  /// Usage:
-  ///   Ceres.MCGS --worker --worker-config /path/to/worker_config_gpu0.json
-  ///   Ceres.MCGS --worker --gpu 0 --port 5100          (legacy, no local config)
-  ///   Ceres.MCGS --worker --worker-config ... --gpu 1  (config + GPU override)
-  ///
-  /// CLI overrides (--gpu, --port, --host) take precedence over config file values.
+  /// Usage: Ceres.MCGS --worker --gpu 0 --port 5100
   /// </summary>
   public static async Task LaunchWorkerAsync(
       int gpuId, int port, WorkerLocalConfig localConfig = null, string bindHost = "0.0.0.0")
