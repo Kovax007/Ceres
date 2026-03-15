@@ -272,7 +272,10 @@ public class WorkerTournamentRunner
     TournamentResultStats results = await Task.Run(() =>
     {
       int concurrency = Math.Max(1, config.Concurrency);
-      int[] gpuIds = new[] { _gpuId };
+      // DeviceIDs passed to TournamentManager are additive offsets applied to the base
+      // device index already embedded in the NNEvaluatorDef (GPU:_gpuId#TensorRTNative).
+      // Pass [0] so TryModifyDeviceID(base + 0) = base — all threads stay on this GPU.
+      int[] gpuIds = new[] { 0 };
       var mgr = new TournamentManager(def, concurrency, gpuIds);
       return mgr.RunTournament(enableCancelVialCtrlC: false);
     }, ct);
