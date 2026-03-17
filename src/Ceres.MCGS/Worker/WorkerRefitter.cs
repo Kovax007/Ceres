@@ -50,6 +50,18 @@ public class WorkerRefitter
 
 
   /// <summary>
+  /// Discover fused TRT dependency names by doing a trial refit with zero-filled arrays.
+  /// Engine state is NOT modified (the refit is not committed).
+  /// Returns the list of additional weight names TRT requires beyond the supplied ones.
+  /// Delegates to TensorRTEngine.GetFusedDeps which handles the native TRT calls.
+  /// </summary>
+  public List<string> GetFusedDeps(List<string> userWeightNames)
+  {
+    return _engines[0].GetFusedDeps(userWeightNames);
+  }
+
+
+  /// <summary>
   /// Refit the engine with new weights and invalidate CUDA graphs on all handles.
   ///
   /// The weight dictionary must contain ALL weights including fused dependencies

@@ -160,6 +160,14 @@ public class WorkerServer
           await HandleStatusAsync(stream, ct);
           break;
 
+        case WorkerCommand.ProbeDeps:
+          await HandleProbeDepAsync(stream, payload, ct);
+          break;
+
+        case WorkerCommand.Serialize:
+          await HandleSerializeAsync(stream, payload, ct);
+          break;
+
         case WorkerCommand.NetVsNet:
           await HandleNetVsNetAsync(stream, payload, ct);
           break;
@@ -527,6 +535,97 @@ public class WorkerServer
       WDL = _currentWDL,
       GpuId = _gpuId
     }, ct);
+  }
+
+
+  /// <summary>
+  /// PROBE_DEPS: Discover fused TRT dependency names for the supplied weight names.
+  /// The engine state is NOT modified — this is a read-only query.
+  /// </summary>
+  private async Task HandleProbeDepAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  {
+    if (_refitter == null)
+    {
+      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
+      {
+        Status = "error",
+        Error = "Worker not initialized — send INIT first"
+      }, ct);
+      return;
+    }
+
+    try
+    {
+      var req = WorkerProtocol.ParseJson<ProbeDepsRequest>(payload);
+      List<string> fusedDeps = _refitter.GetFusedDeps(req.WeightNames);
+
+      Console.WriteLine($"[Worker GPU:{_gpuId}] ProbeDeps: {req.WeightNames.Count} user weights → {fusedDeps.Count} fused deps");
+
+      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
+      {
+        Status = "ok",
+        FusedDeps = fusedDeps,
+        UserWeights = req.WeightNames.Count
+      }, ct);
+    }
+    catch (Exception ex)
+    {
+      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] ProbeDeps error: {ex.Message}");
+      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
+      {
+        Status = "error",
+        Error = ex.Message
+      }, ct);
+    }
+  }
+
+
+  /// <summary>
+  /// SERIALIZE: Save the current engine weights to a file on the worker host.
+  /// </summary>
+  private async Task HandleSerializeAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  {
+    if (_engines == null)
+    {
+      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
+      {
+        Status = "error",
+        Error = "Worker not initialized — send INIT first"
+      }, ct);
+      return;
+    }
+
+    try
+    {
+      var req = WorkerProtocol.ParseJson<SerializeRequest>(payload);
+      if (string.IsNullOrEmpty(req.OutputPath))
+        throw new ArgumentException("output_path must be non-empty");
+
+      string dir = Path.GetDirectoryName(req.OutputPath);
+      if (!string.IsNullOrEmpty(dir))
+        Directory.CreateDirectory(dir);
+
+      _engines[0].SaveEngine(req.OutputPath);
+      long sizeBytes = new FileInfo(req.OutputPath).Length;
+
+      Console.WriteLine($"[Worker GPU:{_gpuId}] Serialized engine to {req.OutputPath} ({sizeBytes / 1024 / 1024.0:F1} MB)");
+
+      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
+      {
+        Status = "ok",
+        OutputPath = req.OutputPath,
+        SizeBytes = sizeBytes
+      }, ct);
+    }
+    catch (Exception ex)
+    {
+      Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Serialize error: {ex.Message}");
+      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
+      {
+        Status = "error",
+        Error = ex.Message
+      }, ct);
+    }
   }
 
 

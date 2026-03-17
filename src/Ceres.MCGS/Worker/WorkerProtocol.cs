@@ -200,6 +200,32 @@ public class WorkerStatus
 /// For other commands, the payload is JSON.
 /// Responses are always JSON prefixed with [length: 4 bytes LE].
 /// </summary>
+public class ProbeDepsRequest
+{
+  public List<string> WeightNames { get; set; } = new();
+}
+
+public class ProbeDepsResult
+{
+  public string Status { get; set; }
+  public List<string> FusedDeps { get; set; } = new();
+  public int UserWeights { get; set; }
+  public string Error { get; set; }
+}
+
+public class SerializeRequest
+{
+  public string OutputPath { get; set; }
+}
+
+public class SerializeResult
+{
+  public string Status { get; set; }
+  public string OutputPath { get; set; }
+  public long SizeBytes { get; set; }
+  public string Error { get; set; }
+}
+
 public static class WorkerProtocol
 {
   static readonly JsonSerializerOptions JsonOpts = new()
