@@ -184,6 +184,9 @@ public class WorkerServer
       Console.WriteLine($"[Worker GPU:{_gpuId}] Loading engine from {config.EnginePath}");
       var sw = Stopwatch.StartNew();
 
+      // Ensure TRT runtime is initialized before loading engine
+      TensorRTEngine.EnsureInitialized();
+
       // Load multi-profile engine on this GPU
       int[] batchSizes = config.BatchSizes ?? new[] { 1, 2, 4, 8 };
       _engines = TensorRTEngine.LoadMultiProfileEngineFile(
