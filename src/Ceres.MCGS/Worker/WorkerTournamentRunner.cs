@@ -48,8 +48,9 @@ public class WorkerTournamentRunner
 {
   /// <summary>
   /// Delegate invoked after each game pair completes (from the game thread).
+  /// Returns a Task so callers can await it — prevents concurrent stream writes.
   /// </summary>
-  public delegate void GamePairCompletedHandler(GamePairResult result);
+  public delegate Task GamePairCompletedHandler(GamePairResult result);
 
   /// <summary>
   /// The Ceres engine's network spec string (engine path + options).
@@ -73,7 +74,11 @@ public class WorkerTournamentRunner
   private readonly object _statsLock = new();
 
   // Pentanomial tracking: key=openingIndex, value=(r1, r2) from Ceres perspective
+  // Updated live by PerGamePairCallback during tournament.
   private readonly Dictionary<int, (int r1, int r2)> _gamePairsByOpening = new();
+
+  // Live game count accessible during play (for STATUS queries)
+  private volatile int _liveGamesPlayed;
 
 
   public WorkerTournamentRunner(
@@ -163,17 +168,49 @@ public class WorkerTournamentRunner
       }
     });
 
-    // Run tournament on a thread pool thread
-    TournamentResultStats results = await Task.Run(() =>
+    // Run tournament on a thread pool thread.
+    // PerGamePairCallback fires live from game threads to keep STATUS up to date.
+    _liveGamesPlayed = 0;
+    try
     {
-      int concurrency = Math.Max(1, playConfig.Concurrency);
-      int[] gpuIds = new[] { _gpuId };
-      var mgr = new TournamentManager(def, concurrency, gpuIds);
-      return mgr.RunTournament(enableCancelVialCtrlC: false);
-    }, ct);
+      await Task.Run(() =>
+      {
+        int concurrency = Math.Max(1, playConfig.Concurrency);
+        // DeviceIDs passed to TournamentManager are additive offsets applied to the base
+        // device index already embedded in the NNEvaluatorDef (GPU:_gpuId#TensorRTNative).
+        // Pass [0] so TryModifyDeviceID(base + 0) = base — all threads stay on this GPU.
+        int[] gpuIds = new[] { 0 };
+        var mgr = new TournamentManager(def, concurrency, gpuIds);
+        mgr.PerGamePairCallback = (gameInfo, gameReverseInfo) =>
+        {
+          int r1 = CeresResult(gameInfo, 0);
+          int r2 = CeresResult(gameReverseInfo, 0);
+          lock (_statsLock)
+          {
+            if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
+            if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
+            _gamePairsByOpening[gameInfo.OpeningIndex] = (r1, r2);
+            _liveGamesPlayed = _wins + _draws + _losses;
+          }
+        };
+        mgr.RunTournament(enableCancelVialCtrlC: false);
+      }, ct);
+    }
+    catch (OperationCanceledException)
+    {
+      throw;  // Propagate — expected when STOP arrives before Task.Run starts
+    }
+    catch (Exception ex)
+    {
+      // Non-fatal: TournamentResultStats display (DumpTournamentSummary) sometimes throws
+      // when tournament stops early with few results (column width arithmetic bug).
+      // The live W/D/L and _gamePairsByOpening are already populated — we can continue.
+      Console.Error.WriteLine($"[WorkerTournamentRunner] RunTournament warning (non-fatal): {ex.Message}");
+    }
 
-    // Process results
-    ProcessResults(results, onGamePairCompleted);
+    // Stream game-pair results to orchestrator (batch delivery after tournament).
+    // W/D/L and _gamePairsByOpening were already updated live by PerGamePairCallback.
+    await StreamResultsAsync(onGamePairCompleted);
 
     // Compute pentanomial
     int[] pentanomial = ComputePentanomial();
@@ -192,186 +229,6 @@ public class WorkerTournamentRunner
 
 
   /// <summary>
-  /// Run a Ceres-vs-Ceres tournament between two networks.
-  /// Both engines use the same search params and nodes per move.
-  /// Results are from Engine 1's perspective (net1 = "our" engine).
-  /// </summary>
-  public async Task<TournamentResult> RunNetVsNetAsync(
-      NetVsNetConfig config,
-      GamePairCompletedHandler onGamePairCompleted,
-      CancellationToken ct = default)
-  {
-    _currentPerturbationId = "netvsnet";
-    _wins = 0;
-    _draws = 0;
-    _losses = 0;
-    _gamePairsByOpening.Clear();
-
-    // Load Ceres settings (for tablebase dir, etc.)
-    // If already loaded from a prior INIT, CeresUserSettingsManager keeps the state.
-    // The book path comes from the worker's stored _bookPath if available,
-    // otherwise the tournament runs without a book (which is unusual but allowed).
-    string tbDir = CeresUserSettingsManager.Settings?.DirTablebases ?? "";
-
-    // Configure search params (shared by both engines)
-    var searchParams = new ParamsSearch();
-    var selectParams = new ParamsSelect();
-    searchParams.Execution.DualOverlappedIterators = false;
-    searchParams.Execution.DualEvaluators = false;
-    searchParams.Execution.NNBatchSizeAlignmentTarget = 0;
-    ApplySearchParams(searchParams, selectParams, config.SearchParams ?? new());
-
-    // Build net spec strings
-    string net1Spec = config.Net1Prefix + config.Net1Path;
-    if (!string.IsNullOrEmpty(config.Net1Options))
-    {
-      net1Spec += "|" + config.Net1Options;
-    }
-
-    string net2Spec = config.Net2Prefix + config.Net2Path;
-    if (!string.IsNullOrEmpty(config.Net2Options))
-    {
-      net2Spec += "|" + config.Net2Options;
-    }
-
-    // Engine definitions — both are CeresMCGS
-    string device = $"GPU:{_gpuId}#TensorRTNative";
-    NNEvaluatorDef nn1Def = NNEvaluatorDefFactory.FromSpecification(net1Spec, device);
-    NNEvaluatorDef nn2Def = NNEvaluatorDefFactory.FromSpecification(net2Spec, device);
-
-    GameEngineDefCeresMCGS engineDef1 = new("NetA", nn1Def, searchParams, selectParams);
-    GameEngineDefCeresMCGS engineDef2 = new("NetB", nn2Def, searchParams, selectParams);
-
-    EnginePlayerDef player1 = new(engineDef1, SearchLimit.NodesPerMove(config.NodesPerMove));
-    EnginePlayerDef player2 = new(engineDef2, SearchLimit.NodesPerMove(config.NodesPerMove));
-
-    // Tournament definition
-    TournamentDef def = new("NetVsNet", player1, player2);
-    def.NumGamePairs = config.NumGamePairs;
-    def.OpeningsFileName = _bookPath;
-    def.ShowGameMoves = false;
-    def.AdjudicateMinNumMoves = int.MaxValue;
-    def.AdjudicateDrawThresholdNumMoves = int.MaxValue;
-    def.AdjudicateDrawThresholdCentipawns = int.MaxValue;
-    def.UseTablebasesForAdjudication = false;
-    def.AdjudicateWinThresholdCentipawns = int.MaxValue;
-    def.AdjudicateWinThresholdNumMovesDecisive = int.MaxValue;
-    def.OpeningRandomization = OpeningRandomizationEnum.Randomize;
-    _currentDef = def;
-
-    // Register cancellation
-    ct.Register(() =>
-    {
-      if (_currentDef != null)
-      {
-        _currentDef.ShouldShutDown = true;
-      }
-    });
-
-    // Run tournament on a thread pool thread
-    TournamentResultStats results = null;
-    try
-    {
-      results = await Task.Run(() =>
-      {
-        int concurrency = Math.Max(1, config.Concurrency);
-        // DeviceIDs passed to TournamentManager are additive offsets applied to the base
-        // device index already embedded in the NNEvaluatorDef (GPU:_gpuId#TensorRTNative).
-        // Pass [0] so TryModifyDeviceID(base + 0) = base — all threads stay on this GPU.
-        int[] gpuIds = new[] { 0 };
-        var mgr = new TournamentManager(def, concurrency, gpuIds);
-        mgr.PerGamePairCallback = (gameInfo, gameReverseInfo) =>
-        {
-          int r1 = CeresResult(gameInfo, 0);
-          int r2 = CeresResult(gameReverseInfo, 0);
-          lock (_statsLock)
-          {
-            if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
-            if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
-            _gamePairsByOpening[gameInfo.OpeningIndex] = (r1, r2);
-          }
-        };
-        return mgr.RunTournament(enableCancelVialCtrlC: false);
-      }, ct);
-    }
-    catch (OperationCanceledException)
-    {
-      throw;
-    }
-    catch (Exception ex)
-    {
-      // Non-fatal: DumpTournamentSummary column width arithmetic bug.
-      // Live W/D/L and _gamePairsByOpening are already populated via PerGamePairCallback.
-      Console.Error.WriteLine($"[WorkerTournamentRunner] NetVsNet RunTournament warning (non-fatal): {ex.Message}");
-    }
-
-    // Compute pentanomial
-    int[] pentanomial = ComputePentanomial();
-
-    return new TournamentResult
-    {
-      Type = ct.IsCancellationRequested ? "stopped" : "tournament_done",
-      PerturbationId = "netvsnet",
-      Wins = _wins,
-      Draws = _draws,
-      Losses = _losses,
-      GamesPlayed = _wins + _draws + _losses,
-      Pentanomial = pentanomial
-    };
-  }
-
-
-  /// <summary>
-  /// Process results for a net-vs-net tournament.
-  /// Results are from Engine 1 ("CeresMCGS-1") perspective.
-  /// </summary>
-  private void ProcessNetVsNetResults(TournamentResultStats results, GamePairCompletedHandler callback)
-  {
-    if (results == null) return;
-
-    // Find Engine 1 player index by matching "CeresMCGS-1"
-    int indexEngine1 = 0;
-    if (results.Players.Count >= 2)
-    {
-      indexEngine1 = results.Players[0].Name.Contains("CeresMCGS-1") ? 0
-                   : results.Players[1].Name.Contains("CeresMCGS-1") ? 1
-                   : 0;
-    }
-
-    // Group by opening to reconstruct game pairs
-    var gamesByOpening = results.GameInfos
-        .GroupBy(g => g.OpeningIndex)
-        .OrderBy(g => g.Key);
-
-    foreach (var pair in gamesByOpening)
-    {
-      var games = pair.OrderBy(g => g.GameSequenceNum).ToList();
-      if (games.Count != 2) continue;
-
-      int r1 = CeresResult(games[0], indexEngine1);
-      int r2 = CeresResult(games[1], indexEngine1);
-
-      lock (_statsLock)
-      {
-        if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
-        if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
-
-        _gamePairsByOpening[pair.Key] = (r1, r2);
-      }
-
-      callback?.Invoke(new GamePairResult
-      {
-        PerturbationId = "netvsnet",
-        OpeningIdx = pair.Key,
-        R1 = r1,
-        R2 = r2,
-        CumulativeWDL = new[] { _wins, _draws, _losses }
-      });
-    }
-  }
-
-
-  /// <summary>
   /// Stop the current tournament gracefully.
   /// </summary>
   public void Stop()
@@ -384,7 +241,7 @@ public class WorkerTournamentRunner
 
 
   /// <summary>
-  /// Get current W/D/L and games played.
+  /// Get live W/D/L (updated during tournament via PerGamePairCallback).
   /// </summary>
   public (int wins, int draws, int losses) GetCurrentWDL()
   {
@@ -394,56 +251,54 @@ public class WorkerTournamentRunner
     }
   }
 
+  /// <summary>
+  /// Get live game count (updated during tournament).
+  /// </summary>
+  public int GetLiveGamesPlayed() => _liveGamesPlayed;
 
   /// <summary>
-  /// Process all game results from the completed tournament.
-  /// Updates W/D/L and invokes callbacks for each game pair.
+  /// Get live pentanomial computed from games completed so far.
+  /// Safe to call during tournament (locks internally).
+  /// Returns null if no games have completed yet.
   /// </summary>
-  private void ProcessResults(TournamentResultStats results, GamePairCompletedHandler callback)
+  public int[] GetLivePentanomial()
   {
-    if (results == null) return;
-
-    // Find Ceres player index
-    int indexCeres = 0;
-    if (results.Players.Count >= 2)
+    lock (_statsLock)
     {
-      indexCeres = results.Players[0].Name.Contains("CeresMCGS") ? 0
-                 : results.Players[1].Name.Contains("CeresMCGS") ? 1
-                 : 0;
+      return _gamePairsByOpening.Count == 0 ? null : ComputePentanomial();
+    }
+  }
+
+
+  /// <summary>
+  /// Stream completed game-pair results to the orchestrator via callback.
+  /// Reads from _gamePairsByOpening (populated live during tournament).
+  /// Each callback is awaited in order to prevent concurrent writes to the stream.
+  /// </summary>
+  private async Task StreamResultsAsync(GamePairCompletedHandler callback)
+  {
+    if (callback == null) return;
+
+    // Snapshot the pairs under lock, then await each send outside the lock
+    // so that stream writes are sequential (NetworkStream does not support concurrent writes).
+    List<GamePairResult> pairs;
+    lock (_statsLock)
+    {
+      pairs = _gamePairsByOpening
+          .OrderBy(kv => kv.Key)
+          .Select(kv => new GamePairResult
+          {
+            PerturbationId = _currentPerturbationId,
+            OpeningIdx = kv.Key,
+            R1 = kv.Value.r1,
+            R2 = kv.Value.r2,
+            CumulativeWDL = new[] { _wins, _draws, _losses }
+          }).ToList();
     }
 
-    // Group by opening to reconstruct game pairs
-    var gamesByOpening = results.GameInfos
-        .GroupBy(g => g.OpeningIndex)
-        .OrderBy(g => g.Key);
-
-    foreach (var pair in gamesByOpening)
+    foreach (var pair in pairs)
     {
-      var games = pair.OrderBy(g => g.GameSequenceNum).ToList();
-      if (games.Count != 2) continue;
-
-      int r1 = CeresResult(games[0], indexCeres);
-      int r2 = CeresResult(games[1], indexCeres);
-
-      lock (_statsLock)
-      {
-        // Update W/D/L
-        if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
-        if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
-
-        // Track for pentanomial
-        _gamePairsByOpening[pair.Key] = (r1, r2);
-      }
-
-      // Stream callback
-      callback?.Invoke(new GamePairResult
-      {
-        PerturbationId = _currentPerturbationId,
-        OpeningIdx = pair.Key,
-        R1 = r1,
-        R2 = r2,
-        CumulativeWDL = new[] { _wins, _draws, _losses }
-      });
+      await callback(pair);
     }
   }
 
@@ -560,5 +415,122 @@ public class WorkerTournamentRunner
         }
       }
     }
+  }
+
+
+  /// <summary>
+  /// Run a Ceres-vs-Ceres tournament between two networks.
+  /// Both engines use the same search params and nodes per move.
+  /// Results are from Engine 1 (NetA) perspective.
+  /// </summary>
+  public async Task<TournamentResult> RunNetVsNetAsync(
+      NetVsNetConfig config,
+      GamePairCompletedHandler onGamePairCompleted,
+      CancellationToken ct = default)
+  {
+    _currentPerturbationId = "netvsnet";
+    _wins = 0;
+    _draws = 0;
+    _losses = 0;
+    _gamePairsByOpening.Clear();
+
+    // Configure search params (shared by both engines)
+    var searchParams = new ParamsSearch();
+    var selectParams = new ParamsSelect();
+    searchParams.Execution.DualOverlappedIterators = false;
+    searchParams.Execution.DualEvaluators = false;
+    searchParams.Execution.NNBatchSizeAlignmentTarget = 0;
+    ApplySearchParams(searchParams, selectParams, config.SearchParams ?? new());
+
+    // Build net spec strings
+    string net1Spec = (config.Net1Prefix ?? "") + config.Net1Path;
+    if (!string.IsNullOrEmpty(config.Net1Options))
+      net1Spec += "|" + config.Net1Options;
+
+    string net2Spec = (config.Net2Prefix ?? "") + config.Net2Path;
+    if (!string.IsNullOrEmpty(config.Net2Options))
+      net2Spec += "|" + config.Net2Options;
+
+    // Engine definitions — both are CeresMCGS on this worker's GPU
+    string device = $"GPU:{_gpuId}#TensorRTNative";
+    NNEvaluatorDef nn1Def = NNEvaluatorDefFactory.FromSpecification(net1Spec, device);
+    NNEvaluatorDef nn2Def = NNEvaluatorDefFactory.FromSpecification(net2Spec, device);
+
+    GameEngineDefCeresMCGS engineDef1 = new("NetA", nn1Def, searchParams, selectParams);
+    GameEngineDefCeresMCGS engineDef2 = new("NetB", nn2Def, searchParams, selectParams);
+
+    EnginePlayerDef player1 = new(engineDef1, SearchLimit.NodesPerMove(config.NodesPerMove));
+    EnginePlayerDef player2 = new(engineDef2, SearchLimit.NodesPerMove(config.NodesPerMove));
+
+    // Tournament definition
+    TournamentDef def = new("NetVsNet", player1, player2);
+    def.NumGamePairs = config.NumGamePairs;
+    def.OpeningsFileName = _bookPath;
+    def.ShowGameMoves = false;
+    def.AdjudicateMinNumMoves = int.MaxValue;
+    def.AdjudicateDrawThresholdNumMoves = int.MaxValue;
+    def.AdjudicateDrawThresholdCentipawns = int.MaxValue;
+    def.UseTablebasesForAdjudication = false;
+    def.AdjudicateWinThresholdCentipawns = int.MaxValue;
+    def.AdjudicateWinThresholdNumMovesDecisive = int.MaxValue;
+    def.OpeningRandomization = OpeningRandomizationEnum.Randomize;
+    _currentDef = def;
+
+    ct.Register(() =>
+    {
+      if (_currentDef != null)
+        _currentDef.ShouldShutDown = true;
+    });
+
+    // Run tournament with live PerGamePairCallback.
+    // GPU offset [0] because base GPU is already in NNEvaluatorDef (GPU:_gpuId#TensorRTNative).
+    _liveGamesPlayed = 0;
+    TournamentResultStats results = null;
+    try
+    {
+      results = await Task.Run(() =>
+      {
+        int concurrency = Math.Max(1, config.Concurrency);
+        int[] gpuIds = new[] { 0 };
+        var mgr = new TournamentManager(def, concurrency, gpuIds);
+        mgr.PerGamePairCallback = (gameInfo, gameReverseInfo) =>
+        {
+          // NetA is player index 0
+          int r1 = CeresResult(gameInfo, 0);
+          int r2 = CeresResult(gameReverseInfo, 0);
+          lock (_statsLock)
+          {
+            if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
+            if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
+            _gamePairsByOpening[gameInfo.OpeningIndex] = (r1, r2);
+            _liveGamesPlayed = _wins + _draws + _losses;
+          }
+        };
+        return mgr.RunTournament(enableCancelVialCtrlC: false);
+      }, ct);
+    }
+    catch (OperationCanceledException) { throw; }
+    catch (Exception ex)
+    {
+      // Non-fatal: DumpTournamentSummary column width arithmetic bug.
+      // Live W/D/L and _gamePairsByOpening are already populated via PerGamePairCallback.
+      Console.Error.WriteLine($"[WorkerTournamentRunner] NetVsNet RunTournament warning (non-fatal): {ex.Message}");
+    }
+
+    // Stream results to orchestrator
+    await StreamResultsAsync(onGamePairCompleted);
+
+    int[] pentanomial = ComputePentanomial();
+
+    return new TournamentResult
+    {
+      Type = ct.IsCancellationRequested ? "stopped" : "tournament_done",
+      PerturbationId = "netvsnet",
+      Wins = _wins,
+      Draws = _draws,
+      Losses = _losses,
+      GamesPlayed = _wins + _draws + _losses,
+      Pentanomial = pentanomial
+    };
   }
 }
