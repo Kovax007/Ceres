@@ -142,7 +142,7 @@ namespace Ceres.Features.Tournaments
                 shuffledOpeningIndices[i] = i;
               }
 
-              Random rng = new Random(0); // Use fixed seed for deterministic shuffle
+              Random rng = new Random(Def.OpeningShuffleSeed);
               int n = shuffledOpeningIndices.Length;
               while (n > 1)
               {

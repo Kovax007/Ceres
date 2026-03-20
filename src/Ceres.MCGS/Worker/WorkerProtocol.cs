@@ -109,6 +109,13 @@ public class PlayConfig
   public int NumGamePairs { get; set; }
   public int OpeningOffset { get; set; }
   public int Concurrency { get; set; }
+
+  /// <summary>
+  /// Opening book shuffle seed.  -1 = Randomize (default, no seed).
+  /// >= 0 = ShuffleDeterministic with this seed.
+  /// Antithetical pairs sharing the same seed play the same openings (CRN).
+  /// </summary>
+  public int OpeningSeed { get; set; } = -1;
 }
 
 

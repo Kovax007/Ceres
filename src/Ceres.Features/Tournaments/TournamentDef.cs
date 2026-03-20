@@ -146,6 +146,13 @@ namespace Ceres.Features.Tournaments
     public OpeningRandomizationEnum OpeningRandomization = OpeningRandomizationEnum.None;
 
     /// <summary>
+    /// Seed for ShuffleDeterministic mode (Fisher-Yates shuffle).
+    /// Antithetical pairs sharing the same seed get the same opening sequence.
+    /// Only used when OpeningRandomization == ShuffleDeterministic.
+    /// </summary>
+    public int OpeningShuffleSeed = 0;
+
+    /// <summary>
     /// If tablebases should be consulted for adjudication purposes.
     /// </summary>
     public bool UseTablebasesForAdjudication = true;

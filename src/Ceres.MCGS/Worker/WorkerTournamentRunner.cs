@@ -154,7 +154,18 @@ public class WorkerTournamentRunner
     def.UseTablebasesForAdjudication = false;
     def.AdjudicateWinThresholdCentipawns = int.MaxValue;
     def.AdjudicateWinThresholdNumMovesDecisive = int.MaxValue;
-    def.OpeningRandomization = OpeningRandomizationEnum.Randomize;
+
+    // Opening seed: >= 0 uses ShuffleDeterministic (antithetical pairs share seed for CRN),
+    // -1 (default) uses Randomize for independent perturbations.
+    if (playConfig.OpeningSeed >= 0)
+    {
+      def.OpeningRandomization = OpeningRandomizationEnum.ShuffleDeterministic;
+      def.OpeningShuffleSeed = playConfig.OpeningSeed;
+    }
+    else
+    {
+      def.OpeningRandomization = OpeningRandomizationEnum.Randomize;
+    }
     _currentDef = def;
 
     // Register cancellation → sets ShouldShutDown flag
