@@ -130,6 +130,13 @@ public class WorkerTournamentRunner
     searchParams.Execution.DualOverlappedIterators = false;
     searchParams.Execution.DualEvaluators = false;
     searchParams.Execution.NNBatchSizeAlignmentTarget = 0;
+
+    // Disable search exploits: ensure ELO measures pure evaluation quality
+    searchParams.FutilityPruningStopSearchEnabled = false;
+    searchParams.MoveFutilityPruningAggressiveness = 0;
+    searchParams.EnableQuickMoves = false;
+    searchParams.BestMoveMode = ParamsSearch.BestMoveModeEnum.TopN;
+
     ApplySearchParams(searchParams, selectParams, _searchParams);
 
     // Engine definitions
@@ -451,6 +458,13 @@ public class WorkerTournamentRunner
     searchParams.Execution.DualOverlappedIterators = false;
     searchParams.Execution.DualEvaluators = false;
     searchParams.Execution.NNBatchSizeAlignmentTarget = 0;
+
+    // Disable search exploits: ensure ELO measures pure evaluation quality
+    searchParams.FutilityPruningStopSearchEnabled = false;
+    searchParams.MoveFutilityPruningAggressiveness = 0;
+    searchParams.EnableQuickMoves = false;
+    searchParams.BestMoveMode = ParamsSearch.BestMoveModeEnum.TopN;
+
     ApplySearchParams(searchParams, selectParams, config.SearchParams ?? new());
 
     // Build net spec strings

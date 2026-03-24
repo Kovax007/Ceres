@@ -9,7 +9,7 @@
     <LangVersion>preview</LangVersion>
     <GCLargePages>false</GCLargePages>
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <GCHeapHardLimit>10737418240</GCHeapHardLimit>
+    <GCHeapHardLimit>6442450944</GCHeapHardLimit>
     <GCConserveMemory>5</GCConserveMemory>
     <GCLOHThreshold>100000</GCLOHThreshold>
     <RunAnalyzersDuringBuild>true</RunAnalyzersDuringBuild>
