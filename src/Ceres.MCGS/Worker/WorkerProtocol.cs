@@ -309,6 +309,22 @@ public static class WorkerProtocol
 
 
   /// <summary>
+  /// Read exactly N bytes from the stream into a pre-allocated buffer.
+  /// Avoids LOH allocations for large payloads (e.g., ~29MB REFIT data).
+  /// </summary>
+  public static async Task ReadExactIntoAsync(Stream stream, byte[] buffer, int count, CancellationToken ct = default)
+  {
+    int totalRead = 0;
+    while (totalRead < count)
+    {
+      int read = await stream.ReadAsync(buffer.AsMemory(totalRead, count - totalRead), ct);
+      if (read == 0) throw new EndOfStreamException("Connection closed while reading payload");
+      totalRead += read;
+    }
+  }
+
+
+  /// <summary>
   /// Parse a JSON payload into the specified type.
   /// </summary>
   public static T ParseJson<T>(byte[] payload) =>

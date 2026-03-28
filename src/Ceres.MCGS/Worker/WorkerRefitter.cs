@@ -38,6 +38,13 @@ public class WorkerRefitter
   /// </summary>
   private TensorRTEngine[] _engines;
 
+  /// <summary>
+  /// Reusable Half[] buffers keyed by weight name.
+  /// Prevents .NET LOH fragmentation from allocating new arrays every refit.
+  /// Buffers are allocated once on first use and reused for subsequent refits.
+  /// </summary>
+  private Dictionary<string, Half[]> _reusableBuffers;
+
 
   /// <summary>
   /// Initialize with the loaded multi-profile engine handles.
@@ -46,6 +53,7 @@ public class WorkerRefitter
   {
     _engines = engines ?? throw new ArgumentNullException(nameof(engines));
     if (engines.Length == 0) throw new ArgumentException("At least one engine handle required");
+    _reusableBuffers = new Dictionary<string, Half[]>();
   }
 
 
@@ -68,17 +76,40 @@ public class WorkerRefitter
   ///
   /// Returns a RefitResult with timing and success info.
   /// </summary>
+  /// <summary>
+  /// Get or allocate a reusable Half[] buffer for the given weight name and size.
+  /// If the buffer already exists with the correct size, returns the existing one.
+  /// This prevents LOH fragmentation from allocating new large arrays every refit.
+  /// </summary>
+  private Half[] GetOrAllocateBuffer(string name, int numElements)
+  {
+    if (_reusableBuffers.TryGetValue(name, out Half[] existing) && existing.Length == numElements)
+    {
+      return existing;
+    }
+
+    var buffer = new Half[numElements];
+    _reusableBuffers[name] = buffer;
+    return buffer;
+  }
+
+
   public RefitResult Refit(string perturbationId, List<RefitWeightEntry> weightEntries)
   {
     var sw = Stopwatch.StartNew();
 
     try
     {
-      // Convert weight entries to Dictionary<string, Half[]> for BatchRefitWeights
+      // Copy weight data into reusable buffers to avoid LOH fragmentation.
+      // Each refit receives ~29MB of Half[] arrays (32 weights for layer 13).
+      // Without reuse, .NET allocates new LOH segments every iteration that are
+      // never compacted, causing unbounded host memory growth.
       var weightsDict = new Dictionary<string, Half[]>(weightEntries.Count);
       foreach (var entry in weightEntries)
       {
-        weightsDict[entry.Name] = entry.Data;
+        Half[] buffer = GetOrAllocateBuffer(entry.Name, entry.Data.Length);
+        entry.Data.AsSpan().CopyTo(buffer);
+        weightsDict[entry.Name] = buffer;
       }
 
       // Refit via any handle — they all share the same ICudaEngine

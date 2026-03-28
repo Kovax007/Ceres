@@ -64,6 +64,10 @@ public class WorkerServer
   // Semaphore: only one REFIT or PLAY allowed at a time
   private readonly SemaphoreSlim _opSemaphore = new(1, 1);
 
+  // Reusable payload buffer to avoid LOH fragmentation from repeated ~29MB REFIT payloads.
+  // Grows once to the max payload size and is reused for all subsequent commands.
+  private byte[] _payloadBuffer;
+
 
   public WorkerServer(int port, int gpuId, WorkerLocalConfig localConfig = null, string bindHost = "0.0.0.0")
   {
@@ -141,9 +145,29 @@ public class WorkerServer
       if (header == null) break;  // Client disconnected
 
       var (cmd, length) = header.Value;
-      byte[] payload = length > 0
-          ? await WorkerProtocol.ReadExactAsync(stream, length, ct)
-          : Array.Empty<byte>();
+      byte[] payload;
+      if (length > 0 && cmd == WorkerCommand.Refit)
+      {
+        // Reuse payload buffer for REFIT to avoid LOH fragmentation.
+        // REFIT payloads are ~29MB (32 weight tensors as FP16) and arrive every iteration.
+        // Without reuse, .NET allocates new LOH segments that are never compacted,
+        // causing unbounded host memory growth (~1.5GB/hour observed).
+        if (_payloadBuffer == null || _payloadBuffer.Length < length)
+        {
+          _payloadBuffer = new byte[length];
+        }
+        await WorkerProtocol.ReadExactIntoAsync(stream, _payloadBuffer, length, ct);
+        payload = _payloadBuffer;
+      }
+      else if (length > 0)
+      {
+        // Non-REFIT commands have small JSON payloads (< 1KB), safe to allocate fresh
+        payload = await WorkerProtocol.ReadExactAsync(stream, length, ct);
+      }
+      else
+      {
+        payload = Array.Empty<byte>();
+      }
 
       Console.WriteLine($"[Worker GPU:{_gpuId}] Command: {cmd} ({length} bytes)");
 
