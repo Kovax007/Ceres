@@ -324,7 +324,19 @@ public class WorkerServer
     try
     {
       var (perturbationId, weights) = WorkerProtocol.ParseRefitPayload(payload);
-      var result = _refitter.Refit(perturbationId, weights);
+
+      // Serialize the refitted engine to a temp file so the tournament runner
+      // (which loads its own NNEvaluator from the file path) uses the new weights.
+      string serializePath = System.IO.Path.Combine(
+          System.IO.Path.GetTempPath(), $"ceres_worker_gpu{_gpuId}_refitted.engine");
+      var result = _refitter.Refit(perturbationId, weights, serializePath);
+
+      // Update the tournament runner's engine path to the serialized file
+      if (result.Status == "refitted" && _tournamentRunner != null)
+      {
+        _tournamentRunner.UpdateEnginePath(serializePath);
+      }
+
       _state = "idle";
       await WorkerProtocol.SendResponseAsync(stream, result, ct);
     }

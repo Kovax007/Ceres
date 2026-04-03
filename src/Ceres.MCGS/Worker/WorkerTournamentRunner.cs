@@ -54,9 +54,9 @@ public class WorkerTournamentRunner
 
   /// <summary>
   /// The Ceres engine's network spec string (engine path + options).
-  /// Updated when weights are refitted to point to the same loaded engine.
+  /// Updated after each refit to point to the serialized engine file.
   /// </summary>
-  private readonly string _ceresNetPath;
+  private string _ceresNetPath;
 
   private readonly string _ceresJsonPath;
   private readonly string _opponentExe;
@@ -101,6 +101,29 @@ public class WorkerTournamentRunner
     _gpuId = gpuId;
     _bookPath = bookPath;
     _searchParams = searchParams ?? new();
+  }
+
+
+  /// <summary>
+  /// Update the engine path to point to a newly serialized engine file.
+  /// Called after WorkerRefitter serializes the refitted engine to disk.
+  /// The net prefix and options from the original path are preserved.
+  /// </summary>
+  public void UpdateEnginePath(string newEnginePath)
+  {
+    // Preserve the prefix (e.g. "ONNX_TRT:") and options (e.g. "|cudagraphs=true;...")
+    // from the original _ceresNetPath, replacing only the file path portion.
+    int pipeIdx = _ceresNetPath.IndexOf('|');
+    string options = pipeIdx >= 0 ? _ceresNetPath[pipeIdx..] : "";
+
+    // Find where the file path starts (after prefix like "ONNX_TRT:")
+    int colonIdx = _ceresNetPath.IndexOf(':');
+    string prefix = colonIdx >= 0 && colonIdx < (_ceresNetPath.IndexOf('/'))
+        ? _ceresNetPath[..(colonIdx + 1)]
+        : "";
+
+    _ceresNetPath = prefix + newEnginePath + options;
+    Console.WriteLine($"[WorkerTournamentRunner] Engine path updated to: {System.IO.Path.GetFileName(newEnginePath)}");
   }
 
 

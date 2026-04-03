@@ -94,16 +94,21 @@ public class WorkerRefitter
   }
 
 
-  public RefitResult Refit(string perturbationId, List<RefitWeightEntry> weightEntries)
+  /// <summary>
+  /// Path to the last serialized engine file after refit.
+  /// The tournament runner loads from this path instead of the original engine.
+  /// </summary>
+  public string LastSerializedEnginePath { get; private set; }
+
+
+  public RefitResult Refit(string perturbationId, List<RefitWeightEntry> weightEntries,
+                           string serializePath = null)
   {
     var sw = Stopwatch.StartNew();
 
     try
     {
       // Copy weight data into reusable buffers to avoid LOH fragmentation.
-      // Each refit receives ~29MB of Half[] arrays (32 weights for layer 13).
-      // Without reuse, .NET allocates new LOH segments every iteration that are
-      // never compacted, causing unbounded host memory growth.
       var weightsDict = new Dictionary<string, Half[]>(weightEntries.Count);
       foreach (var entry in weightEntries)
       {
@@ -115,14 +120,19 @@ public class WorkerRefitter
       // Refit via any handle — they all share the same ICudaEngine
       int refittedCount = _engines[0].BatchRefitWeights(weightsDict);
 
-      // Invalidate CUDA graphs on ALL handles (each has independent captured graphs)
-      for (int i = 0; i < _engines.Length; i++)
+      // Serialize the refitted engine to disk so the tournament runner
+      // (which creates its own NNEvaluator from the file path) picks up
+      // the new weights. Without this, the tournament loads the original
+      // unmodified engine file and the refit has no effect on games.
+      if (serializePath != null)
       {
-        _engines[i].InvalidateCudaGraphs();
+        _engines[0].SaveEngine(serializePath);
+        LastSerializedEnginePath = serializePath;
       }
 
       sw.Stop();
-      Console.WriteLine($"[WorkerRefitter] Refitted {refittedCount} weights for '{perturbationId}' in {sw.ElapsedMilliseconds}ms");
+      Console.WriteLine($"[WorkerRefitter] Refitted {refittedCount} weights for '{perturbationId}' in {sw.ElapsedMilliseconds}ms"
+        + (serializePath != null ? $" (serialized to {System.IO.Path.GetFileName(serializePath)})" : ""));
 
       return new RefitResult
       {
