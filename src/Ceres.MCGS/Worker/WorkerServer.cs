@@ -424,7 +424,7 @@ public class WorkerServer
       if (rssMB > MAX_RSS_MB)
       {
         Console.WriteLine($"[Worker GPU:{_gpuId}] RSS {rssMB} MB exceeds {MAX_RSS_MB} MB limit — self-restarting");
-        Environment.Exit(42); // Non-zero exit code signals intentional restart
+        System.Environment.Exit(42); // Non-zero exit code signals intentional restart
       }
     }
     catch (OperationCanceledException)
