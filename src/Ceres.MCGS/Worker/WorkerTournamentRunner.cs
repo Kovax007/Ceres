@@ -23,6 +23,7 @@ using System.Threading.Tasks;
 using Ceres.Base.Benchmarking;
 using Ceres.Chess;
 using Ceres.Chess.GameEngines;
+using Ceres.Chess.NNEvaluators;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.UserSettings;
 using Ceres.Features.GameEngines;
@@ -248,6 +249,18 @@ public class WorkerTournamentRunner
       // The live W/D/L and _gamePairsByOpening are already populated — we can continue.
       Console.Error.WriteLine($"[WorkerTournamentRunner] RunTournament warning (non-fatal): {ex.Message}");
     }
+
+    // Force cleanup of native resources (TRT engines, CUDA graphs, GPU buffers).
+    // The NNEvaluatorFactory static cache holds persistent evaluators that prevent
+    // GC from collecting TRT engine handles, leaking ~400MB per tournament.
+    // ReleasePersistentEvaluators clears the cache, then GC can collect the evaluators
+    // which triggers the Dispose chain down to TRT_FreeEngine → ~EngineContext().
+    NNEvaluatorFactory.ReleasePersistentEvaluators(null);
+
+    // Force immediate GC to reclaim native memory before next tournament
+    GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+    GC.WaitForPendingFinalizers();
+    GC.Collect(2, GCCollectionMode.Aggressive, true, true);
 
     // Stream game-pair results to orchestrator (batch delivery after tournament).
     // W/D/L and _gamePairsByOpening were already updated live by PerGamePairCallback.
