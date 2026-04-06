@@ -414,6 +414,18 @@ public class WorkerServer
 
       _state = "idle";
       await WorkerProtocol.SendResponseAsync(stream, result, ct);
+
+      // Check memory usage — auto-exit if RSS exceeds threshold.
+      // The start script (screen with restart) will respawn the worker.
+      // This is a safety net for the TRT engine memory leak where
+      // NNEvaluator ref-counting prevents native CUDA memory from being freed.
+      const long MAX_RSS_MB = 15_000; // 15 GB
+      long rssMB = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64 / (1024 * 1024);
+      if (rssMB > MAX_RSS_MB)
+      {
+        Console.WriteLine($"[Worker GPU:{_gpuId}] RSS {rssMB} MB exceeds {MAX_RSS_MB} MB limit — self-restarting");
+        Environment.Exit(42); // Non-zero exit code signals intentional restart
+      }
     }
     catch (OperationCanceledException)
     {

@@ -250,17 +250,18 @@ public class WorkerTournamentRunner
       Console.Error.WriteLine($"[WorkerTournamentRunner] RunTournament warning (non-fatal): {ex.Message}");
     }
 
-    // Force cleanup of native resources (TRT engines, CUDA graphs, GPU buffers).
-    // The NNEvaluatorFactory static cache holds persistent evaluators that prevent
-    // GC from collecting TRT engine handles, leaking ~400MB per tournament.
-    // ReleasePersistentEvaluators clears the cache, then GC can collect the evaluators
-    // which triggers the Dispose chain down to TRT_FreeEngine → ~EngineContext().
+    // Force cleanup attempt for native TRT resources.
+    // Due to NNEvaluator ref-counting (IsPersistent + NumInstanceReferences),
+    // DoShutdown may not be called after tournament threads dispose.
+    // Clear the persistent cache and force GC as best-effort cleanup.
     NNEvaluatorFactory.ReleasePersistentEvaluators(null);
-
-    // Force immediate GC to reclaim native memory before next tournament
     GC.Collect(2, GCCollectionMode.Aggressive, true, true);
     GC.WaitForPendingFinalizers();
     GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+
+    // Log memory for monitoring leak
+    long rssBytes = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64;
+    Console.WriteLine($"[WorkerTournamentRunner] Post-cleanup RSS: {rssBytes / 1024 / 1024} MB");
 
     // Stream game-pair results to orchestrator (batch delivery after tournament).
     // W/D/L and _gamePairsByOpening were already updated live by PerGamePairCallback.
