@@ -219,6 +219,12 @@ public class WorkerTournamentRunner
     // Run tournament on a thread pool thread.
     // PerGamePairCallback fires live from game threads to keep STATUS up to date.
     _liveGamesPlayed = 0;
+
+    // Captured outside the Task so we can read diagnostics (failed thread count
+    // + exception messages) after RunTournament returns, even when it returned
+    // a partial result due to thread-level failures.
+    TournamentManager managerRef = null;
+
     try
     {
       await Task.Run(() =>
@@ -229,6 +235,7 @@ public class WorkerTournamentRunner
         // Pass [0] so TryModifyDeviceID(base + 0) = base — all threads stay on this GPU.
         int[] gpuIds = new[] { 0 };
         var mgr = new TournamentManager(def, concurrency, gpuIds);
+        managerRef = mgr;
         mgr.PerGamePairCallback = (gameInfo, gameReverseInfo) =>
         {
           int r1 = CeresResult(gameInfo, 0);
@@ -254,6 +261,19 @@ public class WorkerTournamentRunner
       // when tournament stops early with few results (column width arithmetic bug).
       // The live W/D/L and _gamePairsByOpening are already populated — we can continue.
       Console.Error.WriteLine($"[WorkerTournamentRunner] RunTournament warning (non-fatal): {ex.Message}");
+      Console.Error.Flush();
+    }
+
+    // Read diagnostics from the manager BEFORE we drop the reference.
+    int failedThreads = managerRef?.FailedThreadCount ?? 0;
+    string[] failureReasons = managerRef?.ThreadExceptionMessages.ToArray()
+                              ?? System.Array.Empty<string>();
+    if (failedThreads > 0)
+    {
+      Console.Error.WriteLine(
+        $"[WorkerTournamentRunner] {failedThreads} game thread(s) died during '{_currentPerturbationId}': "
+        + string.Join(" | ", failureReasons));
+      Console.Error.Flush();
     }
 
     // Force cleanup attempt for native TRT resources.
@@ -284,7 +304,9 @@ public class WorkerTournamentRunner
       Draws = _draws,
       Losses = _losses,
       GamesPlayed = _wins + _draws + _losses,
-      Pentanomial = pentanomial
+      Pentanomial = pentanomial,
+      FailedThreads = failedThreads,
+      FailureReasons = failureReasons,
     };
   }
 

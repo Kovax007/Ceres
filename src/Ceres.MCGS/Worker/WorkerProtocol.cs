@@ -145,6 +145,21 @@ public class TournamentResult
   public int Losses { get; set; }
   public int GamesPlayed { get; set; }
   public int[] Pentanomial { get; set; }  // [WW, WD, WL, DD, LD, LL]
+
+  /// <summary>
+  /// Number of game-thread tasks that exited via an exception during this
+  /// tournament.  Zero on a clean run.  Non-zero means GamesPlayed is below
+  /// the requested NumGamePairs * 2 because one or more concurrency threads
+  /// died early — the wins/draws/losses are from the surviving threads only.
+  /// </summary>
+  public int FailedThreads { get; set; } = 0;
+
+  /// <summary>
+  /// First few exception messages from the failed threads (capped server-side
+  /// at 8 entries).  Empty when FailedThreads == 0.  Surfaced so the orchestrator
+  /// can log a precise reason for any partial result instead of guessing.
+  /// </summary>
+  public string[] FailureReasons { get; set; } = System.Array.Empty<string>();
 }
 
 

@@ -35,7 +35,13 @@ namespace Ceres.Features.Tournaments
       }
       catch (Exception exc)
       {
-        Console.WriteLine("Exception in TournamentManager thread: " + exc.ToString());
+        // Record so the caller can see *that* a thread died and *why*.  Without
+        // this the only evidence was a stdout line that nobody monitored, and
+        // the tournament returned a partial result with no warning.
+        RecordThreadException(threadIndex, exc);
+        // Loud, flushed, on stderr so it shows up in worker logs.
+        Console.Error.WriteLine($"[TournamentManager] thread {threadIndex} died: {exc}");
+        Console.Error.Flush();
       }
     }
 
@@ -68,12 +74,14 @@ namespace Ceres.Features.Tournaments
           string pgnFileName = null; // TODO: collect these someday as well?
           gameTest.UpdateStatsAndOutputSummaryFromGameResult(pgnFileName, gameInfo.Engine2IsWhite, gameInfo.OpeningIndex, gameInfo.GameSequenceNum, gameInfo);
           gameTest.UpdateStatsAndOutputSummaryFromGameResult(pgnFileName, gameReverseInfo.Engine2IsWhite, gameReverseInfo.OpeningIndex, gameReverseInfo.GameSequenceNum, gameReverseInfo);
-          
+
 //Console.WriteLine("Count now " + gameTest.NumGames);
         }
         catch (Exception exc)
         {
-          Console.WriteLine("Exception in TournamentManager thread: " + exc.ToString());
+          RecordThreadException(threadIndex, exc);
+          Console.Error.WriteLine($"[TournamentManager coordinator] thread {threadIndex} died: {exc}");
+          Console.Error.Flush();
         }
       }
     }
@@ -98,7 +106,9 @@ namespace Ceres.Features.Tournaments
       }
       catch (Exception exc)
       {
-        Console.WriteLine("Exception in TournamentManager thread: " + exc.ToString());
+        RecordThreadException(threadIndex, exc);
+        Console.Error.WriteLine($"[TournamentManager distributed] thread {threadIndex} died: {exc}");
+        Console.Error.Flush();
       }
     }
 

@@ -109,6 +109,54 @@ namespace Ceres.Features.Tournaments
     RandomDrawWithoutReplacement<int> openingsDraws = null;
     int[] shuffledOpeningIndices = null;
 
+    // Diagnostic counters for thread-level failures.  ThreadProcLocalWorker
+    // catches all exceptions from RunGameTests so that one bad thread does not
+    // tear down the rest of the tournament — but historically those exceptions
+    // were silently swallowed to Console.Out, making it impossible to tell
+    // *why* a tournament returned a partial result.  We now record both the
+    // count and the first exception message so the caller can surface it.
+    int _failedThreadCount = 0;
+    readonly List<string> _threadExceptionMessages = new();
+    readonly object _diagLock = new();
+
+    /// <summary>
+    /// Number of game-thread tasks that exited via an unhandled exception
+    /// during the most recent RunTournament invocation.  Zero means every
+    /// thread completed normally.
+    /// </summary>
+    public int FailedThreadCount
+    {
+      get { lock (_diagLock) return _failedThreadCount; }
+    }
+
+    /// <summary>
+    /// Exception messages collected from any game threads that died.
+    /// At most one entry per failed thread, in the order failures occurred.
+    /// </summary>
+    public IReadOnlyList<string> ThreadExceptionMessages
+    {
+      get { lock (_diagLock) return _threadExceptionMessages.ToArray(); }
+    }
+
+    /// <summary>
+    /// Called from ThreadProcLocalWorker (and the other thread procs) when a
+    /// game-thread exception is caught.  Bumps the failure counter and records
+    /// up to MaxStoredExceptions of the exception messages for diagnostics.
+    /// Thread-safe.
+    /// </summary>
+    internal void RecordThreadException(int threadIndex, Exception exc)
+    {
+      const int MaxStoredExceptions = 8;
+      lock (_diagLock)
+      {
+        _failedThreadCount++;
+        if (_threadExceptionMessages.Count < MaxStoredExceptions)
+        {
+          _threadExceptionMessages.Add($"thread {threadIndex}: {exc.GetType().Name}: {exc.Message}");
+        }
+      }
+    }
+
 
     /// <summary>
     /// Method called by threads to get the next available game to be played.
