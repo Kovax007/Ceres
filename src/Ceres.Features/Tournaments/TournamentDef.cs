@@ -153,6 +153,17 @@ namespace Ceres.Features.Tournaments
     public int OpeningShuffleSeed = 0;
 
     /// <summary>
+    /// Starting offset into the (post-shuffle) opening sequence.
+    /// Defaults to 0. Used by elastic worker dispatch so that multiple
+    /// workers playing the same perturbation can each pick up a disjoint
+    /// chunk of the opening book by sharing the same OpeningShuffleSeed
+    /// (so the post-shuffle order is identical) but reading from different
+    /// starting offsets.
+    /// Only used when OpeningRandomization == ShuffleDeterministic.
+    /// </summary>
+    public int OpeningStartIndex = 0;
+
+    /// <summary>
     /// If tablebases should be consulted for adjudication purposes.
     /// </summary>
     public bool UseTablebasesForAdjudication = true;

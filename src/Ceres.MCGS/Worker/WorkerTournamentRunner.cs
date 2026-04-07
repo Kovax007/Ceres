@@ -188,10 +188,16 @@ public class WorkerTournamentRunner
 
     // Opening seed: >= 0 uses ShuffleDeterministic (antithetical pairs share seed for CRN),
     // -1 (default) uses Randomize for independent perturbations.
+    //
+    // OpeningOffset is the starting index within the post-shuffle sequence — used by
+    // elastic dispatch so that multiple workers playing the same perturbation each pick up
+    // a disjoint chunk of the shuffled book (same seed → same shuffle, different offset →
+    // different chunk). Only meaningful in ShuffleDeterministic mode.
     if (playConfig.OpeningSeed >= 0)
     {
       def.OpeningRandomization = OpeningRandomizationEnum.ShuffleDeterministic;
       def.OpeningShuffleSeed = playConfig.OpeningSeed;
+      def.OpeningStartIndex = playConfig.OpeningOffset;
     }
     else
     {

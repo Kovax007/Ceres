@@ -131,9 +131,12 @@ namespace Ceres.Features.Tournaments
           case OpeningRandomizationEnum.ShuffleDeterministic:
             if (shuffledOpeningIndices == null)
             {
-              if (numOpeningsAvailable < maxOpenings)
+              // Bounds check: we need OpeningStartIndex + maxOpenings entries available
+              // so that the chunk this worker is responsible for fits inside the shuffled list.
+              int requiredOpenings = Def.OpeningStartIndex + maxOpenings;
+              if (numOpeningsAvailable < requiredOpenings)
               {
-                throw new Exception($"Insufficient openings in opening book to play {maxOpenings} games.");
+                throw new Exception($"Insufficient openings in opening book: need {requiredOpenings} (start_index {Def.OpeningStartIndex} + max_openings {maxOpenings}), have {numOpeningsAvailable}.");
               }
 
               shuffledOpeningIndices = new int[numOpeningsAvailable];
@@ -151,7 +154,10 @@ namespace Ceres.Features.Tournaments
                 (shuffledOpeningIndices[k], shuffledOpeningIndices[n]) = (shuffledOpeningIndices[n], shuffledOpeningIndices[k]);
               }
             }
-            return shuffledOpeningIndices[numGamePairsLaunched++];
+            // Read from OpeningStartIndex + numGamePairsLaunched so multiple workers
+            // sharing the same seed but different start indices traverse disjoint
+            // chunks of the same shuffled order.
+            return shuffledOpeningIndices[Def.OpeningStartIndex + numGamePairsLaunched++];
 
           case OpeningRandomizationEnum.Randomize:
             if (openingsDraws == null)
