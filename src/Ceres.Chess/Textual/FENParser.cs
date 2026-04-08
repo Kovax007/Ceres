@@ -56,7 +56,12 @@ namespace Ceres.Chess.Textual
       }
       catch (Exception exc)
       {
-        throw new Exception($"Unable to parse the FEN: {fen}");
+        // Preserve the original exception so the actual root cause (e.g.
+        // "Chess960 castling rights specify file 'G' but no white rook found
+        // on that file") flows up to the caller's log instead of being
+        // silently rewritten to a generic message.  Without this, debugging
+        // any FEN issue requires reflection into the private DoParseFEN.
+        throw new Exception($"Unable to parse the FEN: {fen} -- {exc.Message}", exc);
       }
     }
 

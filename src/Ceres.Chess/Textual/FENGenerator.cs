@@ -89,6 +89,26 @@ namespace Ceres.Chess.Textual
         castling = "-";
       }
 
+      // Defensive: warn loudly if we just emitted a non-standard castling field
+      // for a position that has standard rooks (no Chess960).  This catches the
+      // recurring "G in castling field" bug which produces FENs that the parser
+      // can't read.  The output goes to stderr (flushed) so it shows up in the
+      // worker logs alongside the failing-FEN exception, giving us the position
+      // state at the moment the bad FEN was generated.
+      if (castling != "-" && !castling.All(c => "KQkq".IndexOf(c) >= 0))
+      {
+        Console.Error.WriteLine(
+          $"[FENGenerator] non-standard castling '{castling}' emitted for position. "
+          + $"WhiteKR={pos.MiscInfo.RookInfo.WhiteKRInitPlacement} "
+          + $"WhiteQR={pos.MiscInfo.RookInfo.WhiteQRInitPlacement} "
+          + $"BlackKR={pos.MiscInfo.RookInfo.BlackKRInitPlacement} "
+          + $"BlackQR={pos.MiscInfo.RookInfo.BlackQRInitPlacement} "
+          + $"WhiteCanOO={pos.MiscInfo.WhiteCanOO} OOO={pos.MiscInfo.WhiteCanOOO} "
+          + $"BlackCanOO={pos.MiscInfo.BlackCanOO} OOO={pos.MiscInfo.BlackCanOOO} "
+          + $"pieces={GetFENPieces(pos)} side={(weAreWhite ? "w" : "b")}");
+        Console.Error.Flush();
+      }
+
       // Append castling rights to FEN
       fen.Append(castling + " ");
 
