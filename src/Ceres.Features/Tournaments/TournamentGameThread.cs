@@ -75,6 +75,20 @@ namespace Ceres.Features.Tournaments
 
 
     static PositionsWithHistory openings = new PositionsWithHistory();
+    static bool openingsLoaded = false;
+    static readonly object openingsLock = new();
+
+    /// <summary>
+    /// Reset the static openings cache so the next tournament reloads them.
+    /// Must be called before launching a new tournament (e.g., between PLAY commands).
+    /// </summary>
+    internal static void ResetOpeningsCache()
+    {
+      lock (openingsLock)
+      {
+        openingsLoaded = false;
+      }
+    }
 
     static object writePGNLock = new();
 
@@ -133,7 +147,14 @@ namespace Ceres.Features.Tournaments
 
       havePrintedHeaders = false;
 
-      LoadOpenings();
+      lock (openingsLock)
+      {
+        if (!openingsLoaded)
+        {
+          LoadOpenings();
+          openingsLoaded = true;
+        }
+      }
 
       Random rand = new Random();
 

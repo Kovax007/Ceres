@@ -360,6 +360,10 @@ namespace Ceres.Features.Tournaments
       // Show differences between engine 1 and engine 2
       Def.DumpParams(Def.Logger);
 
+      // Reset static openings cache so this tournament loads fresh openings
+      // (prevents stale data from a previous tournament in the same process).
+      TournamentGameThread.ResetOpeningsCache();
+
       // Prepare to create a set of task threads to run games
       List<Task> tasks = new List<Task>();
       List<TournamentGameThread> gameThreads = new List<TournamentGameThread>();
