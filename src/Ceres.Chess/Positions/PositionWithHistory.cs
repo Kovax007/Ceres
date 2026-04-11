@@ -50,10 +50,17 @@ namespace Ceres.Chess.Positions
 
     public List<MGMove> Moves => moves;
 
-    bool haveFinalized = false;
+    volatile bool haveFinalized = false;
     MGPosition finalPosMG;
 
     Position[] positions;
+
+    // Guards lazy initialization of positions[]/finalPosMG so that concurrent
+    // callers of Count / FinalPosition / FinalPosMG do not race inside
+    // InitPositionsAndFinalPosMG() and produce a half-constructed positions array
+    // (which previously corrupted packed bit fields like RookPlacementInfo and
+    // produced non-standard Shredder-FEN castling letters on serialization).
+    readonly object initLock = new();
 
 
     /// <summary>
@@ -68,10 +75,7 @@ namespace Ceres.Chess.Positions
     {
       get
       {
-        if (!haveFinalized)
-        {
-          InitPositionsAndFinalPosMG();
-        }
+        CheckInit();
         return positions.Length;
       }
     }
@@ -363,9 +367,19 @@ namespace Ceres.Chess.Positions
 
     private void CheckInit()
     {
-      if (!haveFinalized)
+      if (haveFinalized)
       {
+        return;
+      }
+      lock (initLock)
+      {
+        if (haveFinalized)
+        {
+          return;
+        }
         InitPositionsAndFinalPosMG();
+        // haveFinalized is volatile; set after initialization so other
+        // threads never see a half-constructed positions[] array.
         haveFinalized = true;
       }
     }
@@ -461,6 +475,9 @@ namespace Ceres.Chess.Positions
 
       PositionRepetitionCalc.SetRepetitionsCount(positions);
       finalPosMG = mgPos;
+      // Mark as finalized so CheckInit() from another thread does not
+      // re-run this method and clobber positions[] mid-access.
+      haveFinalized = true;
     }
 
 
