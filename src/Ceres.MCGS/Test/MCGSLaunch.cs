@@ -51,6 +51,26 @@ public class MCGSLaunch
       RunInLoggerMode(args[1]);
       return;
     }
+    // Chess960 perft diagnostic:
+    //   Ceres.MCGS perft <depth>              → run all 960 positions
+    //   Ceres.MCGS perft <depth> <numPositions>
+    // Used to validate FENParser / FENGenerator correctness after code changes.
+    if (args.Length >= 2 && args[0].Equals("perft", StringComparison.OrdinalIgnoreCase))
+    {
+      if (int.TryParse(args[1], out int depth) && depth >= 1 && depth <= 6)
+      {
+        int numPositions = 960;
+        if (args.Length >= 3 && int.TryParse(args[2], out int np))
+        {
+          numPositions = np;
+        }
+        Console.WriteLine($"Running Chess960 perft verification: depth={depth}, positions={numPositions}");
+        Chess.MoveGen.Test.MGMoveGenTest.RunChess960Verification(depth, numPositions);
+        System.Environment.Exit(0);
+      }
+      Console.Error.WriteLine("Usage: perft <depth> [numPositions]  (depth 1..6)");
+      System.Environment.Exit(2);
+    }
     else
     {
       Console.WriteLine("Launch regular");
