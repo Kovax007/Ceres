@@ -419,7 +419,7 @@ public class WorkerServer
       // The start script (screen with restart) will respawn the worker.
       // This is a safety net for the TRT engine memory leak where
       // NNEvaluator ref-counting prevents native CUDA memory from being freed.
-      const long MAX_RSS_MB = 15_000; // 15 GB
+      const long MAX_RSS_MB = 25_000; // 25 GB — headroom for iter-over-iter leak accumulation with adaptive chunking
       long rssMB = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64 / (1024 * 1024);
       if (rssMB > MAX_RSS_MB)
       {
