@@ -240,12 +240,30 @@ public class WorkerTournamentRunner
         {
           int r1 = CeresResult(gameInfo, 0);
           int r2 = CeresResult(gameReverseInfo, 0);
+          int openingIdx;
+          int liveW, liveD, liveL;
           lock (_statsLock)
           {
             if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
             if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
             _gamePairsByOpening[gameInfo.OpeningIndex] = (r1, r2);
             _liveGamesPlayed = _wins + _draws + _losses;
+            openingIdx = gameInfo.OpeningIndex;
+            liveW = _wins; liveD = _draws; liveL = _losses;
+          }
+
+          // Live-stream this game pair to the orchestrator immediately.
+          // Fire-and-forget (no await) so the game loop isn't blocked.
+          if (onGamePairCompleted != null)
+          {
+            _ = onGamePairCompleted(new GamePairResult
+            {
+              PerturbationId = _currentPerturbationId,
+              OpeningIdx = openingIdx,
+              R1 = r1,
+              R2 = r2,
+              CumulativeWDL = new[] { liveW, liveD, liveL }
+            });
           }
         };
         mgr.RunTournament(enableCancelVialCtrlC: false);
@@ -289,9 +307,8 @@ public class WorkerTournamentRunner
     long rssBytes = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64;
     Console.WriteLine($"[WorkerTournamentRunner] Post-cleanup RSS: {rssBytes / 1024 / 1024} MB");
 
-    // Stream game-pair results to orchestrator (batch delivery after tournament).
-    // W/D/L and _gamePairsByOpening were already updated live by PerGamePairCallback.
-    await StreamResultsAsync(onGamePairCompleted);
+    // Game-pair results are now streamed LIVE by PerGamePairCallback (above).
+    // No batch StreamResultsAsync needed — results already sent during play.
 
     // Compute pentanomial
     int[] pentanomial = ComputePentanomial();
@@ -588,12 +605,29 @@ public class WorkerTournamentRunner
           // NetA is player index 0
           int r1 = CeresResult(gameInfo, 0);
           int r2 = CeresResult(gameReverseInfo, 0);
+          int openingIdx;
+          int liveW, liveD, liveL;
           lock (_statsLock)
           {
             if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
             if (r2 == 1) _wins++; else if (r2 == -1) _losses++; else _draws++;
             _gamePairsByOpening[gameInfo.OpeningIndex] = (r1, r2);
             _liveGamesPlayed = _wins + _draws + _losses;
+            openingIdx = gameInfo.OpeningIndex;
+            liveW = _wins; liveD = _draws; liveL = _losses;
+          }
+
+          // Live-stream (same as PLAY handler above)
+          if (onGamePairCompleted != null)
+          {
+            _ = onGamePairCompleted(new GamePairResult
+            {
+              PerturbationId = _currentPerturbationId,
+              OpeningIdx = openingIdx,
+              R1 = r1,
+              R2 = r2,
+              CumulativeWDL = new[] { liveW, liveD, liveL }
+            });
           }
         };
         return mgr.RunTournament(enableCancelVialCtrlC: false);
@@ -607,8 +641,7 @@ public class WorkerTournamentRunner
       Console.Error.WriteLine($"[WorkerTournamentRunner] NetVsNet RunTournament warning (non-fatal): {ex.Message}");
     }
 
-    // Stream results to orchestrator
-    await StreamResultsAsync(onGamePairCompleted);
+    // Game-pair results already streamed LIVE by PerGamePairCallback (no batch needed).
 
     int[] pentanomial = ComputePentanomial();
 
