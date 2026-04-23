@@ -371,6 +371,29 @@ public class WorkerTournamentRunner
 
 
   /// <summary>
+  /// Snapshot of every completed game pair in the CURRENT tournament, as a
+  /// list of (opening_idx, r1, r2) triples. Used by the reconnect-recovery
+  /// path: when the orchestrator reconnects after a dropped stream, it reads
+  /// this list to replay missed game_pair events into its dispatcher, so
+  /// affected offsets aren't re-dispatched to rescue workers (avoids duplicate
+  /// play). Safe to call at any time — locks internally, returns an empty list
+  /// if nothing has completed yet or no tournament is running.
+  /// </summary>
+  public List<(int openingIdx, int r1, int r2)> GetPlayedOffsetsSnapshot()
+  {
+    lock (_statsLock)
+    {
+      var result = new List<(int, int, int)>(_gamePairsByOpening.Count);
+      foreach (var kv in _gamePairsByOpening)
+      {
+        result.Add((kv.Key, kv.Value.r1, kv.Value.r2));
+      }
+      return result;
+    }
+  }
+
+
+  /// <summary>
   /// Stream completed game-pair results to the orchestrator via callback.
   /// Reads from _gamePairsByOpening (populated live during tournament).
   /// Each callback is awaited in order to prevent concurrent writes to the stream.

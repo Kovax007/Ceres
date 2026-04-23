@@ -32,15 +32,16 @@ namespace Ceres.MCGS.Worker;
 /// </summary>
 public enum WorkerCommand : byte
 {
-  Init      = 0x01,
-  Refit     = 0x02,
-  Play      = 0x03,
-  Stop      = 0x04,
-  Status    = 0x05,
-  Shutdown  = 0x06,
-  ProbeDeps = 0x07,  // Discover fused TRT weight dependencies (no engine state change)
-  Serialize = 0x08,  // Serialize current engine weights to a file on the worker host
-  NetVsNet  = 0x09   // Run a Ceres-vs-Ceres tournament between two networks
+  Init              = 0x01,
+  Refit             = 0x02,
+  Play              = 0x03,
+  Stop              = 0x04,
+  Status            = 0x05,
+  Shutdown          = 0x06,
+  ProbeDeps         = 0x07,  // Discover fused TRT weight dependencies (no engine state change)
+  Serialize         = 0x08,  // Serialize current engine weights to a file on the worker host
+  NetVsNet          = 0x09,  // Run a Ceres-vs-Ceres tournament between two networks
+  ListPlayedOffsets = 0x0A   // Snapshot of completed (opening_idx, r1, r2) game pairs in current PLAY
 }
 
 
@@ -244,6 +245,33 @@ public class RefitResult
   public int WeightsSet { get; set; }
   public double ElapsedMs { get; set; }
   public string Error { get; set; }
+}
+
+
+/// <summary>
+/// Compact per-pair entry used by ListPlayedOffsets: no perturbation_id (echoed
+/// once at the top level), just the triple we need to replay into the dispatcher.
+/// </summary>
+public class PlayedOffsetEntry
+{
+  public int OpeningIdx { get; set; }
+  public int R1 { get; set; }
+  public int R2 { get; set; }
+}
+
+
+/// <summary>
+/// Response to LIST_PLAYED_OFFSETS: snapshot of every completed game pair in
+/// the CURRENT PlayAsync call (cleared on each new PLAY via _gamePairsByOpening.Clear()).
+/// Used by orchestrator reconnect flow to recover game_pair events emitted while
+/// the stream was dropped, so a pair doesn't need to be replayed by rescue workers.
+/// </summary>
+public class PlayedOffsetsResult
+{
+  public string Type { get; set; } = "played_offsets";
+  public string PerturbationId { get; set; }
+  public string State { get; set; }  // worker state at time of snapshot
+  public List<PlayedOffsetEntry> Offsets { get; set; } = new();
 }
 
 

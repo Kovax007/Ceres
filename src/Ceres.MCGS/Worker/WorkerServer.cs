@@ -205,6 +205,10 @@ public class WorkerServer
           await HandleNetVsNetAsync(stream, payload, ct);
           break;
 
+        case WorkerCommand.ListPlayedOffsets:
+          await HandleListPlayedOffsetsAsync(stream, ct);
+          break;
+
         case WorkerCommand.Shutdown:
           await HandleShutdownAsync(stream, ct);
           return;
@@ -515,6 +519,39 @@ public class WorkerServer
       WDL = new[] { w, d, l },
       GpuId = _gpuId,
       Pentanomial = penta
+    }, ct);
+  }
+
+
+  /// <summary>
+  /// LIST_PLAYED_OFFSETS: Return a snapshot of every completed game pair in
+  /// the CURRENT tournament. Used by the orchestrator's reconnect-recovery
+  /// path to replay game_pair events that were emitted while its stream was
+  /// dropped — avoiding duplicate play by rescue workers on offsets the
+  /// orphaned PLAY had already finished.
+  ///
+  /// Safe in any state: returns an empty list (state="idle"/"uninitialized")
+  /// when nothing is running. Does NOT affect tournament state.
+  /// </summary>
+  private async Task HandleListPlayedOffsetsAsync(NetworkStream stream, CancellationToken ct)
+  {
+    string perturbationId;
+    lock (_stateLock) { perturbationId = _currentPerturbationId; }
+
+    var entries = new List<PlayedOffsetEntry>();
+    if (_tournamentRunner != null)
+    {
+      foreach (var (openingIdx, r1, r2) in _tournamentRunner.GetPlayedOffsetsSnapshot())
+      {
+        entries.Add(new PlayedOffsetEntry { OpeningIdx = openingIdx, R1 = r1, R2 = r2 });
+      }
+    }
+
+    await WorkerProtocol.SendResponseAsync(stream, new PlayedOffsetsResult
+    {
+      PerturbationId = perturbationId,
+      State = _state,
+      Offsets = entries
     }, ct);
   }
 
