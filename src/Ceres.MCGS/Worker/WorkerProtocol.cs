@@ -41,7 +41,9 @@ public enum WorkerCommand : byte
   ProbeDeps         = 0x07,  // Discover fused TRT weight dependencies (no engine state change)
   Serialize         = 0x08,  // Serialize current engine weights to a file on the worker host
   NetVsNet          = 0x09,  // Run a Ceres-vs-Ceres tournament between two networks
-  ListPlayedOffsets = 0x0A   // Snapshot of completed (opening_idx, r1, r2) game pairs in current PLAY
+  ListPlayedOffsets = 0x0A,  // Snapshot of completed (opening_idx, r1, r2) game pairs in current PLAY
+  Resume            = 0x0B,  // Server-on-reconnect handshake querying the worker journal
+  Progress          = 0x0C   // Per-K-pair PROGRESS push from runner during PLAY
 }
 
 
@@ -117,6 +119,18 @@ public class PlayConfig
   /// Antithetical pairs sharing the same seed play the same openings (CRN).
   /// </summary>
   public int OpeningSeed { get; set; } = -1;
+
+  /// <summary>
+  /// Server-assigned command id for idempotent dispatch.  Format produced by
+  /// the orchestrator: "{iter}-{rnd}-{variant}-chunk{idx}-{uuid8}".
+  ///
+  /// Backwards compat: nullable.  Older Python clients omit this field — the
+  /// worker MUST continue to operate as before when CmdId is null/empty (no
+  /// journal entry, just a debug log line).  The value is echoed back
+  /// unchanged in the matching TournamentResult so the orchestrator can
+  /// reconcile result→dispatch.
+  /// </summary>
+  public string CmdId { get; set; }
 }
 
 
@@ -161,6 +175,16 @@ public class TournamentResult
   /// can log a precise reason for any partial result instead of guessing.
   /// </summary>
   public string[] FailureReasons { get; set; } = System.Array.Empty<string>();
+
+  /// <summary>
+  /// Echo of the server-assigned CmdId from the originating PLAY.
+  /// Nullable for backwards compat: this build always echoes the value back;
+  /// older clients ignore the field.  When the orchestrator receives a
+  /// RESULTS message with CmdId == null (legacy worker behaviour), it MUST
+  /// treat the result as belonging to the most recently dispatched CmdId
+  /// for that worker — see WorkerOrchestrator.dispatched_cmd_ids handling.
+  /// </summary>
+  public string CmdId { get; set; }
 }
 
 
@@ -272,6 +296,91 @@ public class PlayedOffsetsResult
   public string PerturbationId { get; set; }
   public string State { get; set; }  // worker state at time of snapshot
   public List<PlayedOffsetEntry> Offsets { get; set; } = new();
+}
+
+
+/// <summary>
+/// Entry in a RESUME request: one cmd_id the server expects to know about,
+/// plus the state the server *believes* it's in.  The worker uses
+/// ExpectedState only as a hint for diagnostics — its own journal is
+/// authoritative for whatever state the cmd_id is actually in.
+/// </summary>
+public class ResumeServerViewEntry
+{
+  public string CmdId { get; set; }
+  public string ExpectedState { get; set; }  // "in_progress" | "completed" | etc.
+}
+
+
+/// <summary>
+/// RESUME request payload (server → worker), sent immediately after a TCP
+/// reconnect and BEFORE any subsequent PLAY.  Contains the orchestrator's
+/// view of which cmd_ids the worker should know about.  The worker walks its
+/// journal and answers with a ResumeReply that may include cmd_ids the
+/// server did not list (e.g. results that completed during the disconnect
+/// window).
+/// </summary>
+public class ResumeRequest
+{
+  public List<ResumeServerViewEntry> ServerView { get; set; } = new();
+}
+
+
+/// <summary>
+/// Single entry in a RESUME_REPLY journal slice.  When State == "completed",
+/// Results is populated with the cached TournamentResult payload the worker
+/// durably recorded at COMPLETED time.  For "started" / "failed" Results is
+/// null (only the state matters; failures may include a partial payload but
+/// the wire shape is kept simple — orchestrator just needs the terminality
+/// signal to requeue).
+/// </summary>
+public class ResumeReplyEntry
+{
+  public string CmdId { get; set; }
+  public string State { get; set; }   // "started" | "completed" | "failed"
+  public TournamentResult Results { get; set; }
+}
+
+
+/// <summary>
+/// RESUME_REPLY (worker → server), sent in response to a RESUME request.
+/// Includes:
+///   - every cmd_id the server asked about (state from journal, results if
+///     COMPLETED).
+///   - every cmd_id the worker has touched within a recency window (~30 min)
+///     that the server did NOT ask about — this is how the orchestrator
+///     ingests results that completed while the server was disconnected.
+/// </summary>
+public class ResumeReply
+{
+  public string Type { get; set; } = "resume_reply";
+  public string Status { get; set; } = "ok";
+  public List<ResumeReplyEntry> Journal { get; set; } = new();
+}
+
+
+/// <summary>
+/// Async PROGRESS push (worker → server) emitted by WorkerTournamentRunner
+/// every K game-pairs during a PLAY.  Lets the orchestrator track partial
+/// chunk progress so a hard-crashed worker bounds lost work to K pairs
+/// instead of the whole chunk.
+///
+/// Wire shape: standard JSON-with-length-prefix response, type="progress".
+/// PartialWdl is [wins, draws, losses] from Ceres perspective accumulated
+/// since the start of the chunk.  Send is best-effort: the runner wraps it
+/// in try/catch so a dead socket can't crash the play loop.
+///
+/// Backwards compat: older orchestrators that don't recognise type="progress"
+/// fall through to the "unknown message type" log branch in send_play and
+/// continue waiting for the next response — no behaviour change required.
+/// </summary>
+public class ProgressMessage
+{
+  public string Type { get; set; } = "progress";
+  public string CmdId { get; set; }
+  public int GamesPlayed { get; set; }
+  public int OfTotal { get; set; }
+  public int[] PartialWdl { get; set; }
 }
 
 

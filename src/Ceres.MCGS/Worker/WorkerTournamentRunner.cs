@@ -54,6 +54,24 @@ public class WorkerTournamentRunner
   public delegate Task GamePairCompletedHandler(GamePairResult result);
 
   /// <summary>
+  /// Delegate invoked every PROGRESS_EVERY_K game pairs (default K=10).
+  /// Carries cumulative wins/draws/losses and pair counts since the start of
+  /// the chunk; the receiver pushes this to the orchestrator over the open
+  /// PLAY socket.  Best-effort — handler should swallow exceptions so a dead
+  /// socket doesn't propagate up into the game loop.
+  /// </summary>
+  public delegate Task ProgressHandler(string cmdId, int gamesPlayed,
+      int ofTotalGamePairs, int[] partialWdl);
+
+  /// <summary>
+  /// Per-K-pair PROGRESS cadence.  Each pair = 2 games (mirrored).  At ~30
+  /// sec/pair this fires roughly every 5 minutes.  Tunable as a constant —
+  /// the design bounds expected behaviour at K=10, so a config knob would be
+  /// noise.  Bump if PROGRESS rate becomes a wire-traffic concern.
+  /// </summary>
+  private const int PROGRESS_EVERY_K_PAIRS = 10;
+
+  /// <summary>
   /// The Ceres engine's network spec string (engine path + options).
   /// Updated after each refit to point to the serialized engine file.
   /// </summary>
@@ -81,6 +99,13 @@ public class WorkerTournamentRunner
   // Live game count accessible during play (for STATUS queries)
   private volatile int _liveGamesPlayed;
 
+  // Handle to the per-worker journal.  Used by the inner game-pair loop to
+  // emit a PROGRESS entry every K pairs.  The runner does NOT write
+  // COMPLETED/FAILED itself — those belong to WorkerServer.HandlePlayAsync,
+  // which owns the cmd_id lifecycle.  Nullable so unit tests and the
+  // netvsnet path (no cmd_id) can pass null.
+  private readonly WorkerJournal _journal;
+
 
   public WorkerTournamentRunner(
       string ceresNetPath,
@@ -91,7 +116,8 @@ public class WorkerTournamentRunner
       int engineNodes,
       int gpuId,
       string bookPath,
-      Dictionary<string, double> searchParams)
+      Dictionary<string, double> searchParams,
+      WorkerJournal journal = null)
   {
     _ceresNetPath = ceresNetPath;
     _ceresJsonPath = ceresJsonPath;
@@ -102,6 +128,7 @@ public class WorkerTournamentRunner
     _gpuId = gpuId;
     _bookPath = bookPath;
     _searchParams = searchParams ?? new();
+    _journal = journal;  // null OK: PROGRESS path null-checks before dereferencing
   }
 
 
@@ -136,6 +163,7 @@ public class WorkerTournamentRunner
   public async Task<TournamentResult> RunAsync(
       PlayConfig playConfig,
       GamePairCompletedHandler onGamePairCompleted,
+      ProgressHandler onProgress = null,
       CancellationToken ct = default)
   {
     _currentPerturbationId = playConfig.PerturbationId;
@@ -227,6 +255,15 @@ public class WorkerTournamentRunner
 
     try
     {
+      // Per-K-pair PROGRESS bookkeeping.  The PerGamePairCallback runs from
+      // game threads concurrently; we serialize the "did we hit a K boundary?"
+      // check inside _statsLock so two threads can't both fire PROGRESS for
+      // the same pair count.
+      int totalPairs = playConfig.NumGamePairs;
+      string cmdIdForProgress = playConfig.CmdId;
+      int pairsCompleted = 0;
+      int lastProgressBoundary = 0;
+
       await Task.Run(() =>
       {
         int concurrency = Math.Max(1, playConfig.Concurrency);
@@ -242,6 +279,8 @@ public class WorkerTournamentRunner
           int r2 = CeresResult(gameReverseInfo, 0);
           int openingIdx;
           int liveW, liveD, liveL;
+          bool fireProgress = false;
+          int pairsForProgress = 0;
           lock (_statsLock)
           {
             if (r1 == 1) _wins++; else if (r1 == -1) _losses++; else _draws++;
@@ -250,6 +289,19 @@ public class WorkerTournamentRunner
             _liveGamesPlayed = _wins + _draws + _losses;
             openingIdx = gameInfo.OpeningIndex;
             liveW = _wins; liveD = _draws; liveL = _losses;
+
+            pairsCompleted++;
+            // Fire on every K-th pair AND on the final pair so a chunk that
+            // doesn't land on a K-multiple still gets one durable PROGRESS
+            // before COMPLETED.
+            bool isKBoundary = (pairsCompleted - lastProgressBoundary) >= PROGRESS_EVERY_K_PAIRS;
+            bool isFinalPair = (pairsCompleted == totalPairs);
+            if (isKBoundary || isFinalPair)
+            {
+              fireProgress = true;
+              pairsForProgress = pairsCompleted;
+              lastProgressBoundary = pairsCompleted;
+            }
           }
 
           // Live-stream this game pair to the orchestrator immediately.
@@ -264,6 +316,34 @@ public class WorkerTournamentRunner
               R2 = r2,
               CumulativeWDL = new[] { liveW, liveD, liveL }
             });
+          }
+
+          if (fireProgress && !string.IsNullOrEmpty(cmdIdForProgress))
+          {
+            // Final pair gets a durable (fsynced) journal write so the
+            // last-known partial state survives a crash; intermediate ticks
+            // skip fsync to keep the per-K cost in the 10s-of-microseconds
+            // range (the design doc accepts losing in-flight PROGRESS on
+            // hard crash because the crash itself triggers RESUME, which
+            // reads whatever was durably committed).
+            bool durable = (pairsForProgress == totalPairs);
+            int[] partialWdl = new[] { liveW, liveD, liveL };
+            try
+            {
+              _journal?.AppendProgress(cmdIdForProgress, pairsForProgress,
+                  totalPairs, partialWdl, durable: durable);
+            }
+            catch (Exception ex)
+            {
+              Console.Error.WriteLine(
+                $"[WorkerTournamentRunner] Journal AppendProgress error (non-fatal): {ex.Message}");
+            }
+            if (onProgress != null)
+            {
+              // Fire-and-forget: best-effort wire send, dead socket handled
+              // by the handler.  Don't await — we're on the game thread.
+              _ = onProgress(cmdIdForProgress, pairsForProgress, totalPairs, partialWdl);
+            }
           }
         };
         mgr.RunTournament(enableCancelVialCtrlC: false);
