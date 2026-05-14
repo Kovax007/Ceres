@@ -246,6 +246,8 @@ public class NetVsNetConfig
   public int NumGamePairs { get; set; }
   public int Concurrency { get; set; }
   public Dictionary<string, double> SearchParams { get; set; }  // applied to both engines
+  public int OpeningOffset { get; set; }      // starting index into shuffled openings (chunked dispatch)
+  public int OpeningSeed { get; set; } = -1;  // >=0 → ShuffleDeterministic; -1 → Randomize
 }
 
 

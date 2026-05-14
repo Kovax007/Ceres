@@ -683,7 +683,20 @@ public class WorkerTournamentRunner
     def.UseTablebasesForAdjudication = false;
     def.AdjudicateWinThresholdCentipawns = int.MaxValue;
     def.AdjudicateWinThresholdNumMovesDecisive = int.MaxValue;
-    def.OpeningRandomization = OpeningRandomizationEnum.Randomize;
+
+    // Opening selection matches PLAY semantics: deterministic shuffle when seed>=0
+    // (so multiple chunks for the same pair use disjoint slices of the same shuffle),
+    // randomized when seed=-1.
+    if (config.OpeningSeed >= 0)
+    {
+      def.OpeningRandomization = OpeningRandomizationEnum.ShuffleDeterministic;
+      def.OpeningShuffleSeed = config.OpeningSeed;
+      def.OpeningStartIndex = config.OpeningOffset;
+    }
+    else
+    {
+      def.OpeningRandomization = OpeningRandomizationEnum.Randomize;
+    }
     _currentDef = def;
 
     ct.Register(() =>
