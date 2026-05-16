@@ -1,6 +1,6 @@
 CXX = clang++
 CXXFLAGS = -std=c++17 -fPIC -O3 -Wall -fvisibility=hidden -fstack-protector-strong -D_FORTIFY_SOURCE=2
-CUDA_PATH = /usr/local/cuda-12.5
+CUDA_PATH ?= /usr/local/cuda
 INCLUDES = -I$(CUDA_PATH)/include
 LDFLAGS = -shared -L$(CUDA_PATH)/lib64 -Wl,-z,relro,-z,now
 LIBS = -lnvinfer -lnvonnxparser -lcudart
