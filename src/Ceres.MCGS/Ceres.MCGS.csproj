@@ -59,7 +59,10 @@
     <ProjectReference Include="..\Ceres.Chess\Ceres.Chess.csproj" />
     <ProjectReference Include="..\Ceres.Features\Ceres.Features.csproj" />
     <ProjectReference Include="..\Ceres.MCTS\Ceres.MCTS.csproj" />
-    <ProjectReference Include="..\Ceres\Ceres.csproj" />
+    <!-- Removed circular ref to Ceres (top-level launcher project) — upstream's Ceres
+         references MCGS via MCGSLaunch.Launch(), so MCGS must not depend back.
+         Any MCGS code that imports Ceres.APIExamples or Ceres.Commands lives in Test/
+         and is excluded from the main build below. -->
   </ItemGroup>
 
 

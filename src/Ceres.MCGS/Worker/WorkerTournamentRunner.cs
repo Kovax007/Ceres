@@ -27,7 +27,8 @@ using Ceres.Chess.NNEvaluators;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.UserSettings;
 using Ceres.Features.GameEngines;
-using Ceres.Features.Players;
+// Note: EnginePlayerDef moved from Ceres.Features.Players to Ceres.Chess.GameEngines in upstream
+// (already imported via `using Ceres.Chess.GameEngines` above).
 using Ceres.Features.Tournaments;
 using Ceres.MCGS.GameEngines;
 using Ceres.MCGS.Search.Params;
