@@ -24,9 +24,6 @@ using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GraphStores;
-using Ceres.MCGS.Storage;
-using Ceres.MCGS.Storage.Structs;
-
 
 #endregion
 
@@ -249,7 +246,7 @@ public static class NodeUtils
 
       // To mimic recursive DFS order, you  push children in reverse order
       // so first child to be processed first.
-      for (int i = node.NumEdgesVisited; i >= 0; i--)
+      for (int i = node.NumEdgesExpanded - 1; i >= 0; i--)
       {
         GEdge childEdge = node.ChildEdgeAtIndex(i);
 
@@ -315,71 +312,4 @@ public static class NodeUtils
     }
 #endif
   }
-
-  public static BitArray BitArrayNodesInSubtree(GraphStore store, ref GNodeStruct newRoot,
-                                                bool setOldGeneration, out uint numNodes,
-                                                int numExtraPaddingNodesAtEnd, bool clearCacheItems)
-  {
-    return BitArrayNodesInSubGraph(store, ref newRoot, setOldGeneration, out numNodes, null, numExtraPaddingNodesAtEnd, clearCacheItems);
-  }
-
-
-  /// <summary>
-  /// Scans all nodes in store and constructs a BitArray capturing
-  /// all the nodes which belongs to the subtree rooted at a specified newRoot node.
-  /// Additionally the CacheIndex is reset to 0 for all nodes not already old generation.
-  /// 
-  /// Optionally any nodes not belonging are marked as old generation.
-  /// </summary>
-  /// <param name="store"></param>
-  /// <param name="newRoot"></param>
-  /// <param name="setOldGeneration"></param>
-  /// <param name="numNodes"></param>
-  /// <param name="nodesNewlyBecomingOldGeneration"></param>
-  /// <returns></returns>
-  public unsafe static BitArray BitArrayNodesInSubGraph(GraphStore store, ref GNodeStruct newRoot,
-                                                       bool setOldGeneration, out uint numNodes,
-                                                       BitArray nodesNewlyBecomingOldGeneration,
-                                                       int numExtraPaddingNodesAtEnd, bool clearCacheItems)
-  {
-    BitArray includedNodes = new(store.NodesStore.NumTotalNodes + numExtraPaddingNodesAtEnd);
-
-    // Start by including the new root node.
-    int newRootIndex = newRoot.Index.Index;
-    includedNodes.Set(newRootIndex, true);
-
-    // We can use a highly efficient sequential scan, which is is possible only because the
-    // tree has the special property that children of nodes always appear after their parent.
-    uint countNumNodes = 0;
-    for (int i = 1; i < store.NodesStore.nextFreeIndex; i++)
-    {
-      ref GNodeStruct nodeRef = ref store.NodesStore.nodes[i];
-
-      if (!nodeRef.IsOldGeneration)
-      {
-        if (clearCacheItems)
-        {
-          //                        nodeRef.Context.SetAsStoreID(store.StoreID);
-        }
-
-        if (includedNodes.Get(nodeRef.ParentIndex.Index) || i == newRootIndex)
-        {
-          includedNodes.Set(i, true);
-          countNumNodes++;
-        }
-        else if (setOldGeneration)
-        {
-          throw new NotImplementedException();
-          //nodesNewlyBecomingOldGeneration?[i] = true;
-          nodeRef.IsOldGeneration = true;
-          store.NodesStore.NumOldGeneration++;
-        }
-      }
-    }
-
-    numNodes = countNumNodes;
-
-    return includedNodes;
-  }
-
 }

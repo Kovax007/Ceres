@@ -39,7 +39,7 @@ using Ceres.MCGS.Search.Params;
 
 #endregion
 
-namespace Ceres.MCGS.Search;
+namespace Ceres.MCGS.Search.Coordination;
 
 public partial class MCGSManager : IDisposable
 {
@@ -104,16 +104,14 @@ public partial class MCGSManager : IDisposable
 
       Debug.Assert(pos.ToMGPosition.IsLegalMove(immediateMove));
       List<Position> historyPositions = [.. Engine.Graph.Store.NodesStore.PositionHistory.Positions];
+
+      // Build position history by ascending to root via tree-parent edges.
+      // The tree-parent invariant guarantees a cycle-free path to the root.
       GNode thisNode = node;
       while (!thisNode.IsSearchRoot)
       {
-        // Arbitrarily choose one parent edge to ascend to the root.
-        // TODO: make a helper method that does this more efficiently/elegantly.
-        foreach (GEdge edge in thisNode.ParentEdges)
-        {
-          thisNode = edge.ParentNode;
-          historyPositions.Add(edge.ChildNode.CalcPosition().ToPosition);
-        }
+        historyPositions.Add(thisNode.CalcPosition().ToPosition);
+        thisNode = thisNode.Graph[thisNode.TreeParentNodeIndex];
       }
 
       // Try to avoid making a move which would allow opponent to claim draw.
@@ -182,6 +180,17 @@ public partial class MCGSManager : IDisposable
       (WDLResult result, MGMove immediateMove) = TryGetTablebaseImmediateMove(node);
       TablebaseImmediateBestMove = immediateMove;
 
+      // When the search root was previously explored (tree reuse with N > 1),
+      // skip modifying the graph node. Setting N=1 and Terminal on a node with
+      // parent edges from prior search would violate edge.N <= child.N invariants.
+      // The tablebase move is still returned via TablebaseImmediateBestMove.
+      // Note: RunLoop(1) runs before this, so a fresh root has N=1 after eval.
+      GNode root = Engine.SearchRootNode;
+      if (root.NodeRef.N > 1)
+      {
+        return;
+      }
+
       if (result == WDLResult.Win)
       {
         SetRootAsWin();
@@ -193,19 +202,17 @@ public partial class MCGSManager : IDisposable
         // TODO: do we have to adjust for possible contempt?
         const int DISTANCE_TO_END_OF_GAME = 1;
 
-        GNode root = Engine.SearchRootNode;
-
         root.NodeRef.Q = 0;
         root.NodeRef.SiblingsQFrac = 0;
         root.NodeRef.D = 1;
         root.NodeRef.N = 1;
-        root.NodeRef.WinP = 0; 
+        root.NodeRef.WinP = 0;
         root.NodeRef.LossP = 0;
         root.NodeRef.UncertaintyValue = 0;
         root.NodeRef.UncertaintyPolicy = 0;
         root.NodeRef.MRaw = DISTANCE_TO_END_OF_GAME;
         root.NodeRef.Terminal = GameResult.Draw;
-//        root.NodeRef.EvalResult = new LeafEvaluationResult(GameResult.Draw, 0, 0, 1, 0, 0, 0);
+        //        root.NodeRef.EvalResult = new LeafEvaluationResult(GameResult.Draw, 0, 0, 1, 0, 0, 0);
       }
       else if (result == WDLResult.Loss && TablebaseImmediateBestMove != default)
       {
@@ -214,8 +221,6 @@ public partial class MCGSManager : IDisposable
         const int DISTANCE_TO_MATE = 1;
 
         float lossP = ParamsSelect.LossPForProvenLoss(DISTANCE_TO_MATE, false);
-
-        GNode root = Engine.SearchRootNode;
 
         root.NodeRef.Q = -lossP;
         root.NodeRef.SiblingsQFrac = 0;
@@ -240,7 +245,7 @@ public partial class MCGSManager : IDisposable
     const int DISTANCE_TO_MATE = 1;
 
     float winP = ParamsSelect.WinPForProvenWin(DISTANCE_TO_MATE, false);
-    
+
     GNode root = Engine.SearchRootNode;
 
     root.NodeRef.Q = winP;
@@ -275,7 +280,8 @@ public partial class MCGSManager : IDisposable
                                                      ref MGMoveList moves,
                                                      ref NNEvaluatorResult[] evalResults,
                                                      bool fillInHistory,
-                                                     bool dumpInfo)
+                                                     bool dumpInfo,
+                                                     byte[] searchRootPlySinceLastMove = null)
   {
     // Compute move list if not already provided.
     if (moves == null)
@@ -291,6 +297,10 @@ public partial class MCGSManager : IDisposable
     // with extra last slot to be for new position after each move to be evaluated.
     Position[] positions = new Position[priorMoves.Count + 1];
     Array.Copy(priorMoves.Positions.ToArray(), positions, priorMoves.Positions.Length);
+
+    // If the evaluator needs ply-since-last-move, prepare a buffer for child ply values.
+    bool needsLastMovePlies = nnEvaluator.InputsRequired.HasFlag(NNEvaluator.InputTypes.LastMovePlies);
+    byte[] childPlies = needsLastMovePlies ? new byte[64] : null;
 
     Span<short> repetitionCounts = stackalloc short[moves.NumMovesUsed];
 
@@ -313,7 +323,13 @@ public partial class MCGSManager : IDisposable
       EncodedPositionWithHistory eph = new();
       eph.SetFromSequentialPositions(positions, fillInHistory);
 
-      batchBuilder.Add(in eph, false);
+      // Compute ply-since-last-move for this child position from cached root values.
+      if (needsLastMovePlies)
+      {
+        PlySinceLastMoveArray.ApplyMove(searchRootPlySinceLastMove, childPlies, moves.MovesArray[i]);
+      }
+
+      batchBuilder.Add(in eph, false, lastMovePlies: childPlies);
     }
 
     // Build the batch and evaluate it.

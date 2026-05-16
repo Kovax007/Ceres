@@ -35,26 +35,24 @@ using Ceres.Chess.NNFiles;
 using Ceres.Chess.Positions;
 using Ceres.Chess.SearchResultVerboseMoveInfo;
 using Ceres.Chess.UserSettings;
+
 using Ceres.MCGS.Analysis;
 using Ceres.MCGS.GameEngines;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Managers;
-using Ceres.MCGS.MTGSNodes.Analysis;
+using Ceres.MCGS.Search;
 using Ceres.MCGS.Search;
 using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
-using Ceres.MCGS.Storage;
 using Ceres.MCGS.Utils;
-using Ceres.MCTS.MTCSNodes;
-
-//using Ceres.Features.GameEngines;
-//using Ceres.Features.Visualization.TreePlot;
-//using Ceres.Features.Visualization.AnalysisGraph;
+using Ceres.MCGS.Visualization.AnalysisGraph;
+using Ceres.MCGS.Visualization.PlyVisualization;
+using Ceres.Chess.NetEvaluation.Batch;
 
 #endregion
 
-namespace Ceres.Features.UCI;
+namespace Ceres.MCGS.UCI;
 
 /// <summary>
 /// Manager of UCI game loop, parsing and executing commands from Console
@@ -192,7 +190,7 @@ public partial class UCIManagerMCGS
                         NNDevicesSpecificationString deviceSpec,
                         Action<ParamsSearch> searchModifier = null,
                         Action<ParamsSelect> selectModifier = null,
-                        TextReader inStream = null, 
+                        TextReader inStream = null,
                         TextWriter outStream = null,
                         Action<MCGSManager> searchFinishedEvent = null,
                         bool disablePruning = false,
@@ -274,9 +272,16 @@ public partial class UCIManagerMCGS
       parms.PolicySoftmax = policySoftmax;
       parms.FPUValue = fpu;
       parms.FPUValueAtRoot = fpuAtRoot;
-  
+
+      // Apply ActionHead settings if enabled
+      if (enableActionHead)
+      {
+        parms.FPUMode = ParamsSelect.FPUType.ActionHead;
+        parms.FPUModeAtRoot = ParamsSelect.FPUType.ActionHead;
+      }
+
       SelectModifier?.Invoke(parms);
-      
+
       return parms;
     }
   }
@@ -330,7 +335,7 @@ public partial class UCIManagerMCGS
           break;
 
         case "uci":
-          UCIWriteLine($"id name Ceres {GameEngineCeresMCGSInProcess.CERES_MCGS_VERSION_STR}");
+          UCIWriteLine($"id name Ceres {CeresVersion.VersionString}");
           UCIWriteLine("id author David Elliott and the Ceres Authors");
           UCIWriteLine(SetOptionUCIDescriptions);
           UCIWriteLine("uciok");
@@ -353,9 +358,11 @@ public partial class UCIManagerMCGS
           UCIWriteLine("dump-store {d}  - dumps full node store for tree from last search (optionally with max depth specifier)");
           UCIWriteLine("dump-trans-pos  - dumps transpositions list (standalone hash)");
           UCIWriteLine("dump-nvidia     - dumps information about NVIDIA CUDA devices detected in the system");
+          UCIWriteLine("forward <n>     - advances position by n ply along PV (e.g. \"forward 7\") for subsequent search with graph reuse");
           UCIWriteLine("show-graph-plot - shows a graphical representation of full search graph");
           UCIWriteLine("graph [1-10]    - invokes graph feature to show the principal variations from last search (requires configuration), e.g. graph 7");
           UCIWriteLine("gamecomp        - invokes the game comparison feature to graph the divergence points in one or more games (requires configuration)");
+          UCIWriteLine("plyviz          - generates HTML visualization of PlyBin distributions for current position");
           UCIWriteLine("");
           break;
 
@@ -495,27 +502,21 @@ public partial class UCIManagerMCGS
             //DumpFullInfo(GameEngineSearchResultCeresMCGS searchResult, TextWriter writer, string description)
 
             CeresEngine.Search.Manager.DumpFullInfo(lastSearchResult, Console.Out, "UCI");
-//               CeresEngine.Search.Manager.DumpFullInfo(search.BestMove, search.SearchRootNode,
-//                                                      search.LastReuseDecision, search.LastMakeNewRootTimingStats,
-//                                                      search.LastGameLimitInputs, Console.Out, "UCI");
+            //               CeresEngine.Search.Manager.DumpFullInfo(search.BestMove, search.SearchRootNode,
+            //                                                      search.LastReuseDecision, search.LastMakeNewRootTimingStats,
+            //                                                      search.LastGameLimitInputs, Console.Out, "UCI");
           }
           else
             UCIWriteLine("info string No search manager created");
           break;
 
         case string c when c.StartsWith("graph"):
-          UCIWriteLine("graph not yet implemented");
-          break;
-
-          throw new NotImplementedException(); // TODO:
-#if NOT
-          // Command of the form such as "graph" or "graph 7" or "graph 3 ref 0.5"
           if (CeresEngine?.Search != null)
           {
             string[] partsGraph = c.TrimEnd().Split(" ");
-            string optionsStr = partsGraph.Length > 1 ? c.Substring(6) : null;
-            AnalysisGraphOptions options = AnalysisGraphOptions.FromString(optionsStr);
-            AnalysisGraphGenerator graphGenerator = new AnalysisGraphGenerator(CeresEngine.Search, options);
+            string optionsStr = partsGraph.Length > 1 ? c[6..] : null;
+            AnalysisGraphOptions graphOptions = AnalysisGraphOptions.FromString(optionsStr);
+            AnalysisGraphGenerator graphGenerator = new AnalysisGraphGenerator(CeresEngine.Search, graphOptions);
             graphGenerator.Write(true);
           }
           else
@@ -523,10 +524,41 @@ public partial class UCIManagerMCGS
             UCIWriteLine("info string No search manager created");
           }
           break;
-#endif
 
         case string c when c.StartsWith("gamecomp"):
           UCIManagerHelpersMCGS.ProcessGameComp(c, UCIWriteLine);
+          break;
+
+        case "plyviz":
+          if (InitializeEngineIfNeeded())
+          {
+            NNEvaluator evaluator = CeresEngine.Evaluators.Evaluator0;
+            NNEvaluatorResult plyvizResult = evaluator.Evaluate(curPositionAndMoves);
+            if (plyvizResult.PlyBinMoveProbs == null)
+            {
+              UCIWriteLine("info string PlyBin outputs not available for this network");
+            }
+            else
+            {
+              Position plyvizPos = curPositionAndMoves.FinalPosition;
+              bool isBlack = plyvizPos.SideToMove == SideType.Black;
+              (Half[,] moveProbs, Half[,] capProbs) = PlyBinVisualization.ConvertProbs(plyvizResult, isBlack);
+              List<PVCandidate> pvs = PVExtractor.ExtractPVs(plyvizResult, plyvizPos);
+              string fen = plyvizPos.FEN;
+              string plyvizTitle = "PlyBin - " + fen;
+              string plyvizPath = Path.Combine(Path.GetTempPath(), "ceres_plyviz.html");
+              List<PlyBinEntry> plyvizEntries =
+              [
+                new PlyBinEntry(fen, plyvizTitle, moveProbs, capProbs, plyvizResult.ToString(),
+                                PunimSelfProbs: plyvizResult.PunimSelfProbs,
+                                PunimOpponentProbs: plyvizResult.PunimOpponentProbs,
+                                ProjectedPVs: pvs, MLH: plyvizResult.M)
+              ];
+              string outputFile = PlyBinVisualization.GenerateMulti(plyvizEntries, plyvizTitle, plyvizPath);
+              UCIWriteLine("info string Ply Visualization page output to " + outputFile);
+              StringUtils.LaunchBrowserWithURL(outputFile);
+            }
+          }
           break;
 
         case "dump-params":
@@ -538,12 +570,16 @@ public partial class UCIManagerMCGS
             UCIWriteLine("info string No search manager created");
           break;
 
+        case string c when c.StartsWith("forward"):
+          ProcessForward(c);
+          break;
+
         case "dump-processor":
           HardwareManager.DumpProcessorInfo();
           break;
 
         case string c when c.StartsWith("download"):
-          UCIManagerHelpers.ProcessDownloadCommand(c, UCIWriteLine);
+          UCIManagerHelpersMCGS.ProcessDownloadCommand(c, UCIWriteLine);
           break;
 
         case string c when c.StartsWith("backendbench"):
@@ -556,7 +592,7 @@ public partial class UCIManagerMCGS
             if (InitializeEngineIfNeeded())
             {
               BackendbenchOptions options = BackendbenchOptionsParser.Parse(c);
-              BackendBenchEvaluator(EvaluatorDef, CeresEngine.Evaluators.Evaluator0, 
+              BackendBenchEvaluator(EvaluatorDef, CeresEngine.Evaluators.Evaluator0,
                                     options.StartIndex, options.EndIndex, options.StepSize, options.RepeatCount);
             }
           }
@@ -630,7 +666,7 @@ public partial class UCIManagerMCGS
             }
 
             long bytesTotalMemory = GC.GetTotalMemory(true);
-            Console.WriteLine("GB total managed memory: " + Math.Round(bytesTotalMemory/(1024.0*1024.0*1024.0), 3));
+            Console.WriteLine("GB total managed memory: " + Math.Round(bytesTotalMemory / (1024.0 * 1024.0 * 1024.0), 3));
           }
           else
           {
@@ -1005,6 +1041,84 @@ public partial class UCIManagerMCGS
 
 
   /// <summary>
+  /// Processes the forward command which advances position along the principal variation.
+  /// </summary>
+  /// <param name="command">The forward command with ply count argument (e.g., "forward 7")</param>
+  private void ProcessForward(string command)
+  {
+    // Verify search manager exists
+    if (CeresEngine?.Search?.Manager == null)
+    {
+      UCIWriteLine("info string No search manager created - run a search first");
+      return;
+    }
+
+    // Parse the ply count argument
+    string[] parts = command.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length != 2)
+    {
+      UCIWriteLine("info string forward command requires exactly one positive integer argument (number of ply)");
+      return;
+    }
+
+    if (!int.TryParse(parts[1], out int numPly) || numPly < 1)
+    {
+      UCIWriteLine("info string forward command requires a positive integer argument");
+      return;
+    }
+
+    // Get the principal variation from the current search
+    GNode searchRootNode = CeresEngine.Search.Manager.Engine.SearchRootNode;
+
+    // Minimum N for PV nodes (avoid noisy nodes)
+    int minN = (int)Math.Max(1, searchRootNode.N * 0.0001f);
+
+    SearchPrincipalVariationMCGS pv = new(CeresEngine.Search.Manager, searchRootNode, default, true, minN);
+
+    // Check if we have enough PV nodes to advance
+    if (pv.Nodes.Count <= numPly)
+    {
+      UCIWriteLine($"info string Cannot advance {numPly} ply - PV only has {pv.Nodes.Count - 1} moves");
+      return;
+    }
+
+    // Build the list of moves from the PV to advance by
+    List<string> movesToAdd = [];
+    for (int i = 0; i < numPly; i++)
+    {
+      GNodeAndOptionalEdge nodeEdge = pv.Nodes[i];
+      if (!nodeEdge.HasEdge || nodeEdge.Edge.IsNull)
+      {
+        UCIWriteLine($"info string Cannot advance {numPly} ply - PV terminates at ply {i}");
+        return;
+      }
+
+      string moveStr = nodeEdge.Edge.MoveMG.MoveStr(MGMoveNotationStyle.Coordinates, IsChess960OptionSet);
+      movesToAdd.Add(moveStr);
+    }
+
+    // Create a new position by cloning and applying the PV moves to the current position
+    PositionWithHistory newPosition = new(curPositionAndMoves);
+    foreach (string move in movesToAdd)
+    {
+      newPosition.AppendMove(move);
+    }
+
+    // Get the new search root node (the position after advancing)
+    GNode newRootNode = pv.Nodes[numPly].ParentNode;
+    string newFEN = newRootNode.CalcPosition().ToPosition.FEN;
+    double newRootQ = newRootNode.Q;
+
+    // Update the current position
+    curPositionAndMoves = newPosition;
+    curPositionIsContinuationOfPrior = true; // Signal that graph reuse should be attempted
+
+    // Output the info line
+    UCIWriteLine($"info string advanced {numPly} ply along the PV to {newFEN} with root Q = {newRootQ:F2}");
+  }
+
+
+  /// <summary>
   /// Processes the go command.
   /// </summary>
   /// <param name="command"></param>
@@ -1138,7 +1252,7 @@ public partial class UCIManagerMCGS
     if (numPV == 1)
     {
       UCIWriteLine(UCIInfoMCGS.UCIInfoString(manager,
-//                                               bestMoveInfo == null ? default : bestMoveInfo.BestMoveEdge,
+                                             //                                               bestMoveInfo == null ? default : bestMoveInfo.BestMoveEdge,
                                              showWDL: showWDL, scoreAsQ: scoreAsQ, isChess960: IsChess960OptionSet));
     }
     else
@@ -1210,7 +1324,7 @@ public partial class UCIManagerMCGS
     else
     {
       MCGSPosGraphNodeDumper.DumpNodeStr(CeresEngine.Search.Manager, 0, searchRootNode, default, searchRootNode, default, 0, true);
-//        CeresEngine.Manager.Engine.SearchRootNode.Dump(1, 1, prefixString: "info string ");
+      //        CeresEngine.Manager.Engine.SearchRootNode.Dump(1, 1, prefixString: "info string ");
     }
   }
 

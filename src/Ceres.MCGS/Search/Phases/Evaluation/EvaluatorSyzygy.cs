@@ -27,12 +27,12 @@ using Ceres.Chess.NNEvaluators.LC0DLL;
 using Ceres.Chess.Positions;
 using Ceres.Chess.UserSettings;
 using Ceres.MCGS.Search.Params;
+using Ceres.MCGS.Search.PathEvaluators;
 using Ceres.MCGS.Search.Paths;
-using Ceres.MCTS.Evaluators;
 
 #endregion
 
-namespace Ceres.MCGS.Search.PathEvaluators;
+namespace Ceres.MCGS.Search.Phases.Evaluation;
 
 /// <summary>
 /// Selection terminator which probes Syzygy tablebases 
@@ -141,15 +141,15 @@ public sealed class EvaluatorSyzygy
     bool forceNoTablebaseTerminals = false;
     if (startPos.PieceCount <= 7 && tablebasePaths != null) // TODO: remove hardcoding of the PieceCount maximum here
     {
-      LeafEvaluatorSyzygy evaluatorTB = new LeafEvaluatorSyzygy(tablebasePaths, false);
-      if (startPos.PieceCount <= evaluatorTB.MaxCardinality)
+      ISyzygyEvaluatorEngine evaluator = SyzygyEvaluatorPool.GetSessionForPaths(tablebasePaths);
+      if (startPos.PieceCount <= evaluator.MaxCardinality)
       {
-        MGMove ret = evaluatorTB.Evaluator.CheckTablebaseBestNextMove(in startPos, out WDLResult result,
+        MGMove ret = evaluator.CheckTablebaseBestNextMove(in startPos, out WDLResult result,
           out List<(MGMove, short)> fullWinningMoveList, out bool winningMoveListOrderedByDTM);
 
         if (result == WDLResult.Win && !winningMoveListOrderedByDTM)
         {
-          // No DTZ were available to guide search, must start a new tree
+          // No DTZ were available to guide search, must start a new graph
           // and perform actual NN search to find the win.
           forceNoTablebaseTerminals = true;
         }

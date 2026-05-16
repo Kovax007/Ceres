@@ -35,11 +35,11 @@ using Ceres.MCTS.MTCSNodes.Struct;
 using Ceres.MCTS.Params;
 using Ceres.Features.GameEngines;
 using Ceres.Base.OperatingSystem;
-using Ceres.Features.Players;
 using Ceres.Chess.NNEvaluators.LC0DLL;
 using Ceres.MCTS.MTCSNodes.Analysis;
 using ManagedCuda.BasicTypes;
 using Ceres.Features.UCI;
+using Ceres.MCTS.GameEngines;
 
 #endregion
 

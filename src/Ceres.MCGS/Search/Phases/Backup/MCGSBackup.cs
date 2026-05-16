@@ -27,11 +27,11 @@ using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.Paths;
 using Ceres.MCGS.Search.Strategies;
-using Ceres.MCGS.Storage;
+using Ceres.MCGS.Utils;
 
 #endregion
 
-namespace Ceres.MCGS.Search;
+namespace Ceres.MCGS.Search.Phases.Backup;
 
 public partial class MCGSBackup
 {

@@ -20,21 +20,20 @@ using System.Linq;
 
 #endregion
 
-namespace Ceres.MCGS.Managers.Limits
+namespace Ceres.MCGS.Managers.Limits;
+
+/// <summary>
+/// Manager of time which estimates the optimal amount of time
+/// to spend on the next move (testbed version).
+/// </summary>
+[Serializable]
+public class ManagerGameLimitTest : IManagerGameLimit
 {
-  /// <summary>
-  /// Manager of time which estimates the optimal amount of time
-  /// to spend on the next move (testbed version).
-  /// </summary>
-  [Serializable]
-  public class ManagerGameLimitTest : IManagerGameLimit
+  public ManagerGameLimitTest(float aggressiveness)
   {
-    public ManagerGameLimitTest(float aggressiveness)
-    {
-    } 
-    public ManagerGameLimitOutputs ComputeMoveAllocation(ManagerGameLimitInputs inputs)
-    {
-      throw new NotImplementedException();
-    }
+  } 
+  public ManagerGameLimitOutputs ComputeMoveAllocation(ManagerGameLimitInputs inputs)
+  {
+    throw new NotImplementedException();
   }
 }

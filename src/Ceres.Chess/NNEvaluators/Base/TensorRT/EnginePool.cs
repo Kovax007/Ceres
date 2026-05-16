@@ -84,15 +84,13 @@ public sealed class EnginePool : IDisposable
     public readonly IntPtr GpuInput;
     public readonly IntPtr PinnedOutput;
     public readonly IntPtr GpuOutput;
-    public readonly Half[] ManagedOutput;
 
-    public StreamBufferSet(long alignedInputBytes, long alignedOutputBytes, long maxOutputElements)
+    public StreamBufferSet(long alignedInputBytes, long alignedOutputBytes)
     {
       PinnedInput = TensorRTNative.AllocPinned(alignedInputBytes);
       GpuInput = TensorRTNative.AllocGPU(alignedInputBytes);
       PinnedOutput = TensorRTNative.AllocPinned(alignedOutputBytes);
       GpuOutput = TensorRTNative.AllocGPU(alignedOutputBytes);
-      ManagedOutput = new Half[maxOutputElements];
     }
 
     public void Free()
@@ -288,25 +286,24 @@ public sealed class EnginePool : IDisposable
     }
     else // Exact mode
     {
+      // sizes defines exact batch sizes, sorted descending for processing
+      Array.Sort(sizes);
+      Array.Reverse(sizes);
+
+      // Build a single multi-profile engine with shared weights across all batch sizes.
+      // This eliminates N-fold weight duplication in VRAM and requires only one cache file.
       string ext = System.IO.Path.GetExtension(onnxPath).ToLowerInvariant();
       TensorRTEngine[] multiEngines;
       if (ext == ".engine" || ext == ".plan")
       {
-        // Load pre-built engine file directly — sizes must match engine's profile order
+        // Load pre-built engine file directly (bypasses ONNX parsing and cache)
         multiEngines = this.trt.LoadMultiProfileEngineFile(onnxPath, sizes, options, deviceId);
       }
       else
       {
-        // Sort ascending for consistent cache filenames (must match PreBuildUnifiedEngineWithTimingCache)
-        Array.Sort(sizes);
-
-        // Single multi-profile engine with shared weights across all batch sizes
         multiEngines = this.trt.LoadMultiProfileEngineWithCache(
           onnxPath, sizes, options, cacheDir, deviceId);
       }
-
-      // Sort engines by batch size descending (required by scheduler)
-      Array.Sort(multiEngines, (a, b) => b.BatchSize.CompareTo(a.BatchSize));
 
       foreach (TensorRTEngine engine in multiEngines)
       {
@@ -358,7 +355,7 @@ public sealed class EnginePool : IDisposable
     streamBuffers = new StreamBufferSet[NUM_COMPUTE_STREAMS];
     for (int i = 0; i < NUM_COMPUTE_STREAMS; i++)
     {
-      streamBuffers[i] = new StreamBufferSet(alignedInputBytes, alignedOutputBytes, maxOutputElements);
+      streamBuffers[i] = new StreamBufferSet(alignedInputBytes, alignedOutputBytes);
     }
 
     // Pre-allocate managed input buffers for non-pipelined paths (Process/ProcessBytes)
@@ -676,15 +673,12 @@ public sealed class EnginePool : IDisposable
       }
 
       int outputPositions = useDynamic ? count : engineBatchSize;
-      long outputBytes = (long)ComputeAlignedOutputSize(outputPositions) * sizeof(ushort);
+      int outputElements = ComputeAlignedOutputSize(outputPositions);
+      long outputBytes = (long)outputElements * sizeof(ushort);
       engine.CopyFromGPUOnStreamAsync(STREAM_COMPUTE_A, streamBuffers[0].PinnedOutput, streamBuffers[0].GpuOutput, outputBytes);
       engine.SyncStream(STREAM_COMPUTE_A);
 
-      fixed (Half* dstPtr = streamBuffers[0].ManagedOutput)
-      {
-        Buffer.MemoryCopy((void*)streamBuffers[0].PinnedOutput, dstPtr, outputBytes, outputBytes);
-      }
-      handler(globalPositionOffset + start, count, outputPositions, streamBuffers[0].ManagedOutput);
+      handler(globalPositionOffset + start, count, outputPositions, streamBuffers[0].PinnedOutput, outputElements);
       return;
     }
 
@@ -693,6 +687,7 @@ public sealed class EnginePool : IDisposable
     // compute and overlapping D2H(s) with Compute(s+1) across streams.
     Span<long> groupOutputBytes = stackalloc long[NUM_COMPUTE_STREAMS];
     Span<int> groupOutputPositions = stackalloc int[NUM_COMPUTE_STREAMS];
+    Span<int> groupOutputElements = stackalloc int[NUM_COMPUTE_STREAMS];
     for (int groupStart = 0; groupStart < batchCount; groupStart += NUM_COMPUTE_STREAMS)
     {
       int groupEnd = Math.Min(groupStart + NUM_COMPUTE_STREAMS, batchCount);
@@ -748,9 +743,11 @@ public sealed class EnginePool : IDisposable
 
         // D2H on same stream (queued after compute completes on this stream)
         int outputPositions = useDynamic ? count : engineBatchSize;
-        long outputBytes = (long)ComputeAlignedOutputSize(outputPositions) * sizeof(ushort);
+        int outputElements = ComputeAlignedOutputSize(outputPositions);
+        long outputBytes = (long)outputElements * sizeof(ushort);
         groupOutputBytes[s] = outputBytes;
         groupOutputPositions[s] = outputPositions;
+        groupOutputElements[s] = outputElements;
         engine.CopyFromGPUOnStreamAsync(streamId, streamBuffers[s].PinnedOutput, streamBuffers[s].GpuOutput, outputBytes);
       }
 
@@ -763,12 +760,8 @@ public sealed class EnginePool : IDisposable
 
         engine.SyncStream(streamId);
 
-        long outputBytes = groupOutputBytes[s];
-        fixed (Half* dstPtr = streamBuffers[s].ManagedOutput)
-        {
-          Buffer.MemoryCopy((void*)streamBuffers[s].PinnedOutput, dstPtr, outputBytes, outputBytes);
-        }
-        handler(globalPositionOffset + start, count, groupOutputPositions[s], streamBuffers[s].ManagedOutput);
+        handler(globalPositionOffset + start, count, groupOutputPositions[s],
+                streamBuffers[s].PinnedOutput, groupOutputElements[s]);
       }
     }
   }

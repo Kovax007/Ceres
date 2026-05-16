@@ -18,9 +18,11 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Text;
+
 using Ceres.Base.DataType;
 using Ceres.Base.Math;
-
+using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Search.Params;
 
 #endregion
@@ -40,6 +42,10 @@ namespace Ceres.MCGS.Search.PUCT;
 public unsafe static class PUCTScoreCalcVector
 {
   public const int MAX_CHILDREN = 64;
+
+  // ThreadStatic buffer for SIMD-aligned per-child Q values (avoids stackalloc per call)
+  [ThreadStatic]
+  private static double[] t_simdQChildBuffer;
 
   /// <summary>
   /// Static variable available for debugging purposes to
@@ -70,7 +76,6 @@ public unsafe static class PUCTScoreCalcVector
   /// <param name="outputScores"></param>
   /// <param name="outputChildVisitCounts"></param>
   /// <param name="cpuctMultiplier"></param>
-  /// <param name="actionHeadSelectionWeight"></param>
   /// <param name="thresholdPUCTSuboptimalityReject"></param>
   /// <returns></returns>
   internal static int ScoreCalcMulti(ParamsSelect paramsSelect,
@@ -81,8 +86,8 @@ public unsafe static class PUCTScoreCalcVector
                                      int numChildren, int numVisitsToCompute,
                                      Span<double> outputScores, Span<short> outputChildVisitCounts,
                                      double cpuctMultiplier,
-                                     float actionHeadSelectionWeight,
-                                     float thresholdPUCTSuboptimalityReject)
+                                     float thresholdPUCTSuboptimalityReject,
+                                     GNode parentNode = default)
   {
     Debug.Assert(!double.IsNaN(qParent));
 
@@ -92,6 +97,26 @@ public unsafe static class PUCTScoreCalcVector
 
     Debug.Assert(outputScores.IsEmpty || outputScores.Length >= numChildren);
     Debug.Assert(numVisitsToCompute == 0 || outputChildVisitCounts.Length >= numChildren);
+
+    if (paramsSelect.CBGPUCTSelectActive
+        && MCGSParamsFixed.DEBUG_CBGPUCT
+        && parentNode.IsSearchRoot
+        && numVisitsToCompute > 1)
+    {
+      DumpScoreComparison(paramsSelect, parentIsRoot, parentN, parentNInFlight,
+                          qParent, parentSumPVisited, childStats,
+                          qWhenNoChildrenPerChild, numChildren, numVisitsToCompute,
+                          cpuctMultiplier, parentNode);
+    }
+
+    if (paramsSelect.CBGPUCTSelectActive)
+    {
+      return CBGPUCTScoreCalc.ScoreCalc(paramsSelect, parentNode, childStats,
+                                        qParent, parentSumPVisited,
+                                        numChildren, numVisitsToCompute,
+                                        outputScores, outputChildVisitCounts,
+                                        qWhenNoChildrenPerChild);
+    }
 
     float virtualLossMultiplier;
     if (ParamsSelect.VLossRelative)
@@ -105,12 +130,9 @@ public unsafe static class PUCTScoreCalcVector
 
     double cpuctValue = cpuctMultiplier * paramsSelect.CalcCPUCT(parentIsRoot, parentN);
 
-    // Compute qWhenNoChildren
-    double fpuValue = -paramsSelect.CalcFPUValue(parentIsRoot);
-
+    // Compute qWhenNoChildren based on FPU mode
     // TODO: to be more precise, parentSumPVisited should possibly be updated as we visit children
-    bool useFPUReduction = paramsSelect.GetFPUMode(parentIsRoot) == ParamsSelect.FPUType.Reduction;
-    double qWhenNoChildren = useFPUReduction ? +qParent + fpuValue * Math.Sqrt(parentSumPVisited) : fpuValue;
+    double qWhenNoChildren = paramsSelect.CalcQWhenNoChildren(parentIsRoot, qParent, parentSumPVisited);
 
     const bool DUMP_Q_WHEN_NO_CHILDREN = false;
     if (DUMP_Q_WHEN_NO_CHILDREN && qWhenNoChildrenPerChild != null)
@@ -136,7 +158,7 @@ public unsafe static class PUCTScoreCalcVector
                                     parentIsRoot ? paramsSelect.UCTRootNumeratorExponent : paramsSelect.UCTNonRootNumeratorExponent,
                                     cpuctValue, qWhenNoChildren, qWhenNoChildrenPerChild,
                                     parentIsRoot ? paramsSelect.UCTRootDenominatorExponent : paramsSelect.UCTNonRootDenominatorExponent,
-                                    actionHeadSelectionWeight, thresholdPUCTSuboptimalityReject);
+                                    thresholdPUCTSuboptimalityReject);
     return numVisitsAccepted;
   }
 
@@ -172,7 +194,6 @@ public unsafe static class PUCTScoreCalcVector
                              double cpuctValue,
                              double qWhenNoChildren, double[] qWhenNoChildrenPerChild,
                              double uctDenominatorPower,
-                             float actionHeadSelectionWeight,
                              float thresholdPUCTSuboptimalityReject)
   {
     // Load the vectors that do not change
@@ -192,8 +213,7 @@ public unsafe static class PUCTScoreCalcVector
       double numVisitsByParentToChildren = parentNInFlight + (parentN < 2 ? 1 : parentN - 1);
       double cpuctSqrtParentN = cpuctValue * ParamsSelect.UCTParentMultiplier(numVisitsByParentToChildren, uctParentPower);
       ComputeChildScores(childStats, numChildren, qWhenNoChildren, qWhenNoChildrenPerChild, virtualLossMultiplier,
-                         childScores, cpuctSqrtParentN, uctDenominatorPower, 
-                         actionHeadSelectionWeight);
+                         childScores, cpuctSqrtParentN, uctDenominatorPower);
 
       // Assert that none of the scores were NaN.
 #if DEBUG
@@ -267,8 +287,7 @@ public unsafe static class PUCTScoreCalcVector
           numVisitsByParentToChildren = newNInFlight + parentNInFlight + (parentN < 2 ? 1 : parentN - 1);
           cpuctSqrtParentN = cpuctValue * ParamsSelect.UCTParentMultiplier(numVisitsByParentToChildren, uctParentPower);
           ComputeChildScores(childStats, numChildren, qWhenNoChildren, qWhenNoChildrenPerChild, virtualLossMultiplier,
-                             childScores, cpuctSqrtParentN, uctDenominatorPower, 
-                             actionHeadSelectionWeight);
+                             childScores, cpuctSqrtParentN, uctDenominatorPower);
 
           // Check if the best child was still the same
           if (maxIndex == ArrayUtils.IndexOfElementWithMaxValue(childScores, numChildren))
@@ -322,31 +341,35 @@ public unsafe static class PUCTScoreCalcVector
                                          int numChildren, 
                                          double qWhenNoChildren, double [] qWhenNoChildrenPerChild,
                                          double virtualLossMultiplier, Span<double> computedChildScores,
-                                         double cpuctSqrtParentN, double uctDenominatorPower,
-                                         float actionHeadSelectionWeight)
+                                         double cpuctSqrtParentN, double uctDenominatorPower)
   {
-#if ACTION_ENABLED
-Need to review/harmonize logic between these two methods (pick which one is intended).
-Findings comparing ComputeChildScoresSIMD vs ComputeChildScoresNonSIMD (ignoring commented-out code):
-•	Action-head logic not equivalent (High)
-•	SIMD path: Only blends action head into Q if ACTION_ENABLED is defined, 
-  using Q = (1-w)·Q + w·A for all items when weight != 0.
-•	Non-SIMD path: Always compiled and applies a different rule 
+    // Note: SIMD path blends action into Q globally via weight (Q = (1-w)*Q + w*A).
+    //       The new FPUType.ActionHead mode uses action values as per-child FPU instead,
+    //       which flows through qWhenNoChildrenPerChild and does not require the blending logic.
+
+#if OLD_ACTION_COMMENT
+    Need to review / harmonize logic between these two methods(pick which one is intended).
+Findings comparing ComputeChildScoresSIMD vs ComputeChildScoresNonSIMD(ignoring commented -out code):
+	Action - head logic not equivalent(High)
+	SIMD path: Only blends action head into Q if ACTION_ENABLED is defined, 
+  using Q = (1 - w)*Q + w*A for all items when weight != 0.
+	Non - SIMD path: Always compiled and applies a different rule
   only for unvisited moves (i > 0 && N[i] == 0 && weight != 0): 
-    Q = max(Q, A[i] + 0.10). No global blending. 
+    Q = max(Q, A[i] + 0.10).No global blending.
 This changes selection behavior even when ACTION_ENABLED is not defined and adds a fixed +0.10 offset floor.
 #endif
+
     if (ENABLE_SIMD_CALCS && Vector.IsHardwareAccelerated)
     {
       ComputeChildScoresSIMD(childStats, numChildren, qWhenNoChildren, qWhenNoChildrenPerChild,
                              virtualLossMultiplier, computedChildScores,
-                             cpuctSqrtParentN, uctDenominatorPower, actionHeadSelectionWeight);
+                             cpuctSqrtParentN, uctDenominatorPower);
     }
     else
     {
       ComputeChildScoresNonSIMD(childStats, numChildren, qWhenNoChildren, qWhenNoChildrenPerChild,
                                 virtualLossMultiplier, computedChildScores, 
-                                cpuctSqrtParentN, uctDenominatorPower, actionHeadSelectionWeight);
+                                cpuctSqrtParentN, uctDenominatorPower);
     }
   }
 
@@ -355,8 +378,7 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
                                              int numChildren, 
                                              double qWhenNoChildren, double[] qWhenNoChildrenPerChild,
                                              double virtualLossMultiplier, Span<double> computedChildScores,
-                                             double cpuctSqrtParentN, double uctDenominatorPower,
-                                             double actionHeadSelectionWeight)
+                                             double cpuctSqrtParentN, double uctDenominatorPower)
   {
     int simdWidth = Vector<double>.Count;
     int numBlocks = numChildren / simdWidth + (numChildren % simdWidth == 0 ? 0 : 1);
@@ -381,8 +403,21 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
 #if ACTION_ENABLED
       Vector<double> vA = new Vector<double>(a[startOffset..]);
 #endif
-      Vector<double> vQWhenNoChildren = qWhenNoChildrenPerChild != null ? new Vector<double>(qWhenNoChildrenPerChild[startOffset..]) 
-                                                                        : new Vector<double>(qWhenNoChildren);
+      Vector<double> vQWhenNoChildren;
+      if (qWhenNoChildrenPerChild != null)
+      {
+        double[] qPerChildPadded = t_simdQChildBuffer ??= new double[Vector<double>.Count];
+        int remaining = qWhenNoChildrenPerChild.Length - startOffset;
+        for (int i = 0; i < simdWidth; i++)
+        {
+          qPerChildPadded[i] = i < remaining ? qWhenNoChildrenPerChild[startOffset + i] : qWhenNoChildren;
+        }
+        vQWhenNoChildren = new Vector<double>(qPerChildPadded);
+      }
+      else
+      {
+        vQWhenNoChildren = new Vector<double>(qWhenNoChildren);
+      }
       Vector<double> vNInFlight = new(nInFlight[startOffset..]);
 
       Vector<double> vScore = ComputeScoresSIMD(vW, vN, vP,
@@ -390,7 +425,6 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
                                                 vA,
 #endif
                                                 virtualLossMultiplier, cpuctSqrtParentN, uctDenominatorPower,
-                                                actionHeadSelectionWeight,
                                                 vQWhenNoChildren, vNInFlight);
 
       vScore.CopyTo(computedChildScores[startOffset..]);
@@ -448,15 +482,13 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
                                                        int numChildren, 
                                                        double qWhenNoChildren, double[] qWhenNoChildrenPerChild,
                                                        double virtualLossMultiplier, Span<double> computedChildScores,
-                                                       double cpuctSqrtParentN, double uctDenominatorPower,
-                                                       float actionHeadSelectionWeight)
+                                                       double cpuctSqrtParentN, double uctDenominatorPower)
   {
     ComputeScoresNonSIMD(numChildren, childStats.W.Span, childStats.N.Span, 
                          childStats.P.Span, childStats.A.Span,
                          virtualLossMultiplier, cpuctSqrtParentN, uctDenominatorPower,
                          qWhenNoChildren, qWhenNoChildrenPerChild,
-                         childStats.NInFlightAdjusted.Span, computedChildScores, 
-                         actionHeadSelectionWeight);
+                         childStats.NInFlightAdjusted.Span, computedChildScores);
   }
 
 
@@ -466,13 +498,8 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
                                            double uctDenominatorPower,
                                            double qWhenNoChildren, double[] qWhenNoChildrenPerChild, 
                                            Span<double> vNInFlight,
-                                           Span<double> outputVScore, float actionHeadSelectionWeight)
+                                           Span<double> outputVScore)
   {
-    if (qWhenNoChildrenPerChild != null)
-    {
-      throw new NotImplementedException();
-    }
-
     for (int i = 0; i < numScores; i++)
     {
       double nPlusNInFlight = vN[i] + vNInFlight[i];
@@ -498,38 +525,16 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
       }
       else
       {
-        _vQ = qWhenNoChildren + _vLossContrib;
+        double thisQWhenNoChildren = qWhenNoChildrenPerChild != null ? qWhenNoChildrenPerChild[i] : qWhenNoChildren;
+        _vQ = thisQWhenNoChildren + _vLossContrib;
       }
 
-
-      if (i > 0 && vN[i] == 0 && actionHeadSelectionWeight != 0)
-      {
-        double pDiff = vP[i-1] - vP[i];
-        double aDiff = vA[i] - vA[0];
-//          if (pDiff < 0.05f)
-        {
-          //  if (vP[i] < 0.02) weight *= 0.333f; // <--------- TEST ----------
-          //            _vQ = actionHeadSelectionWeight * vA[i] + (1 - actionHeadSelectionWeight) * _vQ;
-          //            if (aDiff < -0.20) // +17 +/-27
-          //              _vQ -= 0.10f;
-
-          if (aDiff < -0.30)
-          {
-//              _vQ = _vQ + 0.12f + (aDiff * 0.5f); // 4 +/-16 @33
-          }
-
-          //            float min = _vQ;
-
-          //            _vQ = -0.12f 
-          //              + actionHeadSelectionWeight * vA[i] 
-          //              + (1 - actionHeadSelectionWeight) * _vQ;
-          //            _vQ = Math.Max(min, _vQ);
-          //            Console.WriteLine(min + "  " + _vQ);
-
-          //_vQ = vA[i]; // 
-          _vQ = Math.Max(_vQ - 0 * 0.10f, vA[i] + 0.10f); 
-        }
-      }
+      // [Experimental action blending, superseded by FPUType.ActionHead mode]
+      // if (i > 0 && vN[i] == 0 && actionHeadSelectionWeight != 0)
+      // {
+      //   double aDiff = vA[i] - vA[0];
+      //   _vQ = Math.Max(_vQ, vA[i] + 0.10f);
+      // }
 
       // U
       double _vUNumerator = vP[i] * cpuctSqrtParentN;
@@ -559,7 +564,6 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
 #endif
                                                  double virtualLossMultiplier,
                                                  double cpuctSqrtParentN, double uctDenominatorPower,
-                                                 double actionHeadSelectionWeight,
                                                  Vector<double> vQWhenNoChildren, Vector<double> vNInFlight)
   {
     Vector<double> vNPlusNInFlight = vN + vNInFlight;
@@ -588,17 +592,8 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
 
     Vector<double> vQWithChildren = (vLossContrib - vW) / vNPlusNInFlight;
     Vector<double> vQWithoutChildren = vQWhenNoChildren + vLossContrib;
-    var maskNoChildren = Vector.GreaterThan(vNPlusNInFlight, Vector<double>.Zero);
+    Vector<long> maskNoChildren = Vector.GreaterThan(vNPlusNInFlight, Vector<double>.Zero);
     Vector<double> vQ = Vector.ConditionalSelect(maskNoChildren, vQWithChildren, vQWithoutChildren);
-
-#if ACTION_ENABLED
-    if (actionHeadSelectionWeight != 0)
-    {
-      Vector<double> vActionHeadWeight = new Vector<double>(actionHeadSelectionWeight);
-      Vector<double> vActionHeadWeightComplement = Vector<double>.One - vActionHeadWeight;
-      vQ = vQ * vActionHeadWeightComplement + vA * vActionHeadWeight;
-    }
-#endif
 
     Vector<double> vScore = vU + vQ;
     return vScore;
@@ -616,6 +611,414 @@ This changes selection behavior even when ACTION_ENABLED is not defined and adds
       buf[i] = Math.Pow(buf[i], power);
     }
     return new Vector<double>(buf);
+  }
+
+  #endregion
+
+
+  #region CB-GPUCT debug comparison
+
+  /// <summary>
+  /// Debug-only: prints two aligned lines of per-child scores - vanilla PUCT vs the
+  /// new CB-GPUCT visit-target rule - so the impact of the new mode can be inspected
+  /// directly. Both modes are invoked in score-only mode (no nInFlight side effects).
+  /// </summary>
+  /// <param name="paramsSelect"></param>
+  /// <param name="parentIsRoot"></param>
+  /// <param name="parentN"></param>
+  /// <param name="parentNInFlight"></param>
+  /// <param name="qParent"></param>
+  /// <param name="parentSumPVisited"></param>
+  /// <param name="childStats"></param>
+  /// <param name="qWhenNoChildrenPerChild"></param>
+  /// <param name="numChildren"></param>
+  /// <param name="numVisitsToCompute"></param>
+  /// <param name="cpuctMultiplier"></param>
+  /// <param name="parentNode"></param>
+  private static void DumpScoreComparison(ParamsSelect paramsSelect,
+                                          bool parentIsRoot, int parentN, double parentNInFlight,
+                                          double qParent, double parentSumPVisited,
+                                          GatheredChildStats childStats,
+                                          double[] qWhenNoChildrenPerChild,
+                                          int numChildren,
+                                          int numVisitsToCompute,
+                                          double cpuctMultiplier,
+                                          GNode parentNode)
+  {
+    Span<double> vanillaScores = stackalloc double[numChildren];
+    Span<double> cbScores = stackalloc double[numChildren];
+    Span<short> dummyVisits = stackalloc short[numChildren];
+
+    // Vanilla PUCT inputs (mirrors what the production path computes below).
+    float virtualLossMultiplier = ParamsSelect.VLossRelative
+      ? (float)qParent + paramsSelect.VirtualLossDefaultRelative
+      : paramsSelect.VirtualLossDefaultAbsolute;
+    double cpuctValue = cpuctMultiplier * paramsSelect.CalcCPUCT(parentIsRoot, parentN);
+    double qWhenNoChildren = paramsSelect.CalcQWhenNoChildren(parentIsRoot, qParent, parentSumPVisited);
+    float uctNumeratorPower = parentIsRoot ? paramsSelect.UCTRootNumeratorExponent
+                                           : paramsSelect.UCTNonRootNumeratorExponent;
+    double uctDenominatorPower = parentIsRoot ? paramsSelect.UCTRootDenominatorExponent
+                                              : paramsSelect.UCTNonRootDenominatorExponent;
+
+    // ---- Phase 1: score-only passes (do NOT mutate nInFlight). ----
+    Compute(parentN, qParent, parentNInFlight, childStats, numChildren, 0,
+            vanillaScores, dummyVisits, virtualLossMultiplier, uctNumeratorPower,
+            cpuctValue, qWhenNoChildren, qWhenNoChildrenPerChild, uctDenominatorPower,
+            float.MaxValue);
+
+    CBGPUCTScoreCalc.ScoreCalc(paramsSelect, parentNode, childStats,
+                               qParent, parentSumPVisited,
+                               numChildren, numVisitsToCompute: 0,
+                               cbScores, dummyVisits,
+                               qWhenNoChildrenPerChild);
+
+    // ---- Phase 2: simulate full visit allocation under both modes. ----
+    // Each call mutates childStats.NInFlightAdjusted in-place; we save and restore
+    // so the real subsequent ScoreCalcMulti call sees the original nInFlight state.
+    Span<double> savedNInFlight = stackalloc double[numChildren];
+    childStats.NInFlightAdjusted.Span[..numChildren].CopyTo(savedNInFlight);
+
+    Span<short> vanAlloc = stackalloc short[numChildren];
+    vanAlloc.Clear();
+    Compute(parentN, qParent, parentNInFlight, childStats, numChildren, numVisitsToCompute,
+            default, vanAlloc, virtualLossMultiplier, uctNumeratorPower,
+            cpuctValue, qWhenNoChildren, qWhenNoChildrenPerChild, uctDenominatorPower,
+            float.MaxValue);
+
+    savedNInFlight.CopyTo(childStats.NInFlightAdjusted.Span[..numChildren]);
+
+    Span<short> cbAlloc = stackalloc short[numChildren];
+    cbAlloc.Clear();
+    CBGPUCTScoreCalc.ScoreCalc(paramsSelect, parentNode, childStats,
+                               qParent, parentSumPVisited,
+                               numChildren, numVisitsToCompute,
+                               default, cbAlloc,
+                               qWhenNoChildrenPerChild);
+
+    savedNInFlight.CopyTo(childStats.NInFlightAdjusted.Span[..numChildren]);
+
+    Span<double> pSpan = childStats.P.Span;
+    Span<double> nSpan = childStats.N.Span;
+    Span<double> wSpan = childStats.W.Span;
+
+    // Diagnostic: entropy + max-Q-fraction of each batch allocation, plus running averages.
+    // H in [0,1]: 1 = uniform across children (most exploratory), 0 = all visits to one child.
+    // maxQ% in [0,1]: 1 = all visits went to the highest-Q non-pruned visited child.
+    int maxQIdx = FindMaxQChildIndex(nSpan, wSpan, numChildren);
+    double vanH = NormalizedEntropy(vanAlloc, numChildren);
+    double cbH = NormalizedEntropy(cbAlloc, numChildren);
+    double vanMaxQFrac = MaxQFraction(vanAlloc, maxQIdx, numChildren);
+    double cbMaxQFrac = MaxQFraction(cbAlloc, maxQIdx, numChildren);
+
+    s_DumpCmpCount++;
+    s_VanEntropySum += vanH;
+    s_CBEntropySum += cbH;
+    s_VanMaxQFracSum += vanMaxQFrac;
+    s_CBMaxQFracSum += cbMaxQFrac;
+
+    double cnt = s_DumpCmpCount;
+    Console.WriteLine($"[CBGPUCT] explore avg(n={s_DumpCmpCount}): "
+                    + $"vanilla(H={s_VanEntropySum / cnt:F3} maxQ%={s_VanMaxQFracSum / cnt * 100:F1})  "
+                    + $"cb(H={s_CBEntropySum / cnt:F3} maxQ%={s_CBMaxQFracSum / cnt * 100:F1})  "
+                    + $"this: van(H={vanH:F3} maxQ%={vanMaxQFrac * 100:F1}) cb(H={cbH:F3} maxQ%={cbMaxQFrac * 100:F1})");
+
+    // Find max valid (non-anomalous) vanilla score and Q across children, so those
+    // lines can show deltas relative to the best (much easier to scan at a glance).
+    double vanillaMax = double.NegativeInfinity;
+    double qMax = double.NegativeInfinity;
+    for (int i = 0; i < numChildren; i++)
+    {
+      double s = vanillaScores[i];
+      if (!double.IsNaN(s) && !double.IsInfinity(s) && Math.Abs(s) <= 99 && s > vanillaMax)
+      {
+        vanillaMax = s;
+      }
+      double n = nSpan[i];
+      if (n > 0)
+      {
+        double q = -wSpan[i] / n;
+        if (Math.Abs(q) <= 10 && q > qMax)
+        {
+          qMax = q;
+        }
+      }
+    }
+
+    // Aligned lines: per-child P (policy %), N (visits), Q (parent perspective; rel. to max),
+    // vanilla score (Q+U; rel. to max), valloc (visits vanilla would allocate this batch),
+    // CB-GPUCT visit-target deficit (raw), alloc (visits CB-GPUCT actually allocates this batch).
+    // Cells 8 chars wide; labels left-padded to 10 chars after "[CBGPUCT] " for alignment.
+    StringBuilder sbP       = new("[CBGPUCT] P:        ");
+    StringBuilder sbVisits  = new("[CBGPUCT] N:        ");
+    StringBuilder sbQ       = new("[CBGPUCT] Q:        ");
+    StringBuilder sbVan     = new("[CBGPUCT] vanilla : ");
+    StringBuilder sbVAlloc  = new("[CBGPUCT] valloc:   ");
+    StringBuilder sbDeficit = new("[CBGPUCT] deficit:  ");
+    StringBuilder sbAlloc   = new("[CBGPUCT] alloc:    ");
+    for (int i = 0; i < numChildren; i++)
+    {
+      sbP.Append(' ').Append(FormatPolicyCell(pSpan[i]));
+
+      double nVal = nSpan[i];
+      sbVisits.Append(' ').Append(FormatVisitsCell(nVal));
+
+      double qVal = nVal > 0 ? -wSpan[i] / nVal : 0;
+      sbQ.Append(' ').Append(FormatQRelToMaxCell(qVal, nVal, qMax));
+
+      sbVan.Append(' ').Append(FormatScoreRelToMaxCell(vanillaScores[i], vanillaMax));
+      sbVAlloc.Append(' ').Append(FormatVisitsCell(vanAlloc[i]));
+      sbDeficit.Append(' ').Append(FormatScoreCell(cbScores[i]));
+      sbAlloc.Append(' ').Append(FormatVisitsCell(cbAlloc[i]));
+    }
+    Console.WriteLine(sbP.ToString());
+    Console.WriteLine(sbVisits.ToString());
+    Console.WriteLine(sbQ.ToString());
+    Console.WriteLine(sbVan.ToString());
+    Console.WriteLine(sbVAlloc.ToString());
+    Console.WriteLine(sbDeficit.ToString());
+    Console.WriteLine(sbAlloc.ToString());
+  }
+
+
+  /// <summary>
+  /// Formats one score for the comparison dump as exactly 8 characters,
+  /// substituting markers for NaN/Infinity/anomalously-large values
+  /// (e.g. pruned root moves where W is set to double.MaxValue).
+  /// </summary>
+  /// <param name="s"></param>
+  /// <returns></returns>
+  private static string FormatScoreCell(double s)
+  {
+    if (double.IsNaN(s))
+    {
+      return "    NaN ";
+    }
+    if (double.IsInfinity(s))
+    {
+      return s > 0 ? "   +INF " : "   -INF ";
+    }
+    if (Math.Abs(s) > 99)
+    {
+      return s > 0 ? "  +HUGE " : "  -HUGE ";
+    }
+    return s.ToString("+0.000;-0.000").PadLeft(8);
+  }
+
+
+  // Running counters for the diagnostic header line. Plain (un-Interlocked)
+  // accumulation is fine for debug purposes: the dump fires only at the
+  // search root with the parent locked, so concurrent updates are unlikely
+  // and slight inaccuracy in the running average is tolerable.
+  private static long s_DumpCmpCount;
+  private static double s_VanEntropySum;
+  private static double s_CBEntropySum;
+  private static double s_VanMaxQFracSum;
+  private static double s_CBMaxQFracSum;
+
+
+  /// <summary>
+  /// Normalized entropy of a per-child visit allocation: -sum(p log p) / log(K).
+  /// Returns a value in [0, 1] where 1 = uniform spread across K children
+  /// (most exploratory) and 0 = all visits concentrated on a single child.
+  /// </summary>
+  /// <param name="alloc"></param>
+  /// <param name="numChildren"></param>
+  /// <returns></returns>
+  private static double NormalizedEntropy(Span<short> alloc, int numChildren)
+  {
+    int sum = 0;
+    for (int i = 0; i < numChildren; i++)
+    {
+      sum += alloc[i];
+    }
+    if (sum <= 1 || numChildren <= 1)
+    {
+      return 0;
+    }
+    double H = 0;
+    for (int i = 0; i < numChildren; i++)
+    {
+      if (alloc[i] > 0)
+      {
+        double p = (double)alloc[i] / sum;
+        H -= p * Math.Log(p);
+      }
+    }
+    double maxH = Math.Log(numChildren);
+    return maxH > 0 ? H / maxH : 0;
+  }
+
+
+  /// <summary>
+  /// Returns the index of the visited child with the highest parent-perspective Q
+  /// (excluding root-pruned children whose Q has been clamped). Returns -1 if no
+  /// such child exists (e.g. all children unvisited or pruned).
+  /// </summary>
+  /// <param name="nSpan"></param>
+  /// <param name="wSpan"></param>
+  /// <param name="numChildren"></param>
+  /// <returns></returns>
+  private static int FindMaxQChildIndex(Span<double> nSpan, Span<double> wSpan, int numChildren)
+  {
+    int maxIdx = -1;
+    double maxQ = double.NegativeInfinity;
+    for (int i = 0; i < numChildren; i++)
+    {
+      double n = nSpan[i];
+      if (n <= 0)
+      {
+        continue;
+      }
+      double q = -wSpan[i] / n;
+      if (Math.Abs(q) > 10)
+      {
+        continue;
+      }
+      if (q > maxQ)
+      {
+        maxQ = q;
+        maxIdx = i;
+      }
+    }
+    return maxIdx;
+  }
+
+
+  /// <summary>
+  /// Fraction of the per-child visit allocation that went to the max-Q child
+  /// (identified by maxQIdx). Returns 0 if no max-Q child or zero allocation.
+  /// </summary>
+  /// <param name="alloc"></param>
+  /// <param name="maxQIdx"></param>
+  /// <param name="numChildren"></param>
+  /// <returns></returns>
+  private static double MaxQFraction(Span<short> alloc, int maxQIdx, int numChildren)
+  {
+    if (maxQIdx < 0)
+    {
+      return 0;
+    }
+    int sum = 0;
+    for (int i = 0; i < numChildren; i++)
+    {
+      sum += alloc[i];
+    }
+    if (sum <= 0)
+    {
+      return 0;
+    }
+    return (double)alloc[maxQIdx] / sum;
+  }
+
+
+  /// <summary>
+  /// Formats a per-child policy probability as percent with 2 decimal places,
+  /// padded to exactly 8 characters.
+  /// </summary>
+  /// <param name="p"></param>
+  /// <returns></returns>
+  private static string FormatPolicyCell(double p)
+  {
+    return (p * 100.0).ToString("F2").PadLeft(8);
+  }
+
+
+  /// <summary>
+  /// Formats a per-child score as a delta relative to the max valid score across
+  /// children (blank when this cell IS the max). Anomalous values (NaN/INF/HUGE)
+  /// still get their distinctive markers. 8 chars wide.
+  /// </summary>
+  /// <param name="s"></param>
+  /// <param name="max"></param>
+  /// <returns></returns>
+  private static string FormatScoreRelToMaxCell(double s, double max)
+  {
+    if (double.IsNaN(s))
+    {
+      return "    NaN ";
+    }
+    if (double.IsInfinity(s))
+    {
+      return s > 0 ? "   +INF " : "   -INF ";
+    }
+    if (Math.Abs(s) > 99)
+    {
+      return s > 0 ? "  +HUGE " : "  -HUGE ";
+    }
+    if (double.IsNegativeInfinity(max) || s == max)
+    {
+      // No valid max (all anomalies) or this cell is the max - blank.
+      return "        ";
+    }
+    return (s - max).ToString("+0.000;-0.000").PadLeft(8);
+  }
+
+
+  /// <summary>
+  /// Formats a per-child visit count as exactly 8 characters; blank when N==0
+  /// (so unvisited children leave their column empty in the comparison dump).
+  /// </summary>
+  /// <param name="n"></param>
+  /// <returns></returns>
+  private static string FormatVisitsCell(double n)
+  {
+    if (n <= 0)
+    {
+      return "        ";
+    }
+    if (n > 99999999)
+    {
+      return "  +HUGE ";
+    }
+    return ((long)n).ToString().PadLeft(8);
+  }
+
+
+  /// <summary>
+  /// Formats a per-child Q (parent perspective) as exactly 8 characters; blank
+  /// when N==0 (Q is undefined for unvisited children); "  pruned" marker for
+  /// pruned root moves whose W was clamped to double.MaxValue.
+  /// </summary>
+  /// <param name="q"></param>
+  /// <param name="n"></param>
+  /// <returns></returns>
+  private static string FormatQCell(double q, double n)
+  {
+    if (n <= 0)
+    {
+      return "        ";
+    }
+    if (Math.Abs(q) > 10)
+    {
+      return "  pruned";
+    }
+    return q.ToString("0.000;-0.000").PadLeft(8);
+  }
+
+
+  /// <summary>
+  /// Like FormatQCell but shows the value as a delta vs the max valid Q across
+  /// children; blank when this cell IS the max (or when no valid max exists).
+  /// </summary>
+  /// <param name="q"></param>
+  /// <param name="n"></param>
+  /// <param name="max"></param>
+  /// <returns></returns>
+  private static string FormatQRelToMaxCell(double q, double n, double max)
+  {
+    if (n <= 0)
+    {
+      return "        ";
+    }
+    if (Math.Abs(q) > 10)
+    {
+      return "  pruned";
+    }
+    if (double.IsNegativeInfinity(max) || q == max)
+    {
+      return "        ";
+    }
+    return (q - max).ToString("+0.000;-0.000").PadLeft(8);
   }
 
   #endregion

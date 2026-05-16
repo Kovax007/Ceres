@@ -18,52 +18,51 @@ using System;
 
 #endregion
 
-namespace Ceres.MCGS.Search.Params
+namespace Ceres.MCGS.Search.Params;
+
+/// <summary>
+/// Attribute applied to options fields that adjust the runtime behavior of Ceres.
+/// </summary>
+public sealed class CeresOptionAttribute : Attribute
 {
   /// <summary>
-  /// Attribute applied to options fields that adjust the runtime behavior of Ceres.
+  /// Underlying data type
   /// </summary>
-  public sealed class CeresOptionAttribute : Attribute
+  public Type Type;
+
+  /// <summary>
+  /// Category into which this option follows
+  /// </summary>
+  public string Category;
+
+  /// <summary>
+  /// Short name of the attribute (used in command line settings)
+  /// </summary>
+  public string Name;
+
+  /// <summary>
+  /// Descriptive text
+  /// </summary>
+  public string Desc;
+
+  /// <summary>
+  /// Default value of the option (expressed as a string)
+  /// </summary>
+  public string Default;
+
+  /// <summary>
+  /// If the option is hidden by default
+  /// </summary>
+  public bool Hidden = false;
+
+  /// <summary>
+  /// If the option must be specified on the command line
+  /// </summary>
+  public bool Required = false;
+
+  // --------------------------------------------------------------------------------------------
+  public override string ToString()
   {
-    /// <summary>
-    /// Underlying data type
-    /// </summary>
-    public Type Type;
-
-    /// <summary>
-    /// Category into which this option follows
-    /// </summary>
-    public string Category;
-
-    /// <summary>
-    /// Short name of the attribute (used in command line settings)
-    /// </summary>
-    public string Name;
-
-    /// <summary>
-    /// Descriptive text
-    /// </summary>
-    public string Desc;
-
-    /// <summary>
-    /// Default value of the option (expressed as a string)
-    /// </summary>
-    public string Default;
-
-    /// <summary>
-    /// If the option is hidden by default
-    /// </summary>
-    public bool Hidden = false;
-
-    /// <summary>
-    /// If the option must be specified on the command line
-    /// </summary>
-    public bool Required = false;
-
-    // --------------------------------------------------------------------------------------------
-    public override string ToString()
-    {
-      return $"<CeresOptionAttribute {Category}-{Name} {Desc} Default={Default}";
-    }
+    return $"<CeresOptionAttribute {Category}-{Name} {Desc} Default={Default}";
   }
 }

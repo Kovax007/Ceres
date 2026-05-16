@@ -15,19 +15,19 @@
 
 using System;
 using System.Diagnostics;
+using System.Linq;
 
 using Ceres.Chess;
 using Ceres.Chess.EncodedPositions;
 
+using Ceres.MCGS.Graphs;
+using Ceres.MCGS.Graphs.GEdgeHeaders;
+using Ceres.MCGS.Graphs.GEdges;
+using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Managers;
+using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.PUCT;
-using Ceres.MCGS.Search.Coordination;
-
-using Ceres.MCGS.Graphs.GEdges;
-using Ceres.MCGS.Graphs.GEdgeHeaders;
-using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Graphs;
 
 #endregion
 
@@ -38,6 +38,14 @@ namespace Ceres.MCGS.Search.Strategies;
 /// </summary>
 public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
 {
+  internal const bool VERBOSE_ACTION_HEAD = false;
+
+  internal const bool ACTION_HEAD_CONSERVATIVE_RESORT_MODE = false;
+  // if the top policy move is conservatively ineligible for rearrangement
+  const bool ACTION_REARRANGE_PIN_TOP_POLICY_MOVE = ACTION_HEAD_CONSERVATIVE_RESORT_MODE;
+  const int MAX_SWAPS = ACTION_HEAD_CONSERVATIVE_RESORT_MODE ? 2 : 5;
+  internal const float ACTION_HEAD_FPU_VALUE = 0.10f;
+
   public ParamsSearch ParamsSearch => Engine.Manager.ParamsSearch;
   public ParamsSelect ParamsSelect => Engine.Manager.ParamsSelect;
 
@@ -94,57 +102,162 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
   /// <param name="node"></param>
   /// <param name="numTargetVisits"></param>
   /// <returns></returns>
-  internal override int NumChildrenToConsider(GNode node, int numTargetVisits) => node.NumEdgesExpanded + numTargetVisits;
+  internal override int NumChildrenToConsider(GNode node, int numTargetVisits) 
+    => node.NumEdgesExpanded + numTargetVisits;
 
 
-  void PossiblyRearrangeOrderUsingAction(GNode node, Graph graph, ParamsSearch paramsSearch, ParamsSelect paramsSelect)
+
+
+  /// <summary>
+  /// Reorders children (originally sorted by prior, index 0 = best prior)
+  /// by <paramref name="scores"/> descending, subject to the constraint that
+  /// no child moves more than <paramref name="d"/> positions from its prior rank.
+  /// Writes the resulting permutation (original indices) into <paramref name="result"/>.
+  /// </summary>
+  public static void SortDisplacementCapped(ReadOnlySpan<double> scores, int d, Span<int> result)
   {
-    // ************* DISABLED ***********
-    return;
-    // **********************************
+    int n = scores.Length;
+    if (result.Length != n)
+      throw new ArgumentException("result must have same length as scores", nameof(result));
+    if (d < 0)
+      throw new ArgumentOutOfRangeException(nameof(d));
 
-    float actionHeadSelectionWeight = paramsSearch.ActionHeadSelectionWeight;
+    // For small N (typical MCTS branching), a stack-allocated bool array
+    // avoids any heap allocation.
+    Span<bool> placed = n <= 256 ? stackalloc bool[n] : new bool[n];
+    placed.Clear();
+
+    for (int slot = 0; slot < n; slot++)
+    {
+      int lo = Math.Max(0, slot - d);
+      int hi = Math.Min(n - 1, slot + d);
+
+      // Deadline rule: any unplaced child i with i + d == slot MUST go now,
+      // otherwise it would violate its upper displacement bound next iteration.
+      int pick = -1;
+      int forcedIdx = slot - d; // the only i where i + d == slot
+      if (forcedIdx >= 0 && forcedIdx <= hi && !placed[forcedIdx])
+      {
+        pick = forcedIdx;
+      }
+      else
+      {
+        // Otherwise: pick the eligible unplaced child with the highest score.
+        // Ties break toward the lower index (earlier prior rank).
+        double bestScore = double.NegativeInfinity;
+        for (int i = lo; i <= hi; i++)
+        {
+          if (placed[i]) continue;
+          double s = scores[i];
+          if (s > bestScore)
+          {
+            bestScore = s;
+            pick = i;
+          }
+        }
+      }
+
+      placed[pick] = true;
+      result[slot] = pick;
+    }
+  }
+
+
+
+  /// <inheritdoc/>
+  internal override void PossiblyActionResortUnvisitedChildren(GNode node, Graph graph)
+  {
+    if (ParamsSelect.ActionResortUnvisitedChildren)
+    {
+      PossiblyActionResortUsingAction(node, graph, ParamsSearch, ParamsSelect);
+    }
+  }
+
+
+  void PossiblyActionResortUsingAction(GNode node, Graph graph, in ParamsSearch paramsSearch, in ParamsSelect paramsSelect)
+  {
+    const float MIN_PROBABILITY_FOR_ACTION_BOOST = 0;
+
+    Debug.Assert(node.N == 1);
+    if (paramsSelect.FPUMode != ParamsSelect.FPUType.ActionHead
+      || node.NumPolicyMoves < 2)
+    {
+      return;
+    }
 
     ref readonly GNodeStruct nodeRef = ref node.NodeRef;
 
     // If using action head and this is the first visit,
     // resort the children using the scores computed inclusive of the action head influence.
-    if (nodeRef.N == 1
-      //       && nodeRef.NInFlight == 0
-      //       && nodeRef.NInFlight1 == 0
-      && nodeRef.NumPolicyMoves > 1
-      && actionHeadSelectionWeight > 0)
-    {
-      //        if (nodeRef.NInFlight > 0 || nodeRef.NInFlight1 > 0)
-      //        {
-      //          throw new Exception("Internal error, unexpected state.");
-      //        }
 
-      // Compute scores for all children so we can sort based on that.
-      Span<double> scores = stackalloc double[nodeRef.NumPolicyMoves];
+    // Compute scores for all children so we can sort based on that.
+    Span<double> scores = stackalloc double[nodeRef.NumPolicyMoves];
+    PUCTSelector.ComputeTopChildScores(graph, node,
+                                       paramsSearch,
+                                       paramsSelect,
+                                       0,
+                                       false,
+                                       rootMovePruningStatus: null,
+                                       dualCollisionFraction: ParamsSearch.Execution.DualIteratorAlternateCollisionFraction,
+                                       minChildIndex: 0,
+                                       maxChildIndex: nodeRef.NumPolicyMoves - 1,
+                                       numTargetVisits: 0, // to indicate all
+                                       scores: scores,
+                                       childVisitCounts: default,// not needed
+                                       cpuctMultiplier: 1.0f,
+                                       temperatureMultiplier: 1.0f);
+
+    // Compute baseline scores (without ActionHead, using default FPU settings)
+    double[] baselineScores = null;
+    if (VERBOSE_ACTION_HEAD)
+    {
+      baselineScores = new double[nodeRef.NumPolicyMoves];
+      ParamsSelect defaultParams = new ParamsSelect();
       PUCTSelector.ComputeTopChildScores(graph, node,
                                          paramsSearch,
-                                         paramsSelect,
+                                         defaultParams,
                                          0,
                                          false,
                                          rootMovePruningStatus: null,
                                          dualCollisionFraction: ParamsSearch.Execution.DualIteratorAlternateCollisionFraction,
                                          minChildIndex: 0,
                                          maxChildIndex: nodeRef.NumPolicyMoves - 1,
-                                         numTargetVisits: 0, // to indicate all
-                                         scores: scores,
-                                         childVisitCounts: default,// not needed
+                                         numTargetVisits: 0,
+                                         scores: baselineScores,
+                                         childVisitCounts: default,
                                          cpuctMultiplier: 1.0f,
                                          temperatureMultiplier: 1.0f);
+    }
 
+    Span<GEdgeHeaderStruct> moveInfosSpan = node.EdgeHeadersSpan;
+
+    // Compute FEN for verbose output
+    string fen = VERBOSE_ACTION_HEAD ? node.CalcPosition().ToPosition.FEN : null;
+
+    if (MAX_SWAPS > 0)
+    {
+      if (ACTION_REARRANGE_PIN_TOP_POLICY_MOVE)
+      {
+        ApplyDisplacementCappedSort(scores[1..], moveInfosSpan[1..], MAX_SWAPS, MIN_PROBABILITY_FOR_ACTION_BOOST,
+                                    baselineScores != null ? baselineScores.AsSpan(1) : default,
+                                    nodeRef.V, nodeRef.UncertaintyValue, nodeRef.UncertaintyPolicy, fen);
+      }
+      else
+      {
+        ApplyDisplacementCappedSort(scores, moveInfosSpan, MAX_SWAPS, MIN_PROBABILITY_FOR_ACTION_BOOST,
+                                    baselineScores,
+                                    nodeRef.V, nodeRef.UncertaintyValue, nodeRef.UncertaintyPolicy, fen);
+      }
+    }
+    else
+    {
+      const double DIFF_THRESHOLD = 0.02;
 
       // Bubble sort to get items in same order as the scores.
-      const float MIN_PROBABILITY_FOR_ACTION_BOOST = 0.03f; // ****************** HARDCODED *****************
-
-      Span<GEdgeHeaderStruct> moveInfosSpan = node.EdgeHeadersSpan;
       int numSwapped;
       do
       {
+        // First slot is fixed, consider rearranging thereafter.
         numSwapped = 0;
         for (int i = 1; i < nodeRef.NumPolicyMoves; i++)
         {
@@ -154,7 +267,8 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
             break;
           }
 
-          if (scores[i] > scores[i - 1])
+          double scoreDiff = scores[i] - scores[i - 1];
+          if (scoreDiff > DIFF_THRESHOLD)
           {
             numSwapped++;
 
@@ -162,10 +276,125 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
             (scores[i - 1], scores[i]) = (scores[i], scores[i - 1]);
             (moveInfosSpan[i - 1], moveInfosSpan[i]) = (moveInfosSpan[i], moveInfosSpan[i - 1]);
           }
-
         }
       } while (numSwapped > 0);
     }
+  }
+
+
+  /// <summary>
+  /// Applies a displacement-capped sort to reorder moveInfosSpan based on scores,
+  /// ensuring no element moves more than maxDisplacement positions from its original index.
+  /// </summary>
+  private static void ApplyDisplacementCappedSort(Span<double> scores, Span<GEdgeHeaderStruct> moveInfosSpan,
+                                                  int maxDisplacement, float minProbabilityForBoost,
+                                                  ReadOnlySpan<double> baselineScores,
+                                                  float nodeV, float nodeUV, float nodeUP,
+                                                  string fen)
+  {
+    int n = scores.Length;
+
+    // Get the permutation from SortDisplacementCapped.
+    Span<int> permutation = stackalloc int[n];
+    SortDisplacementCapped(scores, maxDisplacement, permutation);
+
+    if (VERBOSE_ACTION_HEAD)
+    {
+      DumpActionHeadResortInfo(scores, moveInfosSpan, permutation, baselineScores, nodeV, nodeUV, nodeUP, fen);
+    }
+
+    // Apply the permutation to moveInfosSpan.
+    // Use a temporary buffer to hold the reordered elements.
+    Span<GEdgeHeaderStruct> temp = stackalloc GEdgeHeaderStruct[n];
+
+    for (int i = 0; i < n; i++)
+    {
+      temp[i] = moveInfosSpan[permutation[i]];
+    }
+
+    // Copy back to original span (only for elements with sufficient probability).
+    for (int i = 0; i < n; i++)
+    {
+      // Do not reorder low probability nodes.
+      if (temp[i].P < minProbabilityForBoost)
+      {
+        break;
+      }
+      moveInfosSpan[i] = temp[i];
+    }
+  }
+
+
+  /// <summary>
+  /// Dumps verbose information about action head resorting including:
+  /// - Baseline scores (default FPU mode, as from default ParamsSelect())
+  /// - Action head V values (raw neural network action head output)
+  /// - Action head scores (used for sorting)
+  /// - New positions after displacement-capped sort
+  /// </summary>
+  private static void DumpActionHeadResortInfo(ReadOnlySpan<double> scores,
+                                               ReadOnlySpan<GEdgeHeaderStruct> moveInfosSpan,
+                                               ReadOnlySpan<int> permutation,
+                                               ReadOnlySpan<double> baselineScores,
+                                               float nodeV, float nodeUV, float nodeUP,
+                                               string fen)
+  {
+    int n = scores.Length;
+
+    // Build reverse mapping: for each original index, what's its new position?
+    Span<int> newPositions = stackalloc int[n];
+    for (int newPos = 0; newPos < n; newPos++)
+    {
+      int origIdx = permutation[newPos];
+      newPositions[origIdx] = newPos;
+    }
+
+    // Copy data to arrays to avoid span-in-lambda issues
+    string[] moveStrs = new string[n];
+    double[] policies = new double[n];
+    double[] actionVValues = new double[n];
+    double[] actionHeadScores = new double[n];
+    double[] baselineScoresArray = new double[n];
+    int[] newPosArray = new int[n];
+
+    for (int i = 0; i < n; i++)
+    {
+      moveStrs[i] = moveInfosSpan[i].Move.ToString();
+      policies[i] = moveInfosSpan[i].P;
+#if ACTION_ENABLED
+      actionVValues[i] = moveInfosSpan[i].ActionV;
+#endif
+      actionHeadScores[i] = scores[i];
+      baselineScoresArray[i] = baselineScores.IsEmpty ? double.NaN : baselineScores[i];
+      newPosArray[i] = newPositions[i];
+    }
+
+    string FormatRow(string label, Func<int, string> valueFunc)
+    {
+      var values = Enumerable.Range(0, n).Select(i => valueFunc(i));
+      return $"{label,-25} " + string.Join(" ", values);
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"=== Action Head Resort (n={n}, V={nodeV:0.00}, UV={nodeUV:0.00}, UP={nodeUP:0.00}) {fen} ===");
+    Console.WriteLine(FormatRow("Moves:", i => moveStrs[i].PadLeft(6)));
+    Console.WriteLine(FormatRow("Policy:", i => (100 * policies[i]).ToString("0.0").PadLeft(5) + "%"));
+#if ACTION_ENABLED
+    Console.WriteLine(FormatRow("Action V:", i => actionVValues[i].ToString("0.00").PadLeft(6)));
+#endif
+    if (!baselineScores.IsEmpty)
+    {
+      Console.WriteLine(FormatRow("Scores (baseline):", i => baselineScoresArray[i].ToString("0.00").PadLeft(6)));
+    }
+    Console.WriteLine(FormatRow("Scores (ActionHead):", i => actionHeadScores[i].ToString("0.00").PadLeft(6)));
+//    Console.WriteLine(FormatRow("Original position:", i => i.ToString().PadLeft(6)));
+    Console.WriteLine(FormatRow("New position:", i =>
+    {
+      int delta = newPosArray[i] - i;
+      if (delta == 0) return "      ";
+      return (delta > 0 ? $"+{delta}" : delta.ToString()).PadLeft(6);
+    }));
+    Console.WriteLine();
   }
 
 
@@ -250,8 +479,6 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
                                                        out Span<double> childScores)
   {
     CheckThreadStaticsInitialized();
-
-    PossiblyRearrangeOrderUsingAction(parentNode, Engine.Graph, ParamsSearch, ParamsSelect);
 
     // Allocate space to hold visit counts/scores at this level (if not already allocated).
     if (childVisitCountsArray[depth] == null)
@@ -367,6 +594,49 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
       // Q should have already been set and will not change.
       Debug.Assert(node.Q >= 0.995);
     }
+    else if (ParamsSelect.CBGPUCTBackupActive)
+    {
+      // CB-GPUCT regularized backup: store V_bar (Grill reverse-KL) directly as Q.
+      // The existing edge.QChild refresh path then propagates it upward unchanged.
+      // deltaW is intentionally ignored: V_bar is recomputed from current child stats.
+      double vBar = CBGPUCTScoreCalc.ComputeVBar(node, ParamsSelect);
+
+      if (MCGSParamsFixed.DEBUG_CBGPUCT)
+      {
+        // Fair vanilla comparison: visit-weighted child Q (parent perspective) plus self V.
+        int nc = node.NumEdgesExpanded;
+        double sumChildN = 0;
+        double sumChildW = 0;
+        for (int i = 0; i < nc; i++)
+        {
+          GEdge edge = node.ChildEdgeAtIndex(i);
+          sumChildN += edge.N;
+          sumChildW += -edge.Q * edge.N;
+        }
+        double vanillaQ = (sumChildW + node.NodeRef.V) / (sumChildN + 1);
+
+        // Suppress trace when V_bar essentially matches the vanilla visit-weighted Q
+        // (most backups when the regularization isn't shifting Q meaningfully).
+        const double MIN_DELTA_TO_LOG = 0.25;
+        if (Math.Abs(vBar - vanillaQ) > MIN_DELTA_TO_LOG)
+        {
+          double lambdaN = (nc == 0 || sumChildN == 0)
+            ? 0
+            : CBGPUCTScoreCalc.ComputeLambdaNForBackup(ParamsSelect, sumChildN, nc);
+          Console.WriteLine($"[CBGPUCT] V_bar node=#{node.Index.Index} N={node.N} expanded={nc} "
+                          + $"sumChildN={sumChildN:F0} lambda_N={lambdaN:F4} "
+                          + $"V_bar={vBar:+0.0000;-0.0000} vanilla_Q={vanillaQ:+0.0000;-0.0000} "
+                          + $"delta={(vBar - vanillaQ):+0.0000;-0.0000}");
+        }
+      }
+
+      node.NodeRef.Q = vBar;
+
+      // Update D using running average (unchanged from standard backup).
+      double oldDSum = node.D * startN;
+      double newDSum = oldDSum + deltaD;
+      node.NodeRef.D = newDSum / (startN + deltaN);
+    }
     else
     {
       double oldWPure = node.ComputeQPure() * startN;
@@ -374,22 +644,25 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
       double newQPure = newWPure / (startN + deltaN);
 
       node.ResetNodeQUsingNewQPure(newQPure, refreshSiblingDuringBackupToNode);
+
+      // Update D using running average.
+      double oldDSum = node.D * startN;
+      double newDSum = oldDSum + deltaD;
+      node.NodeRef.D = newDSum / (startN + deltaN);
     }
 
 #if DEBUG
-    int count = 0;
-    for (int i=0;i<node.NumEdgesExpanded;i++)
+    // Skip in CB-GPUCT graph-aware mode: edge.N there caches child.N (cross-parent),
+    // not the per-edge visit count, so this invariant intentionally no longer holds.
+    if (!ParamsSelect.CBGPUCTSelectActive || !ParamsSelect.CBGPUCT_GraphAwareDeficit)
     {
-      count += node.ChildEdgeAtIndex(i).N;
+      int count = 0;
+      for (int i=0;i<node.NumEdgesExpanded;i++)
+      {
+        count += node.ChildEdgeAtIndex(i).N;
+      }
+      Debug.Assert(node.N == count + (node.NodeRef.Terminal.IsTerminal() ? node.N : 1));
     }
-    Debug.Assert(node.N == count + (node.Terminal.IsTerminal() ? node.N : 1));
-#endif
-#if NOT
-    // Update D.
-    // TODO - needs implementation
-    double newDSum = (oldN == 0 ? 0 : oldDSum) + deltaD;
-    double newD = newDSum / (oldN + deltaN);
-    node.NodeRef.D = newD;
 #endif
   }
 
@@ -425,10 +698,24 @@ public sealed class MCGSStrategyPUCT : MCGSSelectBackupStrategyBase
       edge.AddUpdateSample(priorMean, newQChild);
     }
 
-    // The N on edges represents the number of visits along this path to the child node,
-    // independent of total visits to the child (some of which may have arisen via other parents).
-    // (see: https://github.com/lightvector/KataGo/blob/master/docs/GraphSearch.md).
-    edge.N += deltaN;
+    // Default: edge.N is per-edge visit count (visits along this path to the child).
+    // CB-GPUCT graph-aware mode: edge.N caches the destination node's total N (a slightly
+    // stale snapshot taken at this parent's most recent backup; cross-parent visits to
+    // the same child between this parent's backups are not reflected). This avoids the
+    // per-child node deref during gather. childNode.N has already been updated by the
+    // BackupToNode call earlier in the backup chain, so the snapshot is fresh here.
+    // Terminal edges have no destination node (childNode is null), so fall back to
+    // the increment semantic for those - matches the guard pattern used by
+    // PropagateQChangesUpward below.
+    if (ParamsSelect.CBGPUCTSelectActive && ParamsSelect.CBGPUCT_GraphAwareDeficit
+        && edge.Type == GEdgeStruct.EdgeType.ChildEdge)
+    {
+      edge.N = edge.ChildNode.NodeRef.N;
+    }
+    else
+    {
+      edge.N += deltaN;
+    }
     edge.QChild = newQChild;
 
     // Note that the assertion on edge N and child N

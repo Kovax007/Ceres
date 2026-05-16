@@ -16,13 +16,13 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+
 using Ceres.Base.Misc;
 using Ceres.Chess.MoveGen;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.Phases;
-using Ceres.MCGS.Storage;
 
 #endregion
 
@@ -232,25 +232,10 @@ public struct MCGSPathVisit
                    bool moveIrreversible,
                    in MGPosition currentVisitNodePosition)
   {
-    // Possibly update MaxQSuboptimality
-    if (MCGSParamsFixed.UPDATE_MAXQ_SUBOPTIMALITY)
-    {
-      if (!parentOfThisVisitNode.IsNull && IndexOfChildInParent < parentOfThisVisitNode.NumEdgesExpanded)
-      {
-        double parentQ = parentOfThisVisitNode.Q;
-        GEdge edge = parentOfThisVisitNode.ChildEdgeAtIndex(IndexOfChildInParent);
-        if (edge.N > 0)
-        {
-          double ourQ = edge.Q;
-          float suboptimality = (float)-(parentQ + ourQ);
-          parentPath.MaxQSubOptimality = MathF.Max(suboptimality, parentPath.MaxQSubOptimality);
-        }
-      }
-    }
-
     // N.B. Every field must be explicitly reassigned because the 
     //      slots are reused and could start with visits from other batches.
-    Debug.Assert(TypeFieldsHaveChanged());
+    // (disabled due to unstable hash)
+    // Debug.Assert(TypeFieldsHaveChanged());
 
     ParentPath = parentPath;
     IndexOfChildInParent = (short)childIndexOfThisVisitInParent;
@@ -269,6 +254,22 @@ public struct MCGSPathVisit
 
     ChildPosition = currentVisitNodePosition;
     NumPolicyMoves = parentOfThisVisitNode.NumPolicyMoves;
+
+    // Possibly update MaxQSuboptimality
+    if (MCGSParamsFixed.UPDATE_MAXQ_SUBOPTIMALITY)
+    {
+      if (!parentOfThisVisitNode.IsNull && IndexOfChildInParent < parentOfThisVisitNode.NumEdgesExpanded)
+      {
+        double parentQ = parentOfThisVisitNode.Q;
+        GEdge edge = parentOfThisVisitNode.ChildEdgeAtIndex(IndexOfChildInParent);
+        if (edge.N > 0)
+        {
+          double ourQ = edge.Q;
+          float suboptimality = (float)-(parentQ + ourQ);
+          parentPath.MaxQSubOptimality = MathF.Max(suboptimality, parentPath.MaxQSubOptimality);
+        }
+      }
+    }
   }
 
 

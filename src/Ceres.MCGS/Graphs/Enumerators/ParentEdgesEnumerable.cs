@@ -28,42 +28,40 @@
 
 using System.Diagnostics;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Storage;
 
 
 #endregion
 
-namespace Ceres.MCGS.Graphs.Enumerators
+namespace Ceres.MCGS.Graphs.Enumerators;
+
+/// <summary>
+/// Enumerable over the parent edges of a specified node.
+/// </summary>
+public ref struct ParentEdgesEnumerable
 {
   /// <summary>
-  /// Enumerable over the parent edges of a specified node.
+  /// Parent graph.
   /// </summary>
-  public ref struct ParentEdgesEnumerable
+  public readonly Graph Graph;
+
+  /// <summary>
+  /// Index of the child node whose parents are being enumerated.
+  /// </summary>
+  public readonly NodeIndex ChildIndex;
+
+
+  /// <summary>
+  /// Constructor.
+  /// </summary>
+  /// <param name="graph"></param>
+  /// <param name="childNodeIndex"></param>
+  public ParentEdgesEnumerable(Graph graph, NodeIndex childNodeIndex)
   {
-    /// <summary>
-    /// Parent graph.
-    /// </summary>
-    public readonly Graph Graph;
+    Debug.Assert(childNodeIndex != default);
 
-    /// <summary>
-    /// Index of the child node whose parents are being enumerated.
-    /// </summary>
-    public readonly NodeIndex ChildIndex;
-
-
-    /// <summary>
-    /// Constructor.
-    /// </summary>
-    /// <param name="graph"></param>
-    /// <param name="childNodeIndex"></param>
-    public ParentEdgesEnumerable(Graph graph, NodeIndex childNodeIndex)
-    {
-      Debug.Assert(childNodeIndex != default);
-
-      this.Graph = graph;
-      this.ChildIndex = childNodeIndex;
-    }
-
-    public ParentEdgesEnumerator GetEnumerator() => new ParentEdgesEnumerator(Graph, ChildIndex);
+    this.Graph = graph;
+    this.ChildIndex = childNodeIndex;
   }
+
+  public ParentEdgesEnumerator GetEnumerator() => new ParentEdgesEnumerator(Graph, ChildIndex);
 }

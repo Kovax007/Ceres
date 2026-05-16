@@ -16,35 +16,56 @@
 using System;
 using System.Runtime;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Ceres.Base.Environment;
 using Ceres.Base.OperatingSystem;
 using Ceres.Chess.Diagnostics;
 
 #endregion
 
-namespace Ceres.MCGS.Environment
+namespace Ceres.MCGS.Environment;
+
+/// <summary>
+/// Manages initialization of the MCGS engine.
+/// </summary>
+public static class MCGSEngineInitialization
 {
   /// <summary>
-  /// Manages initialization of the MCGS engine.
+  /// Lock object to ensure thread-safe initialization.
   /// </summary>
-  public static class MCGSEngineInitialization
+  private static readonly object initializationLock = new();
+
+  /// <summary>
+  /// Flag indicating if initialization has been completed.
+  /// </summary>
+  private static volatile bool isInitialized = false;
+
+  /// <summary>
+  /// Performs base initialization of the MCGS engine.
+  /// This method is thread-safe and will only perform initialization once.
+  /// </summary>
+  /// <param name="launchMonitor">If true, launches a performance monitor</param>
+  /// <param name="numaNode">NUMA node to use</param>
+  public static void BaseInitialize(bool launchMonitor = false, int numaNode = 0)
   {
-    public static void BaseInitialize(bool launchMonitor, int numaNode)
+    // Quick check without lock for performance (double-checked locking pattern)
+    if (isInitialized)
     {
+      return;
+    }
+
+    lock (initializationLock)
+    {
+      // Check again inside lock to handle race condition
+      if (isInitialized)
+      {
+        return;
+      }
+
       HardwareManager.VerifyHardwareSoftwareCompatability();
 
-      // On .NET 6 the spin count for sempahores is directly configurable.
-      // Because most of the Ceres multithreading is not extremely fine grained,
-      // the awaited event almost always happens later than the default spinning period.
-      // Therefore it is better to use a short spin and save the CPU cycles.
-      // This reduces reported CPU time by about 15% to 20% with no slowdown.
-      // For .NET 6.0: see WorkerThread.cs, default was 70: AppContextConfigHelper.GetInt32Config("System.Threading.ThreadPool.UnfairSemaphoreSpinLimit", 70, false)
-      // (see for how to set this option: https://www.strathweb.com/2019/12/runtime-host-configuration-options-and-appcontext-data-in-net-core/)
-      AppDomain.CurrentDomain.SetData("System.Threading.ThreadPool.UnfairSemaphoreSpinLimit", 5);
-
-      // TODO: consider using SustainedLowLatency when running under timed time control
-      GCSettings.LatencyMode = GCLatencyMode.Batch;
-
+      // TODO: consider setting GCSettings.LatencyMode to
+      //       SustainedLowLatency when running under tight time constrints
 
       HardwareManager.Initialize(numaNode);
 
@@ -55,11 +76,14 @@ namespace Ceres.MCGS.Environment
         EventSourceCeres.LaunchConsoleMonitor("Ceres.MCGS.Environment.MCGSEventSource");
       }
 
-//      MCGSEventSource.Initialize();
-    }
+      //      MCGSEventSource.Initialize();
 
+      isInitialized = true;
+    }
   }
 
+  /// <summary>
+  /// Returns true if initialization has been completed.
+  /// </summary>
+  public static bool IsInitialized => isInitialized;
 }
-
-

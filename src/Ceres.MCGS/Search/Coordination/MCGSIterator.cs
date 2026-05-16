@@ -18,20 +18,20 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
-
+using Ceres.Base.DataTypes;
 using Ceres.Base.Math;
 using Ceres.Base.Misc;
 
 using Ceres.Chess;
 using Ceres.Chess.MoveGen;
-
-using Ceres.MCGS.Graphs;
+using Ceres.MCGS.Graphs.Enumerators;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.PathEvaluators;
 using Ceres.MCGS.Search.Paths;
 using Ceres.MCGS.Search.Phases;
+using Ceres.MCGS.Search.Phases.Evaluation;
 using Ceres.MCGS.Search.Strategies;
 
 #endregion
@@ -236,6 +236,13 @@ public class MCGSIterator : IDisposable
   /// </summary>
   public float AvgPathDepth => (float)PathsSet.SumNonAbortedPathVisits / PathsSet.CountNonAbortedPathVisits;
 
+  /// <summary>
+  /// Fraction of node selection attempts that yielded a usable node.
+  /// </summary>
+  public float NodeSelectionYieldFrac => PathsSet.CountTotalPathsAttempted == 0
+                                       ? 0
+                                       : (float)PathsSet.CountNonAbortedPathVisits / (float)PathsSet.CountTotalPathsAttempted;
+
 
   /// <summary>
   /// Runs the iteration loop.
@@ -322,7 +329,7 @@ public class MCGSIterator : IDisposable
     pathVisitPool.Clear(false);
 
    // Determine the backup mode to actually be used for this batch
-   // (based on ParamsSearch setting and also tree state).
+   // (based on ParamsSearch setting and also graph state).
    // The select and backup phases will both adjust their behavior based on this.
    BackupMode = Engine.Backup.BackupModeToUse();
 
@@ -436,7 +443,7 @@ public class MCGSIterator : IDisposable
     {
       if (Manager.ParamsSearch.Execution.DualOverlappedIterators && Engine.SearchRootNode.N >= MCGSParamsFixed.MIN_N_START_OVERLAP)
       {
-        throw new Exception("Probably not possible to validate tree while another overlapping executor is possibly active");
+        throw new Exception("Probably not possible to validate graph while another overlapping executor is possibly active");
       }
       Engine.Graph.Validate(false);
       ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "Validated graph " + Engine.SearchRootNode.N);
@@ -471,42 +478,46 @@ public class MCGSIterator : IDisposable
   /// <param name="hardMaxRootN"></param>
   private void PossiblyRunSecondSelectionForNNBatchSizePadding(int batchSize, int hardMaxRootN)
   {
-    int rootN = Engine.SearchRootNode.N;
-    int positionsBeforeHardBatchLimit = hardMaxRootN - (rootN + batchSize + Engine.numVisitsInFlight);
     int nnBatchSizeAlignmentTarget = Manager.ParamsSearch.Execution.NNBatchSizeAlignmentTarget;
-
-    // Scale down for small N
-    if (rootN < 50)
-    {
-      nnBatchSizeAlignmentTarget /= 4;
-    }
-    else if (rootN < 100)
-    {
-      nnBatchSizeAlignmentTarget /= 2;
-    }
-
-    if (rootN < nnBatchSizeAlignmentTarget * 8 // graph not large relative to possible alignment
-     || nnBatchSizeAlignmentTarget == 0        // feature not enabled
-     || IsApproachingMaxPathCapacity)          // avoid overflowing batch
-    {
-      return;
-    }
 
     if (nnBatchSizeAlignmentTarget > 0)
     {
-      int numNNPaths = PathsSet.NNPaths.Count;
-      int numNNPathsBeyondPriorAlignmentPoint = numNNPaths % nnBatchSizeAlignmentTarget;
+      int rootN = Engine.SearchRootNode.N;
+      int positionsBeforeHardBatchLimit = hardMaxRootN - (rootN + batchSize + Engine.numVisitsInFlight);
 
-      if (numNNPaths < 196 // already large batches won't benefit much from padding (and expensive to RunSelectionPhase)
-       && numNNPathsBeyondPriorAlignmentPoint != 0 // not already aligned
-       && numNNPathsBeyondPriorAlignmentPoint <= (nnBatchSizeAlignmentTarget / 2)// not already half the way to next alignment point
-       && rootN > nnBatchSizeAlignmentTarget * 5 // graph size large relative to possible increment in batch size 
-       && numAllocatedPaths < Engine.Manager.ParamsSearch.Execution.MaxBatchSize - nnBatchSizeAlignmentTarget * 2) // not close to max batch size
+      // Scale down for small N
+      if (rootN < 50)
       {
-        int numFiller = (int)MathUtils.RoundedUp(numNNPaths, nnBatchSizeAlignmentTarget) - numNNPaths;
-        numFiller = numFiller + numFiller / 3; // take a chance of over-requesting because typically some significant fraction of selected will be non-NN paths
-        int newBatchSizeTarget = numAllocatedPaths + numFiller;
-        RunSelectionPhase(newBatchSizeTarget);
+        nnBatchSizeAlignmentTarget /= 4;
+      }
+      else if (rootN < 100)
+      {
+        nnBatchSizeAlignmentTarget /= 2;
+      }
+
+      if (rootN < nnBatchSizeAlignmentTarget * 8 // graph not large relative to possible alignment
+       || nnBatchSizeAlignmentTarget == 0        // feature not enabled
+       || IsApproachingMaxPathCapacity)          // avoid overflowing batch
+      {
+        return;
+      }
+
+      if (nnBatchSizeAlignmentTarget > 0)
+      {
+        int numNNPaths = PathsSet.NNPaths.Count;
+        int numNNPathsBeyondPriorAlignmentPoint = numNNPaths % nnBatchSizeAlignmentTarget;
+
+        if (numNNPaths < 196 // already large batches won't benefit much from padding (and expensive to RunSelectionPhase)
+         && numNNPathsBeyondPriorAlignmentPoint != 0 // not already aligned
+         && numNNPathsBeyondPriorAlignmentPoint <= (nnBatchSizeAlignmentTarget / 2)// not already half the way to next alignment point
+         && rootN > nnBatchSizeAlignmentTarget * 5 // graph size large relative to possible increment in batch size 
+         && numAllocatedPaths < Engine.Manager.ParamsSearch.Execution.MaxBatchSize - nnBatchSizeAlignmentTarget * 2) // not close to max batch size
+        {
+          int numFiller = (int)MathUtils.RoundedUp(numNNPaths, nnBatchSizeAlignmentTarget) - numNNPaths;
+          numFiller = numFiller + numFiller / 3; // take a chance of over-requesting because typically some significant fraction of selected will be non-NN paths
+          int newBatchSizeTarget = numAllocatedPaths + numFiller;
+          RunSelectionPhase(newBatchSizeTarget);
+        }
       }
     }
   }
@@ -558,7 +569,7 @@ public class MCGSIterator : IDisposable
       DoWriteLine(i++ + " " + found + " #" + currentNode.Index + " " + currentNode.CalcPosition().ToPosition.FEN);
       priorPositionsNode2[currentNode.CalcPosition()] = currentNode;
 
-      var enumer = currentNode.ParentEdges.GetEnumerator();
+      ParentEdgesEnumerator enumer = currentNode.ParentEdges.GetEnumerator();
       enumer.MoveNext();
       GEdge parentEdge = enumer.Current;
       
@@ -760,7 +771,7 @@ public class MCGSIterator : IDisposable
           ref readonly GEdge pathEdge = ref visitiRef.PathVisitRef.ParentChildEdge;
           if (pathEdge.Type == GEdgeStruct.EdgeType.ChildEdge)
           {
-            byte lockValue = pathEdge.ChildNode.NodeRef.LockRef.state;
+            byte lockValue = pathEdge.ChildNode.NodeRef.LockRef.StateRaw;
 
             if (pathEdge.ChildNode.IsLocked)
             {

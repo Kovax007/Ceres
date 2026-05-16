@@ -20,8 +20,6 @@ using System.Threading;
 using Ceres.Base.OperatingSystem;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Graphs.GraphStores;
-using Ceres.MCGS.Storage;
-using Ceres.MCGS.Storage.Structs;
 
 #endregion
 
@@ -67,10 +65,6 @@ public class GEdgeStore
   /// </summary>
   internal int nextFreeBlockIndex = 1; // never allocate index 0 (null node)
 
-  const string SharedMemChildrenName = GraphStoreConfig.STORAGE_USE_EXISTING_SHARED_MEM
-                                        ? "CeresSharedVisitEdge"
-                                        : null;
-
   /// <summary>
   /// Low-level operating system data structure holding children nodes.
   /// </summary>
@@ -84,11 +78,10 @@ public class GEdgeStore
   // Added constant for extra items to meet the minimum extra buffer size requirement.
   private const int BUFFER_EXTRA_ITEMS = 16384; // Ensure at least 256 kbytes extra (256*1024 bytes)
 
-  internal void CopyEntries(int sourceBlockIndex, int destinationBlockIndex, int numChildren)
-    => edgeStoreMemoryBuffer.CopyEntries(sourceBlockIndex * (long)NUM_EDGES_PER_BLOCK,
-                                 destinationBlockIndex * (long)NUM_EDGES_PER_BLOCK,
-                                 numChildren);
-
+  internal void CopyBlockedEntires(int sourceBlockIndex, int destinationBlockIndex, int numBlocks)
+      => edgeStoreMemoryBuffer.CopyEntries(sourceBlockIndex, destinationBlockIndex,  numBlocks);
+      
+     
 
   /// <summary>
   /// Maximum number of children which this child store is configured to hold.
@@ -110,11 +103,8 @@ public class GEdgeStore
     parentStore.DebugLogInfo($"GEdgeStore: Allocating {MaxChildren} edges, tryEnableLargePages={tryEnableLargePages}.");
 
     edgeStoreMemoryBuffer = new MemoryBufferOS<GEdgeStructBlocked>(
-                                MaxChildren / NUM_EDGES_PER_BLOCK,
-                                tryEnableLargePages,
-                                SharedMemChildrenName,
-                                GraphStoreConfig.STORAGE_USE_EXISTING_SHARED_MEM,
-                                GraphStoreConfig.STORAGE_USE_INCREMENTAL_ALLOC);
+                                MaxChildren / NUM_EDGES_PER_BLOCK, 
+                                tryEnableLargePages, null, false, GraphStoreConfig.STORAGE_USE_INCREMENTAL_ALLOC);
   }
 
 

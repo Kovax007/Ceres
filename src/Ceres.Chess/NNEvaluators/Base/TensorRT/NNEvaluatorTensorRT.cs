@@ -14,12 +14,15 @@
 #region Using directives
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Numerics.Tensors;
 using System.Threading.Tasks;
 using Ceres.Base.CUDA;
 using Ceres.Base.DataTypes;
+using Ceres.Base.Math;
 using Ceres.Base.Threading;
 using Ceres.Chess.EncodedPositions;
 using Ceres.Chess.EncodedPositions.Basic;
@@ -51,6 +54,13 @@ public class NNEvaluatorTensorRT : NNEvaluator
 {
   const bool USE_HISTORY = true;
   const bool SUBSTITUTE_VALUE3_INTO_VALUE2_IF_FOUND = false;
+
+  // NaN-in-output handling: count every occurrence but only log to Console
+  // at most once every NAN_LOG_MIN_INTERVAL_SECONDS (cumulative total included).
+  const int NAN_LOG_MIN_INTERVAL_SECONDS = 5 * 60;
+  static long nanOccurrenceCount;
+  static long nanLastLoggedTicks;
+  static readonly object nanLogLock = new();
 
   /// <summary>
   /// If true, loads TensorRT engines in parallel across GPUs.
@@ -86,6 +96,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private int value2Size;
   private int value3Size;
   private int policySize;
+  private int policy2Size;
   private int mlhSize;
   private int uncVSize;
   private int uncPSize;
@@ -95,6 +106,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private int value2TensorIndex;
   private int value3TensorIndex;
   private int policyTensorIndex;
+  private int policy2TensorIndex = -1;
   private int mlhTensorIndex;
   private int uncVTensorIndex;
   private int uncPTensorIndex;
@@ -102,6 +114,9 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private int pieceCaptureTensorIndex = -1;
   private int punimSelfTensorIndex = -1;
   private int punimOpponentTensorIndex = -1;
+  private int qDevLowerTensorIndex = -1;
+  private int qDevUpperTensorIndex = -1;
+  private int actionTensorIndex = -1;
 
   // Per-position sizes for ply-bin tensors
   private int pieceMoveSizePerPos;
@@ -112,6 +127,15 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private int punimSelfSizePerPos;
   private int punimOpponentSizePerPos;
   private bool hasPunimOutputs;
+
+  // Per-position sizes for Q deviation tensors
+  private int qDevLowerSize;
+  private int qDevUpperSize;
+  private bool hasQDeviation;
+
+  // Per-position size for action tensor (TPGRecord.MAX_MOVES * 3 elements per position)
+  private int actionSizePerPos;
+  private readonly bool hasAction;
 
   private readonly int inputElementsPerPosition;
   private readonly int outputElementsPerPosition;
@@ -149,7 +173,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private FP16[] mBuffer;
   private FP16[] uncVBuffer;
   private FP16[] uncPBuffer;
+  private FP16[] extraStat0Buffer;
+  private FP16[] extraStat1Buffer;
   private CompressedPolicyVector[] policiesBuffer;
+  private CompressedPolicyVector[] policies2Buffer;
+  private CompressedActionVector[] actionsBuffer;
   private ParallelOptions cachedParallelOptions;
 
   // Network capabilities (determined from output tensors)
@@ -158,6 +186,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
   private readonly bool hasUncertaintyV;
   private readonly bool hasUncertaintyP;
   private readonly bool hasValueSecondary;
+  private readonly bool hasPolicySecondary;
 
   // Warmup tracking (static lock ensures only one Warmup runs at a time across all instances)
   private bool haveWarmedUp;
@@ -175,10 +204,16 @@ public class NNEvaluatorTensorRT : NNEvaluator
   public override bool HasUncertaintyP => hasUncertaintyP;
 
   /// <inheritdoc/>
-  public override bool HasAction => false;
+  public override bool HasAction => hasAction;
 
   /// <inheritdoc/>
   public override bool HasValueSecondary => hasValueSecondary;
+
+  /// <inheritdoc/>
+  public override bool HasPolicySecondary => hasPolicySecondary;
+
+  /// <inheritdoc/>
+  public override bool SupportsAdvancedPolicyFeatures => true;
 
   /// <inheritdoc/>
   public override int MaxBatchSize => maxBatchSize;
@@ -233,7 +268,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
                              int softMaxBatchSize = 0,
                              int optimizationLevel = 3,
                              bool forceBF16 = false,
-                             bool refittable = false)
+                             bool refittable = false,
+                             int fp32AllNormsOverride = -1)
   {
     if (!File.Exists(onnxFileName))
     {
@@ -290,6 +326,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
       options.UseFP16 = 1;
       options.UseBF16 = 0;
       options.FP32PostAttentionNorm = 1;
+      options.FP32Softmax = 1;
+      options.FP32AllNorms = 3; // scope 3 = smolgen norms only (sufficient, zero perf cost)
 
       // NOTE: BF16 is best on datacenter cards (works for all nets, no upcasting required)
       //       Consumer cards can use FP32+post attention norm which is high accuraacy for most nets
@@ -307,6 +345,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
       options.FP32PostAttentionNorm = 0;
       options.FP32PostAttentionNormStrict = 0;
       options.FP32SmolgenNorm = 0;
+      options.FP32Softmax = 0;
+      options.FP32AllNorms = 0;
     }
 
     if (refittable)
@@ -314,9 +354,14 @@ public class NNEvaluatorTensorRT : NNEvaluator
       options.Refittable = 1;
     }
 
+    if (fp32AllNormsOverride >= 0)
+    {
+      options.FP32AllNorms = fp32AllNormsOverride;
+    }
+
     options.Validate();
 
-    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, UseCUDAGraphs={options.UseCudaGraphs}");
+    Console.WriteLine($"  Build options: FP16={options.UseFP16}, BF16={options.UseBF16}, FP32PostAttentionNorm={options.FP32PostAttentionNorm}, FP32Softmax={options.FP32Softmax}, FP32AllNorms={options.FP32AllNorms}, UseCUDAGraphs={options.UseCudaGraphs}");
 
     const int MIN_BATCH_SIZE_PER_GPU = 6;
     pool = new MultiGPUEnginePool(trt, onnxFileName, effectiveSizesPerGPU, poolMode, options, 0, 0, GpuIDs, MIN_BATCH_SIZE_PER_GPU, cacheDir);
@@ -365,6 +410,10 @@ public class NNEvaluatorTensorRT : NNEvaluator
           policyTensorIndex = tensorIndex;
           policySize = sizePerPos;
           break;
+        case "policy2":
+          policy2TensorIndex = tensorIndex;
+          policy2Size = sizePerPos;
+          break;
         case "mlh":
           mlhTensorIndex = tensorIndex;
           mlhSize = sizePerPos;
@@ -376,6 +425,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
           uncVSize = sizePerPos;
           break;
         case "uncertainty_p":
+        case "uncertainty_policy":
         case "unc_p":
           uncPTensorIndex = tensorIndex;
           uncPSize = sizePerPos;
@@ -396,6 +446,19 @@ public class NNEvaluatorTensorRT : NNEvaluator
           punimOpponentTensorIndex = tensorIndex;
           punimOpponentSizePerPos = sizePerPos;
           break;
+        case "q_deviation_lower":
+        case "q_deviation_loser":
+          qDevLowerTensorIndex = tensorIndex;
+          qDevLowerSize = sizePerPos;
+          break;
+        case "q_deviation_upper":
+          qDevUpperTensorIndex = tensorIndex;
+          qDevUpperSize = sizePerPos;
+          break;
+        case "action":
+          actionTensorIndex = tensorIndex;
+          actionSizePerPos = sizePerPos;
+          break;
       }
       tensorIndex++;
     }
@@ -405,8 +468,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
     hasUncertaintyV = uncVSize > 0;
     hasUncertaintyP = uncPSize > 0;
     hasValueSecondary = value2Size > 0 || (SUBSTITUTE_VALUE3_INTO_VALUE2_IF_FOUND && value3Size > 0);
+    hasPolicySecondary = policy2Size > 0;
     hasPlyBinOutputs = pieceMoveSizePerPos == 512 && pieceCaptureSizePerPos == 512;
     hasPunimOutputs = punimSelfSizePerPos == 8 && punimOpponentSizePerPos == 8;
+    hasAction = actionSizePerPos == EncodedPolicyVector.POLICY_VECTOR_LENGTH * 3; // [B, 1858, 3] - WDL logits for all possible moves
+    hasQDeviation = qDevLowerSize > 0 && qDevUpperSize > 0;
 
     if (netType == ONNXNetExecutor.NetTypeEnum.TPG)
     {
@@ -435,7 +501,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
     mBuffer = hasM ? new FP16[maxBatchSize] : Array.Empty<FP16>();
     uncVBuffer = hasUncertaintyV ? new FP16[maxBatchSize] : Array.Empty<FP16>();
     uncPBuffer = hasUncertaintyP ? new FP16[maxBatchSize] : Array.Empty<FP16>();
+    extraStat0Buffer = hasQDeviation ? new FP16[maxBatchSize] : Array.Empty<FP16>();
+    extraStat1Buffer = hasQDeviation ? new FP16[maxBatchSize] : Array.Empty<FP16>();
     policiesBuffer = new CompressedPolicyVector[maxBatchSize];
+    policies2Buffer = hasPolicySecondary ? new CompressedPolicyVector[maxBatchSize] : Array.Empty<CompressedPolicyVector>();
+    actionsBuffer = hasAction ? new CompressedActionVector[maxBatchSize] : null;
     plyBinMoveBuffer = hasPlyBinOutputs ? new Half[maxBatchSize * 512] : Array.Empty<Half>();
     plyBinCaptureBuffer = hasPlyBinOutputs ? new Half[maxBatchSize * 512] : Array.Empty<Half>();
     punimSelfBuffer = hasPunimOutputs ? new Half[maxBatchSize * 8] : Array.Empty<Half>();
@@ -515,6 +585,828 @@ public class NNEvaluatorTensorRT : NNEvaluator
   public Action<NNEvaluatorOptions, IEncodedPositionBatchFlat, bool, Memory<byte>, Memory<Half>, short[]> ConverterToFlat { get; set; }
   public Func<NNEvaluatorOptions, object, Memory<byte>, int> ConverterToFlatFromTPG = null;
 
+  // Thread-static buffers for native input conversion
+  [ThreadStatic] static byte[] inputsPrimaryNative;
+  [ThreadStatic] static Half[] inputsPrimaryNativeF;
+
+  // Lookup table for fast byte to Half conversion
+  static bool haveInitializedLookupByteToHalf = false;
+  static readonly Half[] LookupByteToHalf = new Half[256];
+
+  static void InitLookupTable()
+  {
+    for (int i = 0; i <= byte.MaxValue; i++)
+    {
+      LookupByteToHalf[i] = (Half)i;
+    }
+    haveInitializedLookupByteToHalf = true;
+  }
+
+
+  /// <summary>
+  /// Optional worker method which evaluates batch of positions which are already converted into native format needed by evaluator.
+  /// </summary>
+  /// <param name="positionsNativeInput">The positions in native TPG format</param>
+  /// <param name="usesSecondaryInputs">Whether secondary inputs are used (not supported)</param>
+  /// <param name="numPositions">Number of positions in the batch</param>
+  /// <param name="posMoveIsLegal">Function to check if a move is legal for a position</param>
+  /// <param name="retrieveSupplementalResults">Whether to retrieve supplemental results</param>
+  /// <returns>The position evaluation batch</returns>
+  public override IPositionEvaluationBatch DoEvaluateNativeIntoBuffers(object positionsNativeInput, bool usesSecondaryInputs,
+                                                                       int numPositions, Func<int, int, bool> posMoveIsLegal,
+                                                                       bool retrieveSupplementalResults = false)
+  {
+    if (numPositions > MaxBatchSize)
+    {
+      throw new Exception($"Batch size {numPositions} too large, evaluator constructed for max {MaxBatchSize}.");
+    }
+
+    if (HasState)
+    {
+      throw new NotImplementedException("State not supported");
+    }
+    if (usesSecondaryInputs)
+    {
+      throw new NotImplementedException("Secondary inputs not supported");
+    }
+    System.Diagnostics.Debug.Assert(!retrieveSupplementalResults);
+
+    if (NetType != ONNXNetExecutor.NetTypeEnum.TPG)
+    {
+      throw new Exception("DoEvaluateNativeIntoBuffers only supported for TPG net type.");
+    }
+
+    if (ConverterToFlatFromTPG == null)
+    {
+      throw new Exception("ConverterToFlatFromTPG must be provided");
+    }
+
+    if (!haveInitializedLookupByteToHalf)
+    {
+      InitLookupTable();
+    }
+
+    // Allocate thread-static buffers if needed
+    int bytesPerSquareRecord = TPGRecord.BYTES_PER_SQUARE_RECORD;
+    int maxBufferSize = MaxBatchSize * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
+
+    if (inputsPrimaryNative == null || inputsPrimaryNative.Length < maxBufferSize)
+    {
+      inputsPrimaryNative = new byte[maxBufferSize];
+      inputsPrimaryNativeF = new Half[maxBufferSize];
+    }
+
+    // Convert native input to flat format
+    int numConverted = ConverterToFlatFromTPG(Options, positionsNativeInput, inputsPrimaryNative);
+
+    if (useByteInputs)
+    {
+      // Copy converted bytes directly to squareByteBuffer for ProcessBytesWithHandler
+      Array.Copy(inputsPrimaryNative, squareByteBuffer, numConverted);
+    }
+    else
+    {
+      // Convert bytes to Half (efficiently via lookup table) for Half input path
+      for (int i = 0; i < numConverted; i++)
+      {
+        inputsPrimaryNativeF[i] = LookupByteToHalf[inputsPrimaryNative[i]];
+      }
+
+      // Convert byte buffer to half buffer with /100 scaling
+      int elemsToCopy = numPositions * inputElementsPerPosition;
+      Memory<byte> sourceBytes = new Memory<byte>(inputsPrimaryNative, 0, elemsToCopy);
+      Memory<Half> targetHalfs = new Memory<Half>(inputHalfBuffer, 0, elemsToCopy);
+      TPGConvertersToFlat.CopyAndDivideSIMD(sourceBytes, targetHalfs, 100.0f);
+    }
+
+    return ProcessNativeBatchWithPool(numPositions, posMoveIsLegal);
+  }
+
+
+  /// <summary>
+  /// Process native batch using MultiGPUEnginePool.
+  /// Similar to ProcessBatchWithPool but uses pre-converted native inputs.
+  /// </summary>
+  private PositionEvaluationBatch ProcessNativeBatchWithPool(int numPos, Func<int, int, bool> posMoveIsLegal)
+  {
+    // Reuse pre-allocated buffers (sized to maxBatchSize)
+    FP16[] w = wBuffer;
+    FP16[] l = lBuffer;
+    FP16[] w2 = w2Buffer;
+    FP16[] l2 = l2Buffer;
+    FP16[] m = mBuffer;
+    FP16[] uncV = uncVBuffer;
+    FP16[] uncP = uncPBuffer;
+    FP16[] extraStat0 = extraStat0Buffer;
+    FP16[] extraStat1 = extraStat1Buffer;
+    CompressedPolicyVector[] policies = policiesBuffer;
+    CompressedPolicyVector[] pol2 = policies2Buffer;
+    CompressedActionVector[] actions = hasAction ? actionsBuffer : Array.Empty<CompressedActionVector>();
+    Half[] plyBinMove = plyBinMoveBuffer;
+    Half[] plyBinCapture = plyBinCaptureBuffer;
+    Half[] punimSelf = punimSelfBuffer;
+    Half[] punimOpponent = punimOpponentBuffer;
+
+    // Get option values for value head temperature
+    float valueHead1Temperature = Options?.ValueHead1Temperature ?? 1.0f;
+    float valueHead2Temperature = Options?.ValueHead2Temperature ?? 1.0f;
+    float valueHead1TemperatureScaling = Options?.Value1UncertaintyTemperatureScalingFactor ?? 0.0f;
+    float valueHead2TemperatureScaling = Options?.Value2UncertaintyTemperatureScalingFactor ?? 0.0f;
+
+    // Policy2 blend parameters
+    float fractionPolicyHead2 = (hasPolicySecondary ? Options?.FractionPolicyHead2 : null) ?? 0.0f;
+    bool policy2BlendLogits = Options?.Policy2BlendLogits ?? true;
+    float policy1Temperature = Options?.Policy1Temperature ?? 1.0f;
+    float policy2Temperature = Options?.Policy2Temperature ?? 1.0f;
+
+    // Capture buffer size for thread-local allocation in handler
+    int requiredBufferSize = outputFloatBufferSize;
+
+    SubBatchOutputHandler handler = (int globalStartPosition, int positionCount, int engineBatchSize, IntPtr rawOutputPtr, int outputElementCount) =>
+    {
+      // Ensure thread-local buffer is allocated
+      if (threadLocalOutputFloatBuffer == null || threadLocalOutputFloatBuffer.Length < requiredBufferSize)
+      {
+        threadLocalOutputFloatBuffer = new float[requiredBufferSize];
+      }
+
+      // Vectorized conversion from Half to float (directly from pinned host memory)
+      unsafe
+      {
+        ReadOnlySpan<Half> rawSpan = new ReadOnlySpan<Half>((void*)rawOutputPtr, outputElementCount);
+        TensorPrimitives.ConvertToSingle(rawSpan, threadLocalOutputFloatBuffer.AsSpan(0, outputElementCount));
+      }
+
+      ExtractSubBatchResultsNative(globalStartPosition, positionCount, engineBatchSize,
+                                   threadLocalOutputFloatBuffer, w, l, w2, l2, m, uncV, uncP, policies,
+                                   pol2, actions,
+                                   plyBinMove, plyBinCapture, punimSelf, punimOpponent,
+                                   extraStat0, extraStat1,
+                                   valueHead1Temperature, valueHead2Temperature,
+                                   valueHead1TemperatureScaling, valueHead2TemperatureScaling,
+                                   fractionPolicyHead2, policy2BlendLogits,
+                                   policy1Temperature, policy2Temperature,
+                                   NetType == ONNXNetExecutor.NetTypeEnum.TPG,
+                                   posMoveIsLegal);
+    };
+
+    if (useByteInputs)
+    {
+      pool.ProcessBytesWithHandler(squareByteBuffer, numPos, handler);
+    }
+    else
+    {
+      pool.ProcessWithHandler(inputHalfBuffer, numPos, handler);
+    }
+
+    // Apply value head blending if FractionValueHead2 is specified
+    float fractionValueHead2 = Options?.FractionValueHead2 ?? 0.0f;
+    FP16[] finalW, finalL;
+
+    if (fractionValueHead2 > 0.0f && hasValueSecondary)
+    {
+      float fractionValueHead1 = 1.0f - fractionValueHead2;
+      FP16[] blendedW = blendedWBuffer;
+      FP16[] blendedL = blendedLBuffer;
+
+      for (int i = 0; i < numPos; i++)
+      {
+        blendedW[i] = (FP16)((float)w[i] * fractionValueHead1 + (float)w2[i] * fractionValueHead2);
+        blendedL[i] = (FP16)((float)l[i] * fractionValueHead1 + (float)l2[i] * fractionValueHead2);
+      }
+      finalW = blendedW;
+      finalL = blendedL;
+    }
+    else
+    {
+      finalW = w;
+      finalL = l;
+    }
+
+    return new PositionEvaluationBatch(
+      isWDL: IsWDL,
+      hasM: HasM,
+      hasUncertaintyV: HasUncertaintyV,
+      hasUncertaintyP: hasUncertaintyP,
+      hasAction: hasAction,
+      hasValueSecondary: hasValueSecondary,
+      hasState: false,
+      numPos: numPos,
+      policies: policies,
+      actionProbabilties: actions,
+      w: finalW,
+      l: finalL,
+      w2: w2,
+      l2: l2,
+      m: m,
+      uncertaintyV: uncV,
+      uncertaintyP: uncP,
+      states: default,
+      activations: default,
+      stats: default,
+      plyBinMoveProbs: hasPlyBinOutputs ? plyBinMove : default,
+      plyBinCaptureProbs: hasPlyBinOutputs ? plyBinCapture : default,
+      punimSelfProbs: hasPunimOutputs ? punimSelf : default,
+      punimOpponentProbs: hasPunimOutputs ? punimOpponent : default,
+      extraStat0: hasQDeviation ? extraStat0 : default,
+      extraStat1: hasQDeviation ? extraStat1 : default,
+      hasPolicySecondary: hasPolicySecondary,
+      policies2: hasPolicySecondary ? pol2 : default);
+  }
+
+
+  /// <summary>
+  /// Holds computed offsets into the output tensor buffer for each output type.
+  /// </summary>
+  private readonly struct TensorOffsets
+  {
+    public readonly int Value;
+    public readonly int Value2;
+    public readonly int Policy;
+    public readonly int Policy2;
+    public readonly int Mlh;
+    public readonly int UncV;
+    public readonly int UncP;
+    public readonly int PieceMove;
+    public readonly int PieceCapture;
+    public readonly int PunimSelf;
+    public readonly int PunimOpponent;
+    public readonly int QDevLower;
+    public readonly int QDevUpper;
+    public readonly int Action;
+
+    public TensorOffsets(int value, int value2, int policy, int policy2, int mlh, int uncV, int uncP,
+                         int pieceMove, int pieceCapture, int punimSelf, int punimOpponent,
+                         int qDevLower, int qDevUpper, int action)
+    {
+      Value = value;
+      Value2 = value2;
+      Policy = policy;
+      Policy2 = policy2;
+      Mlh = mlh;
+      UncV = uncV;
+      UncP = uncP;
+      PieceMove = pieceMove;
+      PieceCapture = pieceCapture;
+      PunimSelf = punimSelf;
+      PunimOpponent = punimOpponent;
+      QDevLower = qDevLower;
+      QDevUpper = qDevUpper;
+      Action = action;
+    }
+  }
+
+
+  /// <summary>
+  /// Computes tensor offsets for a given engine batch size.
+  /// </summary>
+  private TensorOffsets ComputeTensorOffsets(int engineBatchSize)
+  {
+    int valueOffset = 0;
+    int value2Offset = 0;
+    int value3Offset = 0;
+    int policyOffset = 0;
+    int policy2Offset = 0;
+    int mlhOffset = 0;
+    int uncVOffset = 0;
+    int uncPOffset = 0;
+    int pieceMoveOffset = 0;
+    int pieceCaptureOffset = 0;
+    int punimSelfOffset = 0;
+    int punimOpponentOffset = 0;
+    int qDevLowerOffset = 0;
+    int qDevUpperOffset = 0;
+    int actionOffset = 0;
+
+    int currentOffset = 0;
+    for (int t = 0; t < outputInfos.Length; t++)
+    {
+      int sizePerPos = (int)(outputInfos[t].Size / largestEngineBatchSize);
+      int tensorSize = engineBatchSize * sizePerPos;
+
+      if (t == valueTensorIndex)
+      {
+        valueOffset = currentOffset;
+      }
+      else if (t == value2TensorIndex)
+      {
+        value2Offset = currentOffset;
+      }
+      else if (t == value3TensorIndex)
+      {
+        value3Offset = currentOffset;
+      }
+      else if (t == policyTensorIndex)
+      {
+        policyOffset = currentOffset;
+      }
+      else if (t == policy2TensorIndex)
+      {
+        policy2Offset = currentOffset;
+      }
+      else if (t == mlhTensorIndex)
+      {
+        mlhOffset = currentOffset;
+      }
+      else if (t == uncVTensorIndex)
+      {
+        uncVOffset = currentOffset;
+      }
+      else if (t == uncPTensorIndex)
+      {
+        uncPOffset = currentOffset;
+      }
+      else if (t == pieceMoveTensorIndex)
+      {
+        pieceMoveOffset = currentOffset;
+      }
+      else if (t == pieceCaptureTensorIndex)
+      {
+        pieceCaptureOffset = currentOffset;
+      }
+      else if (t == punimSelfTensorIndex)
+      {
+        punimSelfOffset = currentOffset;
+      }
+      else if (t == punimOpponentTensorIndex)
+      {
+        punimOpponentOffset = currentOffset;
+      }
+      else if (t == qDevLowerTensorIndex)
+      {
+        qDevLowerOffset = currentOffset;
+      }
+      else if (t == qDevUpperTensorIndex)
+      {
+        qDevUpperOffset = currentOffset;
+      }
+      else if (t == actionTensorIndex)
+      {
+        actionOffset = currentOffset;
+      }
+
+      // Align to 256-byte boundary (128 fp16 elements)
+      const int ALIGN = 128;
+      currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
+    }
+
+    // Substitute value3 into value2 if enabled and value3 is present
+    int effectiveValue2Offset = (SUBSTITUTE_VALUE3_INTO_VALUE2_IF_FOUND && value3Size > 0) ? value3Offset : value2Offset;
+
+    return new TensorOffsets(valueOffset, effectiveValue2Offset, policyOffset, policy2Offset, mlhOffset, uncVOffset, uncPOffset,
+                             pieceMoveOffset, pieceCaptureOffset, punimSelfOffset, punimOpponentOffset,
+                             qDevLowerOffset, qDevUpperOffset, actionOffset);
+  }
+
+
+  /// <summary>
+  /// Applies softmax with bin reversal to 8-bin logits, writing to destination.
+  /// Used for ply-bin and PUNIM outputs.
+  /// </summary>
+  private static void SoftmaxReversed8Bins(float[] source, int srcOffset, Half[] dest, int dstOffset)
+  {
+    float max = source[srcOffset];
+    for (int b = 1; b < 8; b++)
+    {
+      float v = source[srcOffset + b];
+      if (v > max) max = v;
+    }
+
+    float expSum = 0;
+    Span<float> exps = stackalloc float[8];
+    for (int b = 0; b < 8; b++)
+    {
+      float e = MathF.Exp(source[srcOffset + b] - max);
+      exps[b] = e;
+      expSum += e;
+    }
+
+    float invSum = 1.0f / expSum;
+    for (int b = 0; b < 8; b++)
+    {
+      dest[dstOffset + b] = (Half)(exps[7 - b] * invSum);
+    }
+  }
+
+
+  /// <summary>
+  /// Extracts ply-bin outputs (piece_move and piece_capture) for a single position.
+  /// </summary>
+  private static void ExtractPlyBinOutputs(float[] subBatchOutput, int posPieceMoveOffset, int posPieceCaptureOffset,
+                                           Half[] plyBinMove, Half[] plyBinCapture, int destOffset)
+  {
+    // piece_move: softmax per square (8 bins), reverse bin order
+    for (int sq = 0; sq < 64; sq++)
+    {
+      SoftmaxReversed8Bins(subBatchOutput, posPieceMoveOffset + sq * 8, plyBinMove, destOffset + sq * 8);
+    }
+
+    // piece_capture: softmax per square (8 bins), reverse bin order
+    for (int sq = 0; sq < 64; sq++)
+    {
+      SoftmaxReversed8Bins(subBatchOutput, posPieceCaptureOffset + sq * 8, plyBinCapture, destOffset + sq * 8);
+    }
+  }
+
+
+  /// <summary>
+  /// Extracts PUNIM outputs (punim_self and punim_opponent) for a single position.
+  /// </summary>
+  private static void ExtractPunimOutputs(float[] subBatchOutput, int posPunimSelfOffset, int posPunimOpponentOffset,
+                                          Half[] punimSelf, Half[] punimOpponent, int punimDestOffset)
+  {
+    SoftmaxReversed8Bins(subBatchOutput, posPunimSelfOffset, punimSelf, punimDestOffset);
+    SoftmaxReversed8Bins(subBatchOutput, posPunimOpponentOffset, punimOpponent, punimDestOffset);
+  }
+
+
+  /// <summary>
+  /// Extract results from a sub-batch output buffer for native inputs.
+  /// Uses posMoveIsLegal callback instead of batch.Moves for policy extraction.
+  /// </summary>
+  private void ExtractSubBatchResultsNative(int startPos, int count, int engineBatchSize,
+                                            float[] subBatchOutput,
+                                            FP16[] w, FP16[] l, FP16[] w2, FP16[] l2, FP16[] m, FP16[] uncV, FP16[] uncP,
+                                            CompressedPolicyVector[] policies,
+                                            CompressedPolicyVector[] policies2,
+                                            CompressedActionVector[] actions,
+                                            Half[] plyBinMove, Half[] plyBinCapture,
+                                            Half[] punimSelf, Half[] punimOpponent,
+                                            FP16[] extraStat0, FP16[] extraStat1,
+                                            float valueHead1Temperature, float valueHead2Temperature,
+                                            float valueHead1TemperatureScaling, float valueHead2TemperatureScaling,
+                                            float fractionPolicyHead2, bool policy2BlendLogits,
+                                            float policy1Temperature, float policy2Temperature,
+                                            bool wdlIsLogistic,
+                                            Func<int, int, bool> posMoveIsLegal)
+  {
+    // Compute tensor offsets once outside the parallel loop
+    TensorOffsets offsets = ComputeTensorOffsets(engineBatchSize);
+
+    // Get policy temperature
+    float policyTemperature = Options?.PolicyTemperature ?? 1.0f;
+
+    // Parallel extraction of per-position results
+    Parallel.For(0, count, new ParallelOptions() { MaxDegreeOfParallelism = 1 + count / 48 }, i =>
+    {
+      int resultIndex = startPos + i;
+
+      // ===== Extract MLH =====
+      if (hasM)
+      {
+        int posMlhOffset = offsets.Mlh + i * mlhSize;
+        m[resultIndex] = (FP16)MathF.Max(subBatchOutput[posMlhOffset] * 100, 0);
+      }
+
+      // ===== Extract Uncertainty V =====
+      float uncertaintyV = 0;
+      if (hasUncertaintyV)
+      {
+        int posUncVOffset = offsets.UncV + i * uncVSize;
+        uncertaintyV = subBatchOutput[posUncVOffset];
+        uncV[resultIndex] = (FP16)uncertaintyV;
+      }
+
+      // ===== Extract Uncertainty P =====
+      if (hasUncertaintyP)
+      {
+        int posUncPOffset = offsets.UncP + i * uncPSize;
+        uncP[resultIndex] = (FP16)subBatchOutput[posUncPOffset];
+      }
+
+      // ===== Extract Value Head 1 =====
+      int posValueOffset = offsets.Value + i * valueSize;
+      if (isWDL)
+      {
+        if (wdlIsLogistic)
+        {
+          float vW = subBatchOutput[posValueOffset];
+          float vD = subBatchOutput[posValueOffset + 1];
+          float vL = subBatchOutput[posValueOffset + 2];
+
+          (float wVal, float lVal) = ExtractAndScaleWDL(vW, vD, vL,
+                                                         valueHead1Temperature, valueHead1TemperatureScaling,
+                                                         uncertaintyV, wdlIsLogistic);
+          w[resultIndex] = (FP16)wVal;
+          l[resultIndex] = (FP16)lVal;
+        }
+        else
+        {
+          w[resultIndex] = (FP16)subBatchOutput[posValueOffset];
+          l[resultIndex] = (FP16)subBatchOutput[posValueOffset + 2];
+        }
+      }
+      else
+      {
+        float v = subBatchOutput[posValueOffset];
+        w[resultIndex] = (FP16)((v + 1) * 0.5f);
+        l[resultIndex] = (FP16)((1 - v) * 0.5f);
+      }
+
+      // ===== Extract Value Head 2 (if present) =====
+      if (hasValueSecondary)
+      {
+        int posValue2Offset = offsets.Value2 + i * value2Size;
+        float vW2 = subBatchOutput[posValue2Offset];
+        float vD2 = subBatchOutput[posValue2Offset + 1];
+        float vL2 = subBatchOutput[posValue2Offset + 2];
+
+        (float w2Val, float l2Val) = ExtractAndScaleWDL(vW2, vD2, vL2,
+                                                         valueHead2Temperature, valueHead2TemperatureScaling,
+                                                         uncertaintyV, wdlIsLogistic: true);
+        w2[resultIndex] = (FP16)w2Val;
+        l2[resultIndex] = (FP16)l2Val;
+      }
+
+      // ===== Extract Policy using posMoveIsLegal callback =====
+      int batchIndex = startPos + i;
+      int posPolicyOffset = offsets.Policy + i * policySize;
+      ReadOnlySpan<float> policyLogits = subBatchOutput.AsSpan().Slice(posPolicyOffset, policySize);
+
+      // Collect legal move indices and policy1 logits
+      Span<int> indices = stackalloc int[128];
+      Span<float> logits = stackalloc float[128];
+      int numMoves = 0;
+      float maxLogit = float.NegativeInfinity;
+
+      for (int moveIndex = 0; moveIndex < policySize && numMoves < 128; moveIndex++)
+      {
+        if (posMoveIsLegal(batchIndex, moveIndex))
+        {
+          float logit = policyLogits[moveIndex];
+          indices[numMoves] = moveIndex;
+          logits[numMoves] = logit;
+          if (logit > maxLogit)
+          {
+            maxLogit = logit;
+          }
+          numMoves++;
+        }
+      }
+
+      if (numMoves == 0)
+      {
+        return;
+      }
+
+      indices = indices.Slice(0, numMoves);
+      logits = logits.Slice(0, numMoves);
+
+      // ===== Extract Action WDL (if present) =====
+      // IMPORTANT: Must extract actions BEFORE CompressedPolicyVector.Initialize,
+      // because Initialize sorts the indices span in-place (when alreadySorted: false).
+      if (hasAction)
+      {
+        int posActionOffset = offsets.Action + i * actionSizePerPos;
+        ReadOnlySpan<float> actionLogits = subBatchOutput.AsSpan().Slice(posActionOffset, actionSizePerPos);
+
+        // Cap at NUM_MOVE_SLOTS to match CompressedActionVector's inline-array capacity
+        // (matches the truncation already performed by CompressedPolicyVector.Initialize).
+        int mvLimit = Math.Min(numMoves, CompressedPolicyVector.NUM_MOVE_SLOTS);
+
+        // Extract action WDL for each legal move using nnIndex (analogous to policy)
+        for (int mv = 0; mv < mvLimit; mv++)
+        {
+          int nnIndex = indices[mv]; // Use nnIndex to index into action tensor [1858, 3]
+          // Defensive: policy loop already handles nnIndex < 0 by using NegativeInfinity logit,
+          // so write default here to keep the action slot index-aligned with the policy slot
+          // prior to SortWithActions inside CompressedPolicyVector.Initialize.
+          if (nnIndex < 0 || 3 * nnIndex + 2 >= actionSizePerPos)
+          {
+            actions[resultIndex][mv] = default;
+            continue;
+          }
+          int baseActionIndex = 3 * nnIndex;
+
+          float a0 = actionLogits[baseActionIndex];     // W logit
+          float a1 = actionLogits[baseActionIndex + 1]; // D logit
+          float a2 = actionLogits[baseActionIndex + 2]; // L logit
+
+          // Numerically stable softmax
+          float actionLogitMax = MathF.Max(MathF.Max(a0, a1), a2);
+          float expW = MathF.Exp(a0 - actionLogitMax);
+          float expD = MathF.Exp(a1 - actionLogitMax);
+          float expL = MathF.Exp(a2 - actionLogitMax);
+          float actionSum = expW + expD + expL;
+
+          // Store (W_prob, L_prob) - D is derived as 1 - W - L
+          actions[resultIndex][mv] = ((Half)(expW / actionSum), (Half)(expL / actionSum));
+        }
+      }
+
+      bool policyInitialized = false;
+      if (hasPolicySecondary)
+      {
+        // Read policy2 logits for the same legal moves
+        int posPolicy2Offset = offsets.Policy2 + i * policy2Size;
+        ReadOnlySpan<float> policy2Logits = subBatchOutput.AsSpan().Slice(posPolicy2Offset, policy2Size);
+
+        Span<float> logits2 = stackalloc float[numMoves];
+        float maxLogit2 = float.NegativeInfinity;
+        for (int mv = 0; mv < numMoves; mv++)
+        {
+          float lg2 = policy2Logits[indices[mv]];
+          logits2[mv] = lg2;
+          if (lg2 > maxLogit2)
+          {
+            maxLogit2 = lg2;
+          }
+        }
+
+        // Store unblended policy2 (always, when present)
+        Span<float> p2Probs = stackalloc float[numMoves];
+        TensorPrimitives.Subtract(logits2, maxLogit2, p2Probs);
+        if (policyTemperature != 1.0f)
+        {
+          TensorPrimitives.Multiply(p2Probs, 1.0f / policyTemperature, p2Probs);
+        }
+        TensorPrimitives.Exp(p2Probs, p2Probs);
+        float sum2 = TensorPrimitives.Sum(p2Probs);
+
+        // Detect numeric underflow for unblended policy2
+        Debug.Assert(sum2 > 0 && !float.IsNaN(sum2),
+          $"Softmax underflow in unblended policy2 (Native): sum2={sum2}. " +
+          $"numMoves={numMoves}, policyTemperature={policyTemperature}, maxLogit2={maxLogit2}");
+
+        if (sum2 > 0)
+        {
+          TensorPrimitives.Multiply(p2Probs, 1.0f / sum2, p2Probs);
+        }
+        CompressedPolicyVector.Initialize(ref policies2[resultIndex], SideType.White, indices, p2Probs, alreadySorted: false);
+
+        if (fractionPolicyHead2 > 0)
+        {
+          if (policy2BlendLogits)
+          {
+            // Apply per-head temperatures to logits before blending (in logit space).
+            // Temperature is applied by dividing logits: logits_tempered = (logits - max) / temperature.
+            // We subtract max BEFORE temperature scaling to prevent numeric overflow/underflow
+            // when temperature < 1 (which amplifies the logits).
+            Span<float> temperedLogits1 = stackalloc float[numMoves];
+            Span<float> temperedLogits2 = stackalloc float[numMoves];
+
+            if (policy1Temperature != 1.0f)
+            {
+              // Subtract max first, then apply temperature
+              TensorPrimitives.Subtract(logits, maxLogit, temperedLogits1);
+              TensorPrimitives.Multiply(temperedLogits1, 1.0f / policy1Temperature, temperedLogits1);
+            }
+            else
+            {
+              // Still subtract max for consistency
+              TensorPrimitives.Subtract(logits, maxLogit, temperedLogits1);
+            }
+
+            if (policy2Temperature != 1.0f)
+            {
+              // Subtract max first, then apply temperature
+              TensorPrimitives.Subtract(logits2, maxLogit2, temperedLogits2);
+              TensorPrimitives.Multiply(temperedLogits2, 1.0f / policy2Temperature, temperedLogits2);
+            }
+            else
+            {
+              // Still subtract max for consistency
+              TensorPrimitives.Subtract(logits2, maxLogit2, temperedLogits2);
+            }
+
+            // Blend in logit space: weighted average of tempered logits, then softmax
+            float frac1 = 1.0f - fractionPolicyHead2;
+            for (int mv = 0; mv < numMoves; mv++)
+            {
+              logits[mv] = frac1 * temperedLogits1[mv] + fractionPolicyHead2 * temperedLogits2[mv];
+            }
+            // Recompute maxLogit for the blended logits
+            maxLogit = logits[0];
+            for (int mv = 1; mv < numMoves; mv++)
+            {
+              if (logits[mv] > maxLogit)
+              {
+                maxLogit = logits[mv];
+              }
+            }
+          }
+          else
+          {
+            // Probability blending: softmax each head with per-head temperature, then blend
+            float p1CombinedTemp = policyTemperature * policy1Temperature;
+            TensorPrimitives.Subtract(logits, maxLogit, logits);
+            if (p1CombinedTemp != 1.0f)
+            {
+              TensorPrimitives.Multiply(logits, 1.0f / p1CombinedTemp, logits);
+            }
+            TensorPrimitives.Exp(logits, logits);
+            float sum1 = TensorPrimitives.Sum(logits);
+            if (sum1 > 0)
+            {
+              TensorPrimitives.Multiply(logits, 1.0f / sum1, logits);
+            }
+
+            float frac1 = 1.0f - fractionPolicyHead2;
+            if (policy2Temperature != 1.0f)
+            {
+              Span<float> temperedP2 = stackalloc float[numMoves];
+              float p2CombinedTemp = policyTemperature * policy2Temperature;
+              TensorPrimitives.Subtract(logits2, maxLogit2, temperedP2);
+              if (p2CombinedTemp != 1.0f)
+              {
+                TensorPrimitives.Multiply(temperedP2, 1.0f / p2CombinedTemp, temperedP2);
+              }
+              TensorPrimitives.Exp(temperedP2, temperedP2);
+              float sumT2 = TensorPrimitives.Sum(temperedP2);
+              if (sumT2 > 0)
+              {
+                TensorPrimitives.Multiply(temperedP2, 1.0f / sumT2, temperedP2);
+              }
+              for (int mv = 0; mv < numMoves; mv++)
+              {
+                logits[mv] = frac1 * logits[mv] + fractionPolicyHead2 * temperedP2[mv];
+              }
+            }
+            else
+            {
+              for (int mv = 0; mv < numMoves; mv++)
+              {
+                logits[mv] = frac1 * logits[mv] + fractionPolicyHead2 * p2Probs[mv];
+              }
+            }
+            if (hasAction)
+            {
+              CompressedPolicyVector.Initialize(ref policies[resultIndex], SideType.White, indices, logits, alreadySorted: false,
+                                                withActions: true, ref actions[resultIndex]);
+            }
+            else
+            {
+              CompressedPolicyVector.Initialize(ref policies[resultIndex], SideType.White, indices, logits, alreadySorted: false);
+            }
+            policyInitialized = true;
+          }
+        }
+      }
+
+      if (!policyInitialized)
+      {
+        // Apply softmax (for unblended policy1 or logit-blended result)
+        TensorPrimitives.Subtract(logits, maxLogit, logits);
+
+        if (policyTemperature != 1.0f)
+        {
+          float invPolicyTemp = 1.0f / policyTemperature;
+          TensorPrimitives.Multiply(logits, invPolicyTemp, logits);
+        }
+
+        TensorPrimitives.Exp(logits, logits);
+
+        float sum = TensorPrimitives.Sum(logits);
+
+        // Detect numeric underflow: if sum is 0 or NaN, softmax failed (likely due to extreme temperature scaling)
+        Debug.Assert(sum > 0 && !float.IsNaN(sum),
+          $"Softmax underflow in ExtractSubBatchResultsNative: sum={sum}. " +
+          $"numMoves={numMoves}, policyTemperature={policyTemperature}, maxLogit={maxLogit}");
+
+        if (sum > 0)
+        {
+          float invSum = 1.0f / sum;
+          TensorPrimitives.Multiply(logits, invSum, logits);
+        }
+
+        if (hasAction)
+        {
+          CompressedPolicyVector.Initialize(ref policies[resultIndex], SideType.White, indices, logits, alreadySorted: false,
+                                            withActions: true, ref actions[resultIndex]);
+        }
+        else
+        {
+          CompressedPolicyVector.Initialize(ref policies[resultIndex], SideType.White, indices, logits, alreadySorted: false);
+        }
+      }
+
+      // ===== Extract Ply-Bin Outputs (if present) =====
+      if (hasPlyBinOutputs)
+      {
+        int destOffset = resultIndex * 512;
+        int posPieceMoveOffset = offsets.PieceMove + i * pieceMoveSizePerPos;
+        int posPieceCaptureOffset = offsets.PieceCapture + i * pieceCaptureSizePerPos;
+        ExtractPlyBinOutputs(subBatchOutput, posPieceMoveOffset, posPieceCaptureOffset, plyBinMove, plyBinCapture, destOffset);
+      }
+
+      // ===== Extract PUNIM Outputs (if present) =====
+      if (hasPunimOutputs)
+      {
+        int punimDestOffset = resultIndex * 8;
+        int posPunimSelfOffset = offsets.PunimSelf + i * punimSelfSizePerPos;
+        int posPunimOpponentOffset = offsets.PunimOpponent + i * punimOpponentSizePerPos;
+        ExtractPunimOutputs(subBatchOutput, posPunimSelfOffset, posPunimOpponentOffset, punimSelf, punimOpponent, punimDestOffset);
+      }
+
+      // ===== Extract Q Deviation Outputs (if present) =====
+      if (hasQDeviation)
+      {
+        extraStat0[resultIndex] = (FP16)subBatchOutput[offsets.QDevLower + i * qDevLowerSize];
+        extraStat1[resultIndex] = (FP16)subBatchOutput[offsets.QDevUpper + i * qDevUpperSize];
+      }
+    });
+  }
+
 
   /// <inheritdoc/>
   protected override IPositionEvaluationBatch DoEvaluateIntoBuffers(IEncodedPositionBatchFlat batch, bool retrieveSupplementalResults = false)
@@ -542,6 +1434,15 @@ public class NNEvaluatorTensorRT : NNEvaluator
       Memory<byte> byteBuffer = new Memory<byte>(squareByteBuffer, 0, numPos * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD);
       Memory<Half> emptyHalf = Memory<Half>.Empty;
       ConverterToFlat(Options, batch, USE_HISTORY, byteBuffer, emptyHalf, null);
+
+      // Apply PlySinceLastMove transformation for each position in the batch.
+      // Pass pre-computed LastMovePlies if available; otherwise history-based estimation is used.
+      // Only apply if Options is NNEvaluatorOptionsCeres; otherwise skip ply-since logic entirely.
+      if (Options is NNEvaluatorOptionsCeres ceresOptions)
+      {
+        ReadOnlySpan<byte> lastMovePlies = batch.LastMovePlies.IsEmpty ? default : batch.LastMovePlies.Span.Slice(0, numPos * 64);
+        ApplyPlySinceLastMoveTransformationToTPGBuffer(byteBuffer.Span, numPos, ceresOptions.PlySinceLastMoveMode, lastMovePlies);
+      }
     }
 
     return ProcessBatchWithPool(batch, numPos);
@@ -561,8 +1462,11 @@ public class NNEvaluatorTensorRT : NNEvaluator
     FP16[] m = mBuffer;
     FP16[] uncV = uncVBuffer;
     FP16[] uncP = uncPBuffer;
+    FP16[] extraStat0 = extraStat0Buffer;
+    FP16[] extraStat1 = extraStat1Buffer;
     CompressedPolicyVector[] policies = policiesBuffer;
-    CompressedActionVector[] actions = Array.Empty<CompressedActionVector>();
+    CompressedPolicyVector[] pol2 = policies2Buffer;
+    CompressedActionVector[] actions = hasAction ? actionsBuffer : Array.Empty<CompressedActionVector>();
     Half[] plyBinMove = plyBinMoveBuffer;
     Half[] plyBinCapture = plyBinCaptureBuffer;
     Half[] punimSelf = punimSelfBuffer;
@@ -574,10 +1478,16 @@ public class NNEvaluatorTensorRT : NNEvaluator
     float valueHead1TemperatureScaling = Options?.Value1UncertaintyTemperatureScalingFactor ?? 0.0f;
     float valueHead2TemperatureScaling = Options?.Value2UncertaintyTemperatureScalingFactor ?? 0.0f;
 
+    // Policy2 blend parameters
+    float fractionPolicyHead2 = (hasPolicySecondary ? Options?.FractionPolicyHead2 : null) ?? 0.0f;
+    bool policy2BlendLogits = Options?.Policy2BlendLogits ?? true;
+    float policy1Temperature = Options?.Policy1Temperature ?? 1.0f;
+    float policy2Temperature = Options?.Policy2Temperature ?? 1.0f;
+
     // Capture buffer size for thread-local allocation in handler
     int requiredBufferSize = outputFloatBufferSize;
 
-    SubBatchOutputHandler handler = (int globalStartPosition, int positionCount, int engineBatchSize, Half[] rawOutput) =>
+    SubBatchOutputHandler handler = (int globalStartPosition, int positionCount, int engineBatchSize, IntPtr rawOutputPtr, int outputElementCount) =>
     {
       // Ensure thread-local buffer is allocated (each GPU thread gets its own buffer)
       if (threadLocalOutputFloatBuffer == null || threadLocalOutputFloatBuffer.Length < requiredBufferSize)
@@ -585,14 +1495,46 @@ public class NNEvaluatorTensorRT : NNEvaluator
         threadLocalOutputFloatBuffer = new float[requiredBufferSize];
       }
 
-      // Vectorized conversion from Half to float using thread-local buffer
-      TensorPrimitives.ConvertToSingle(rawOutput, threadLocalOutputFloatBuffer.AsSpan(0, rawOutput.Length));
+      // Vectorized conversion from Half to float directly from pinned host memory
+      unsafe
+      {
+        ReadOnlySpan<Half> rawSpan = new ReadOnlySpan<Half>((void*)rawOutputPtr, outputElementCount);
+
+        // Check for NaNs on raw Half data (half the bandwidth vs checking floats)
+        int usedOutputElements = positionCount * outputElementsPerPosition;
+        bool hasNaN = MathUtils.ContainsNaN(rawSpan.Slice(0, usedOutputElements));
+
+        TensorPrimitives.ConvertToSingle(rawSpan, threadLocalOutputFloatBuffer.AsSpan(0, outputElementCount));
+
+        if (hasNaN)
+        {
+          // Identify which head(s) contain the NaN before we substitute zeros.
+          string nanHeads = IdentifyNaNHeads(rawSpan, positionCount, engineBatchSize);
+
+          // Substitute NaN with 0 in the converted float buffer so downstream
+          // consumers see sane values, then emit a rate-limited warning.
+          Span<float> usedFloats = threadLocalOutputFloatBuffer.AsSpan(0, usedOutputElements);
+          for (int i = 0; i < usedFloats.Length; i++)
+          {
+            if (float.IsNaN(usedFloats[i]))
+            {
+              usedFloats[i] = 0;
+            }
+          }
+
+          ReportNaNOccurrence(positionCount, usedOutputElements, nanHeads);
+        }
+      }
 
       ExtractSubBatchResults(batch, globalStartPosition, positionCount, engineBatchSize,
                              threadLocalOutputFloatBuffer, w, l, w2, l2, m, uncV, uncP, policies,
+                             pol2, actions,
                              plyBinMove, plyBinCapture, punimSelf, punimOpponent,
+                             extraStat0, extraStat1,
                              valueHead1Temperature, valueHead2Temperature,
                              valueHead1TemperatureScaling, valueHead2TemperatureScaling,
+                             fractionPolicyHead2, policy2BlendLogits,
+                             policy1Temperature, policy2Temperature,
                              NetType == ONNXNetExecutor.NetTypeEnum.TPG);
     };
 
@@ -648,7 +1590,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       hasM: HasM,
       hasUncertaintyV: HasUncertaintyV,
       hasUncertaintyP: hasUncertaintyP,
-      hasAction: false,
+      hasAction: hasAction,
       hasValueSecondary: hasValueSecondary,
       hasState: false,
       numPos: numPos,
@@ -667,7 +1609,93 @@ public class NNEvaluatorTensorRT : NNEvaluator
       plyBinMoveProbs: hasPlyBinOutputs ? plyBinMove : default,
       plyBinCaptureProbs: hasPlyBinOutputs ? plyBinCapture : default,
       punimSelfProbs: hasPunimOutputs ? punimSelf : default,
-      punimOpponentProbs: hasPunimOutputs ? punimOpponent : default);
+      punimOpponentProbs: hasPunimOutputs ? punimOpponent : default,
+      extraStat0: hasQDeviation ? extraStat0 : default,
+      extraStat1: hasQDeviation ? extraStat1 : default,
+      hasPolicySecondary: hasPolicySecondary,
+      policies2: hasPolicySecondary ? pol2 : default);
+  }
+
+
+  /// <summary>
+  /// Records a NaN occurrence in TensorRT output and emits a red Console warning,
+  /// rate-limited to once every NAN_LOG_MIN_INTERVAL_SECONDS. Cumulative count
+  /// since process start is included in each emitted warning.
+  /// </summary>
+  private static void ReportNaNOccurrence(int positionCount, int elementCount, string headDescription)
+  {
+    long total = System.Threading.Interlocked.Increment(ref nanOccurrenceCount);
+
+    long nowTicks = Environment.TickCount64;
+    long lastTicks = System.Threading.Interlocked.Read(ref nanLastLoggedTicks);
+    if (lastTicks != 0 && (nowTicks - lastTicks) < NAN_LOG_MIN_INTERVAL_SECONDS * 1000L)
+    {
+      return;
+    }
+
+    lock (nanLogLock)
+    {
+      long lastTicks2 = System.Threading.Interlocked.Read(ref nanLastLoggedTicks);
+      if (lastTicks2 != 0 && (nowTicks - lastTicks2) < NAN_LOG_MIN_INTERVAL_SECONDS * 1000L)
+      {
+        return;
+      }
+      System.Threading.Interlocked.Exchange(ref nanLastLoggedTicks, nowTicks);
+
+      ConsoleColor prev = Console.ForegroundColor;
+      try
+      {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"WARNING: NaN detected in TensorRT output (batch {positionCount} positions, "
+                        + $"{elementCount} elements, {headDescription}); substituting 0. Cumulative occurrences: {total}.");
+      }
+      finally
+      {
+        Console.ForegroundColor = prev;
+      }
+    }
+  }
+
+
+  /// <summary>
+  /// Scans the raw output buffer tensor-by-tensor to identify which head(s) contain NaN values.
+  /// Returns a descriptor suitable for embedding in the NaN warning message,
+  /// e.g. "MLH head", "value, policy heads", or "unknown head" if none matched.
+  /// </summary>
+  private string IdentifyNaNHeads(ReadOnlySpan<Half> rawSpan, int positionCount, int engineBatchSize)
+  {
+    List<string> heads = null;
+
+    int currentOffset = 0;
+    for (int t = 0; t < outputInfos.Length; t++)
+    {
+      int sizePerPos = (int)(outputInfos[t].Size / largestEngineBatchSize);
+      int tensorSize = engineBatchSize * sizePerPos;
+      int usedSize = positionCount * sizePerPos;
+
+      if (usedSize > 0 && currentOffset + usedSize <= rawSpan.Length)
+      {
+        if (MathUtils.ContainsNaN(rawSpan.Slice(currentOffset, usedSize)))
+        {
+          string name = outputInfos[t].Name;
+          if (name.StartsWith("/output/"))
+          {
+            name = name["/output/".Length..];
+          }
+          (heads ??= new List<string>()).Add(name);
+        }
+      }
+
+      // Align to 128-element boundary (must match ComputeTensorOffsets).
+      const int ALIGN = 128;
+      currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
+    }
+
+    if (heads == null)
+    {
+      return "unknown head";
+    }
+    return heads.Count == 1 ? heads[0] + " head" : string.Join(", ", heads) + " heads";
   }
 
 
@@ -779,86 +1807,19 @@ public class NNEvaluatorTensorRT : NNEvaluator
                                       float[] subBatchOutput,
                                       FP16[] w, FP16[] l, FP16[] w2, FP16[] l2, FP16[] m, FP16[] uncV, FP16[] uncP,
                                       CompressedPolicyVector[] policies,
+                                      CompressedPolicyVector[] policies2,
+                                      CompressedActionVector[] actions,
                                       Half[] plyBinMove, Half[] plyBinCapture,
                                       Half[] punimSelf, Half[] punimOpponent,
+                                      FP16[] extraStat0, FP16[] extraStat1,
                                       float valueHead1Temperature, float valueHead2Temperature,
                                       float valueHead1TemperatureScaling, float valueHead2TemperatureScaling,
+                                      float fractionPolicyHead2, bool policy2BlendLogits,
+                                      float policy1Temperature, float policy2Temperature,
                                       bool wdlIsLogistic)
   {
     // Compute tensor offsets once outside the parallel loop
-    int valueOffset = 0;
-    int value2Offset = 0;
-    int value3Offset = 0;
-    int policyOffset = 0;
-    int mlhOffset = 0;
-    int uncVOffset = 0;
-    int uncPOffset = 0;
-    int pieceMoveOffset = 0;
-    int pieceCaptureOffset = 0;
-    int punimSelfOffset = 0;
-    int punimOpponentOffset = 0;
-
-    int currentOffset = 0;
-    for (int t = 0; t < outputInfos.Length; t++)
-    {
-      int sizePerPos = (int)(outputInfos[t].Size / largestEngineBatchSize);
-      int tensorSize = engineBatchSize * sizePerPos;
-
-      if (t == valueTensorIndex)
-      {
-        valueOffset = currentOffset;
-      }
-      else if (t == value2TensorIndex)
-      {
-        value2Offset = currentOffset;
-      }
-      else if (t == value3TensorIndex)
-      {
-        value3Offset = currentOffset;
-      }
-      else if (t == policyTensorIndex)
-      {
-        policyOffset = currentOffset;
-      }
-      else if (t == mlhTensorIndex)
-      {
-        mlhOffset = currentOffset;
-      }
-      else if (t == uncVTensorIndex)
-      {
-        uncVOffset = currentOffset;
-      }
-      else if (t == uncPTensorIndex)
-      {
-        uncPOffset = currentOffset;
-      }
-      else if (t == pieceMoveTensorIndex)
-      {
-        pieceMoveOffset = currentOffset;
-      }
-      else if (t == pieceCaptureTensorIndex)
-      {
-        pieceCaptureOffset = currentOffset;
-      }
-      else if (t == punimSelfTensorIndex)
-      {
-        punimSelfOffset = currentOffset;
-      }
-      else if (t == punimOpponentTensorIndex)
-      {
-        punimOpponentOffset = currentOffset;
-      }
-
-      // Align to 256-byte boundary (128 fp16 elements) to match
-      // OUTPUT_TENSOR_ALIGN_ELEMS in TensorRTWrapper.cpp.
-      // Required for CUDA graphs: small tensors (e.g. 8-element PUNIM)
-      // would otherwise cause misaligned addresses during graph capture.
-      const int ALIGN = 128;
-      currentOffset += (tensorSize + ALIGN - 1) / ALIGN * ALIGN;
-    }
-
-    // Substitute value3 into value2 if enabled and value3 is present
-    int effectiveValue2Offset = (SUBSTITUTE_VALUE3_INTO_VALUE2_IF_FOUND && value3Size > 0) ? value3Offset : value2Offset;
+    TensorOffsets offsets = ComputeTensorOffsets(engineBatchSize);
 
     // Get policy temperature once
     float policyTemperature = Options?.PolicyTemperature ?? 1.0f;
@@ -876,7 +1837,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       // ===== Extract MLH =====
       if (hasM)
       {
-        int posMlhOffset = mlhOffset + i * mlhSize;
+        int posMlhOffset = offsets.Mlh + i * mlhSize;
         m[resultIndex] = (FP16)MathF.Max(subBatchOutput[posMlhOffset] * 100, 0); // NetTransformer.MLH_DIVISOR = 100
       }
 
@@ -884,7 +1845,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       float uncertaintyV = 0;
       if (hasUncertaintyV)
       {
-        int posUncVOffset = uncVOffset + i * uncVSize;
+        int posUncVOffset = offsets.UncV + i * uncVSize;
         uncertaintyV = subBatchOutput[posUncVOffset];
         uncV[resultIndex] = (FP16)uncertaintyV;
       }
@@ -892,12 +1853,12 @@ public class NNEvaluatorTensorRT : NNEvaluator
       // ===== Extract Uncertainty P =====
       if (hasUncertaintyP)
       {
-        int posUncPOffset = uncPOffset + i * uncPSize;
+        int posUncPOffset = offsets.UncP + i * uncPSize;
         uncP[resultIndex] = (FP16)subBatchOutput[posUncPOffset];
       }
 
       // ===== Extract Value Head 1 =====
-      int posValueOffset = valueOffset + i * valueSize;
+      int posValueOffset = offsets.Value + i * valueSize;
       if (isWDL)
       {
         if (wdlIsLogistic)
@@ -928,7 +1889,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
       // ===== Extract Value Head 2 (if present) =====
       if (hasValueSecondary)
       {
-        int posValue2Offset = effectiveValue2Offset + i * value2Size;
+        int posValue2Offset = offsets.Value2 + i * value2Size;
         float vW2 = subBatchOutput[posValue2Offset];
         float vD2 = subBatchOutput[posValue2Offset + 1];
         float vL2 = subBatchOutput[posValue2Offset + 2];
@@ -942,7 +1903,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
 
       // ===== Extract Policy =====
       int batchIndex = startPos + i;
-      int posPolicyOffset = policyOffset + i * policySize;
+      int posPolicyOffset = offsets.Policy + i * policySize;
 
       MGMoveList moveList = moves.Span[batchIndex];
       int numMoves = moveList.NumMovesUsed;
@@ -980,7 +1941,203 @@ public class NNEvaluatorTensorRT : NNEvaluator
         }
       }
 
-      // Apply softmax using TensorPrimitives for vectorization
+      // ===== Extract Action WDL (if present) =====
+      // IMPORTANT: Must extract actions BEFORE CompressedPolicyVector.Initialize,
+      // because Initialize sorts the indices span in-place (when alreadySorted: false).
+      if (hasAction)
+      {
+        int posActionOffset = offsets.Action + i * actionSizePerPos;
+        ReadOnlySpan<float> actionLogits = subBatchOutput.AsSpan().Slice(posActionOffset, actionSizePerPos);
+
+        // Cap at NUM_MOVE_SLOTS to match CompressedActionVector's inline-array capacity
+        // (matches the truncation already performed by CompressedPolicyVector.Initialize).
+        int mvLimit = Math.Min(numMoves, CompressedPolicyVector.NUM_MOVE_SLOTS);
+
+        // Extract action WDL for each legal move using nnIndex (analogous to policy)
+        for (int mv = 0; mv < mvLimit; mv++)
+        {
+          int nnIndex = indices[mv]; // Use nnIndex to index into action tensor [1858, 3]
+          // IndexNeuralNet can return -1 for moves that are not representable in the NN format;
+          // the adjacent policy loop already handles this via NegativeInfinity logit. Write
+          // default here to keep the action slot index-aligned with the policy slot prior to
+          // SortWithActions inside CompressedPolicyVector.Initialize.
+          if (nnIndex < 0 || 3 * nnIndex + 2 >= actionSizePerPos)
+          {
+            actions[resultIndex][mv] = default;
+            continue;
+          }
+          int baseActionIndex = 3 * nnIndex;
+
+          float a0 = actionLogits[baseActionIndex];     // W logit
+          float a1 = actionLogits[baseActionIndex + 1]; // D logit
+          float a2 = actionLogits[baseActionIndex + 2]; // L logit
+
+          // Numerically stable softmax
+          float actionLogitMax = MathF.Max(MathF.Max(a0, a1), a2);
+          float expW = MathF.Exp(a0 - actionLogitMax);
+          float expD = MathF.Exp(a1 - actionLogitMax);
+          float expL = MathF.Exp(a2 - actionLogitMax);
+          float actionSum = expW + expD + expL;
+
+          // Store (W_prob, L_prob) - D is derived as 1 - W - L
+          actions[resultIndex][mv] = ((Half)(expW / actionSum), (Half)(expL / actionSum));
+        }
+      }
+
+      SideType side = positions.Span[batchIndex].SideToMove;
+
+      bool policyInitialized = false;
+      if (hasPolicySecondary)
+      {
+        // Read policy2 logits for the same moves
+        int posPolicy2Offset = offsets.Policy2 + i * policy2Size;
+        ReadOnlySpan<float> policy2Logits = subBatchOutput.AsSpan().Slice(posPolicy2Offset, policy2Size);
+
+        Span<float> logits2 = stackalloc float[numMoves];
+        float maxLogit2 = float.NegativeInfinity;
+        for (int mv = 0; mv < numMoves; mv++)
+        {
+          int nnIndex = indices[mv];
+          float lg2 = (nnIndex >= 0 && nnIndex < policy2Size) ? policy2Logits[nnIndex] : float.NegativeInfinity;
+          logits2[mv] = lg2;
+          if (lg2 > maxLogit2)
+          {
+            maxLogit2 = lg2;
+          }
+        }
+
+        // Store unblended policy2
+        Span<float> p2Probs = stackalloc float[numMoves];
+        TensorPrimitives.Subtract(logits2, maxLogit2, p2Probs);
+        if (policyTemperature != 1.0f)
+        {
+          TensorPrimitives.Multiply(p2Probs, 1.0f / policyTemperature, p2Probs);
+        }
+        TensorPrimitives.Exp(p2Probs, p2Probs);
+        float sum2 = TensorPrimitives.Sum(p2Probs);
+
+        // Detect numeric underflow for unblended policy2
+        Debug.Assert(sum2 > 0 && !float.IsNaN(sum2),
+          $"Softmax underflow in unblended policy2: sum2={sum2}. " +
+          $"numMoves={numMoves}, policyTemperature={policyTemperature}, maxLogit2={maxLogit2}");
+
+        if (sum2 > 0)
+        {
+          TensorPrimitives.Multiply(p2Probs, 1.0f / sum2, p2Probs);
+        }
+        CompressedPolicyVector.Initialize(ref policies2[resultIndex], side, indices, p2Probs, alreadySorted: false);
+
+        if (fractionPolicyHead2 > 0)
+        {
+          if (policy2BlendLogits)
+          {
+            // Apply per-head temperatures to logits before blending (in logit space).
+            // Temperature is applied by dividing logits: logits_tempered = (logits - max) / temperature.
+            // We subtract max BEFORE temperature scaling to prevent numeric overflow/underflow
+            // when temperature < 1 (which amplifies the logits).
+            Span<float> temperedLogits1 = stackalloc float[numMoves];
+            Span<float> temperedLogits2 = stackalloc float[numMoves];
+
+            if (policy1Temperature != 1.0f)
+            {
+              // Subtract max first, then apply temperature
+              TensorPrimitives.Subtract(logits, maxLogit, temperedLogits1);
+              TensorPrimitives.Multiply(temperedLogits1, 1.0f / policy1Temperature, temperedLogits1);
+            }
+            else
+            {
+              // Still subtract max for consistency (will be added back by softmax logic)
+              TensorPrimitives.Subtract(logits, maxLogit, temperedLogits1);
+            }
+
+            if (policy2Temperature != 1.0f)
+            {
+              // Subtract max first, then apply temperature
+              TensorPrimitives.Subtract(logits2, maxLogit2, temperedLogits2);
+              TensorPrimitives.Multiply(temperedLogits2, 1.0f / policy2Temperature, temperedLogits2);
+            }
+            else
+            {
+              // Still subtract max for consistency
+              TensorPrimitives.Subtract(logits2, maxLogit2, temperedLogits2);
+            }
+
+            // Blend in logit space: weighted average of tempered logits, then softmax
+            float frac1 = 1.0f - fractionPolicyHead2;
+            for (int mv = 0; mv < numMoves; mv++)
+            {
+              logits[mv] = frac1 * temperedLogits1[mv] + fractionPolicyHead2 * temperedLogits2[mv];
+            }
+            maxLogit = logits[0];
+            for (int mv = 1; mv < numMoves; mv++)
+            {
+              if (logits[mv] > maxLogit)
+              {
+                maxLogit = logits[mv];
+              }
+            }
+          }
+          else
+          {
+            // Probability blending: softmax each head with per-head temperature, then blend
+            float p1CombinedTemp = policyTemperature * policy1Temperature;
+            TensorPrimitives.Subtract(logits, maxLogit, logits);
+            if (p1CombinedTemp != 1.0f)
+            {
+              TensorPrimitives.Multiply(logits, 1.0f / p1CombinedTemp, logits);
+            }
+            TensorPrimitives.Exp(logits, logits);
+            float sum1 = TensorPrimitives.Sum(logits);
+            if (sum1 > 0)
+            {
+              TensorPrimitives.Multiply(logits, 1.0f / sum1, logits);
+            }
+
+            float frac1 = 1.0f - fractionPolicyHead2;
+            if (policy2Temperature != 1.0f)
+            {
+              Span<float> temperedP2 = stackalloc float[numMoves];
+              float p2CombinedTemp = policyTemperature * policy2Temperature;
+              TensorPrimitives.Subtract(logits2, maxLogit2, temperedP2);
+              if (p2CombinedTemp != 1.0f)
+              {
+                TensorPrimitives.Multiply(temperedP2, 1.0f / p2CombinedTemp, temperedP2);
+              }
+              TensorPrimitives.Exp(temperedP2, temperedP2);
+              float sumT2 = TensorPrimitives.Sum(temperedP2);
+              if (sumT2 > 0)
+              {
+                TensorPrimitives.Multiply(temperedP2, 1.0f / sumT2, temperedP2);
+              }
+              for (int mv = 0; mv < numMoves; mv++)
+              {
+                logits[mv] = frac1 * logits[mv] + fractionPolicyHead2 * temperedP2[mv];
+              }
+            }
+            else
+            {
+              for (int mv = 0; mv < numMoves; mv++)
+              {
+                logits[mv] = frac1 * logits[mv] + fractionPolicyHead2 * p2Probs[mv];
+              }
+            }
+            if (hasAction)
+            {
+              CompressedPolicyVector.Initialize(ref policies[resultIndex], side, indices, logits, alreadySorted: false,
+                                                withActions: true, ref actions[resultIndex]);
+            }
+            else
+            {
+              CompressedPolicyVector.Initialize(ref policies[resultIndex], side, indices, logits, alreadySorted: false);
+            }
+            policyInitialized = true;
+          }
+        }
+      }
+
+      if (!policyInitialized)
+      {
+        // Apply softmax (for unblended policy1 or logit-blended result)
       TensorPrimitives.Subtract(logits, maxLogit, logits);
 
       if (policyTemperature != 1.0f)
@@ -992,137 +2149,53 @@ public class NNEvaluatorTensorRT : NNEvaluator
       TensorPrimitives.Exp(logits, logits);
 
       float sum = TensorPrimitives.Sum(logits);
+
+        // Detect numeric underflow: if sum is 0 or NaN, softmax failed (likely due to extreme temperature scaling)
+        Debug.Assert(sum > 0 && !float.IsNaN(sum),
+          $"Softmax underflow in ExtractSubBatchResults: sum={sum}. " +
+          $"numMoves={numMoves}, policyTemperature={policyTemperature}, maxLogit={maxLogit}");
+
       if (sum > 0)
       {
         float invSum = 1.0f / sum;
         TensorPrimitives.Multiply(logits, invSum, logits);
       }
 
-      SideType side = positions.Span[batchIndex].SideToMove;
+        if (hasAction)
+        {
+          CompressedPolicyVector.Initialize(ref policies[resultIndex], side, indices, logits, alreadySorted: false,
+                                            withActions: true, ref actions[resultIndex]);
+        }
+        else
+        {
       CompressedPolicyVector.Initialize(ref policies[resultIndex], side, indices, logits, alreadySorted: false);
+        }
+        Debug.Assert(policies[resultIndex].SumProbabilities > 0.995);
+      }
 
       // ===== Extract Ply-Bin Outputs (if present) =====
       if (hasPlyBinOutputs)
       {
         int destOffset = resultIndex * 512;
-
-        // piece_move: softmax per square (8 bins), reverse bin order
-        int posPieceMoveOffset = pieceMoveOffset + i * pieceMoveSizePerPos;
-        for (int sq = 0; sq < 64; sq++)
-        {
-          int srcBase = posPieceMoveOffset + sq * 8;
-          int dstBase = destOffset + sq * 8;
-
-          float max = subBatchOutput[srcBase];
-          for (int b = 1; b < 8; b++)
-          {
-            float v = subBatchOutput[srcBase + b];
-            if (v > max) max = v;
-          }
-
-          float expSum = 0;
-          Span<float> exps = stackalloc float[8];
-          for (int b = 0; b < 8; b++)
-          {
-            float e = MathF.Exp(subBatchOutput[srcBase + b] - max);
-            exps[b] = e;
-            expSum += e;
-          }
-
-          float invSum = 1.0f / expSum;
-          for (int b = 0; b < 8; b++)
-          {
-            plyBinMove[dstBase + b] = (Half)(exps[7 - b] * invSum);
-          }
-        }
-
-        // piece_capture: softmax per square (8 bins), reverse bin order
-        int posPieceCaptureOffset = pieceCaptureOffset + i * pieceCaptureSizePerPos;
-        for (int sq = 0; sq < 64; sq++)
-        {
-          int srcBase = posPieceCaptureOffset + sq * 8;
-          int dstBase = destOffset + sq * 8;
-
-          float max = subBatchOutput[srcBase];
-          for (int b = 1; b < 8; b++)
-          {
-            float v = subBatchOutput[srcBase + b];
-            if (v > max) max = v;
-          }
-
-          float expSum = 0;
-          Span<float> exps = stackalloc float[8];
-          for (int b = 0; b < 8; b++)
-          {
-            float e = MathF.Exp(subBatchOutput[srcBase + b] - max);
-            exps[b] = e;
-            expSum += e;
-          }
-
-          float invSum = 1.0f / expSum;
-          for (int b = 0; b < 8; b++)
-          {
-            plyBinCapture[dstBase + b] = (Half)(exps[7 - b] * invSum);
-          }
-        }
+        int posPieceMoveOffset = offsets.PieceMove + i * pieceMoveSizePerPos;
+        int posPieceCaptureOffset = offsets.PieceCapture + i * pieceCaptureSizePerPos;
+        ExtractPlyBinOutputs(subBatchOutput, posPieceMoveOffset, posPieceCaptureOffset, plyBinMove, plyBinCapture, destOffset);
       }
 
       // ===== Extract PUNIM Outputs (if present) =====
       if (hasPunimOutputs)
       {
         int punimDestOffset = resultIndex * 8;
+        int posPunimSelfOffset = offsets.PunimSelf + i * punimSelfSizePerPos;
+        int posPunimOpponentOffset = offsets.PunimOpponent + i * punimOpponentSizePerPos;
+        ExtractPunimOutputs(subBatchOutput, posPunimSelfOffset, posPunimOpponentOffset, punimSelf, punimOpponent, punimDestOffset);
+      }
 
-        // punim_self: softmax of 8 bins, reverse bin order
-        int posPunimSelfOffset = punimSelfOffset + i * punimSelfSizePerPos;
-        {
-          float max = subBatchOutput[posPunimSelfOffset];
-          for (int b = 1; b < 8; b++)
-          {
-            float v = subBatchOutput[posPunimSelfOffset + b];
-            if (v > max) max = v;
-          }
-
-          float expSum = 0;
-          Span<float> exps = stackalloc float[8];
-          for (int b = 0; b < 8; b++)
-          {
-            float e = MathF.Exp(subBatchOutput[posPunimSelfOffset + b] - max);
-            exps[b] = e;
-            expSum += e;
-          }
-
-          float invSum = 1.0f / expSum;
-          for (int b = 0; b < 8; b++)
-          {
-            punimSelf[punimDestOffset + b] = (Half)(exps[7 - b] * invSum);
-          }
-        }
-
-        // punim_opponent: softmax of 8 bins, reverse bin order
-        int posPunimOpponentOffset = punimOpponentOffset + i * punimOpponentSizePerPos;
-        {
-          float max = subBatchOutput[posPunimOpponentOffset];
-          for (int b = 1; b < 8; b++)
-          {
-            float v = subBatchOutput[posPunimOpponentOffset + b];
-            if (v > max) max = v;
-          }
-
-          float expSum = 0;
-          Span<float> exps = stackalloc float[8];
-          for (int b = 0; b < 8; b++)
-          {
-            float e = MathF.Exp(subBatchOutput[posPunimOpponentOffset + b] - max);
-            exps[b] = e;
-            expSum += e;
-          }
-
-          float invSum = 1.0f / expSum;
-          for (int b = 0; b < 8; b++)
-          {
-            punimOpponent[punimDestOffset + b] = (Half)(exps[7 - b] * invSum);
-          }
-        }
+      // ===== Extract Q Deviation Outputs (if present) =====
+      if (hasQDeviation)
+      {
+        extraStat0[resultIndex] = (FP16)subBatchOutput[offsets.QDevLower + i * qDevLowerSize];
+        extraStat1[resultIndex] = (FP16)subBatchOutput[offsets.QDevUpper + i * qDevUpperSize];
       }
     });
   }
@@ -1230,6 +2303,7 @@ public class NNEvaluatorTensorRT : NNEvaluator
     //const bool ENABLE_GRAPHS = false;
     bool forceBF16 = options is NNEvaluatorOptionsCeres optionsCeres && optionsCeres.UseBF16;
     bool refittable = options is NNEvaluatorOptionsCeres optionsCeresRefit && optionsCeresRefit.Refittable;
+    int fp32AllNorms = options is NNEvaluatorOptionsCeres optionsCeresNorms ? optionsCeresNorms.Fp32AllNorms : -1;
     NNEvaluatorTensorRT trtNativeEngine = new(netFileName,
                                               netType,
                                               EXACT_BATCHES ? EnginePoolMode.Exact : EnginePoolMode.Range,
@@ -1240,7 +2314,8 @@ public class NNEvaluatorTensorRT : NNEvaluator
                                               softMaxBatchSize: 1024,
                                               optimizationLevel: options.OptimizationLevel,
                                               forceBF16: forceBF16,
-                                              refittable: refittable);
+                                              refittable: refittable,
+                                              fp32AllNormsOverride: fp32AllNorms);
     trtNativeEngine.Options = options;
 
     EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true; // ** TODO: remove/rework

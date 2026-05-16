@@ -17,8 +17,6 @@ using System;
 using System.Runtime.CompilerServices;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Storage;
-using Ceres.MCGS.Storage.Structs;
 
 #endregion
 

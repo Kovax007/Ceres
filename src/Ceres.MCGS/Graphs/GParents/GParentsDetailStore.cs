@@ -28,12 +28,12 @@ namespace Ceres.MCGS.Graphs.GParents;
 /// determined by GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT.
 /// This version uses incremental allocation and an overallocation factor to reduce OS calls.
 /// </summary>
-internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentDetailsStruct>
+internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentsDetailsStruct>
 {
   /// <summary>
   /// The block (segment) size is defined as the maximum number of entries per segment.
   /// </summary>
-  public const int SEGMENT_BLOCK_SIZE = GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT;
+  public const int SEGMENT_BLOCK_SIZE = GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT;
 
   /// <summary>
   /// Extra segments allocated beyond the expected maximum (optional, here set to zero).
@@ -61,7 +61,17 @@ internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentDetailsStruct>
   /// <summary>
   /// Underlying memory buffer.
   /// </summary>
-  public MemoryBufferOS<GParentDetailsStruct> MemoryBufferOSStore => Entries;
+  public MemoryBufferOS<GParentsDetailsStruct> MemoryBufferOSStore => Entries;
+
+
+  /// <summary>
+  /// Resets the next free block index.
+  /// </summary>
+  internal new int NextFreeBlockIndex
+  {
+    get => nextFreeBlockIndex;
+    set => nextFreeBlockIndex = value;
+  }
 
 
   /// <summary>
@@ -81,7 +91,7 @@ internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentDetailsStruct>
   /// </summary>
   /// <param name="index">The segment index (nonzero).</param>
   /// <returns>Reference to the allocated segment.</returns>
-  internal ref GParentDetailsStruct SegmentRef(int index)
+  internal ref GParentsDetailsStruct SegmentRef(int index)
   {
     // Use the base method SpanAtIndex to get a span for one segment and return the first element by reference.
     return ref SpanAtIndex(index, 1)[0];
@@ -95,17 +105,17 @@ internal class GParentsDetailStore : MemoryBufferOSBlocked<GParentDetailsStruct>
   /// <param name="index">Segment index to dump.</param>
   internal void DumpSegmentsToConsole(int index)
   {
-    ref GParentDetailsStruct segment = ref SegmentRef(index);
-    for (int i = 0; i < GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT; i++)
+    ref GParentsDetailsStruct segment = ref SegmentRef(index);
+    for (int i = 0; i < GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT; i++)
     {
       Console.WriteLine($"Segment {index} entry {i} = {segment.Entries[i]}");
     }
 
     // If the last entry is negative, it indicates a follow pointer.
-    if (segment.Entries[GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT - 1].IsLink)
+    if (segment.Entries[GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT - 1].IsLink)
     {
       Console.WriteLine("follow");
-      DumpSegmentsToConsole(segment.Entries[GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT - 1].AsSegmentLinkIndex);
+      DumpSegmentsToConsole(segment.Entries[GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT - 1].AsSegmentLinkIndex);
     }
   }
 }

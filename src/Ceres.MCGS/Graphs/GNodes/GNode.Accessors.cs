@@ -20,9 +20,7 @@ using Ceres.Base.DataTypes;
 using Ceres.Chess;
 using Ceres.MCGS.Graphs.GEdgeHeaders;
 using Ceres.MCGS.Graphs.GEdges;
-using Ceres.MCGS.LowLevel;
 using Ceres.MCGS.Search.Params;
-using Ceres.MCGS.Storage.Structs;
 
 #endregion
 
@@ -32,28 +30,20 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
 {
   #region Fields containing accumulated values during search
 
-  /// <summary>
-  /// Number of visits to self plus children.
-  /// </summary>
-  public readonly int N => NodeRef.N;
+    /// <summary>
+    /// Number of visits to self plus children.
+    /// </summary>
+    public readonly int N => NodeRef.N;
 
-  #endregion
+    #endregion
 
-  #region Fields directly from neural network output or search initialization
+    #region Fields directly from neural network output or search initialization
 
-  /// <summary>
-  /// The number of children that have been visited in the current search
-  /// Note that children are always visited in descending order by the policy prior probability.
-  /// Also note that in rare circumstances nodes could have been visited (as counted by this number)
-  /// but might actually have an N of 0 (e.g if they were abandoned nodes due to NN buffer hitting its optimal batch size).
-  /// </summary>
-  public readonly byte NumEdgesVisited => NodeRef.NumEdgesVisited;
-
-  /// <summary>
-  /// Number of children which have been expanded 
-  /// (a corresponding node created in the tree).
-  /// </summary>
-  public readonly byte NumEdgesExpanded => NodeRef.NumEdgesExpanded;
+    /// <summary>
+    /// Number of children which have been expanded 
+    /// (a corresponding node created in the graph).
+    /// </summary>
+    public readonly byte NumEdgesExpanded => NodeRef.NumEdgesExpanded;
 
   /// <summary>
   /// Win probability.
@@ -79,6 +69,12 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   /// Uncertainty associated with policy.
   /// </summary>
   public readonly FP16 UncertaintyPolicy => NodeRef.UncertaintyPolicy;
+
+  /// <summary>
+  /// Fortress probability metric: minimum P(NEVER) over all pawn squares.
+  /// High values indicate a pawn unlikely to ever move, suggesting fortress-like structure.
+  /// </summary>
+  public readonly float FortressP => NodeRef.FortressP;
 
   /// <summary>
   /// Number of policy moves (children)
@@ -168,7 +164,7 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
 #endif
 
   /// <summary>
-  /// If the node belonged to a prior seacrh tree but is 
+  /// If the node belonged to a prior seacrh graph but is 
   /// now unreachable due to a new root having been swapped into place.
   /// </summary>
   public readonly bool IsOldGeneration => NodeRef.miscFields.IsOldGeneration;
@@ -189,10 +185,6 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   public readonly byte NumRank2Pawns => NodeRef.miscFields.NumRank2Pawns;
 
   /// <summary>
-  /// If the node was evaluated by the secondary (alternate) neural network.
-  /// </summary>
-  public readonly bool SecondaryNN => NodeRef.miscFields.IsSearchRoot;
-  /// <summary>
   /// If the node corresponds to a position with white to play.
   /// </summary>
   public readonly bool IsWhite => NodeRef.miscFields.IsWhite;
@@ -206,7 +198,7 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
 
 
   /// <summary>
-  /// Indicator if the first node in the virtual transposition subtree 
+  /// Indicator if the first node in the virtual transposition subgraph
   /// has been identified as a draw by repetition.
   /// </summary>
   public readonly bool IsDirty => NodeRef.miscFields.IsDirty;
@@ -278,6 +270,40 @@ public readonly partial struct GNode : IComparable<GNode>, IEquatable<GNode>
   /// Average draw percentage.
   /// </summary>
   public readonly double D => NodeRef.D;
+
+  /// <summary>
+  /// Computes the D value (draw probability) from immediate children.
+  /// Used for cold-path root D recomputation (e.g., UCI display).
+  /// This eliminates possible staleness (but only down one level).
+  /// </summary>
+  /// <returns>The computed D value.</returns>
+  public readonly double ComputeDFromChildren()
+  {
+    if (N <= 1)
+    {
+      return DrawP;
+    }
+
+    double dSum = DrawP; // self contribution (1 visit for initial eval)
+    for (int i = 0; i < NumEdgesExpanded; i++)
+    {
+      GEdge edge = ChildEdgeAtIndex(i);
+      if (edge.N > 0)
+      {
+        if (edge.Type == GEdgeStruct.EdgeType.ChildEdge)
+        {
+          int nNonRep = edge.N - edge.NDrawByRepetition;
+          dSum += edge.ChildNode.D * nNonRep + 1.0 * edge.NDrawByRepetition;
+        }
+        else if (edge.Type == GEdgeStruct.EdgeType.TerminalEdgeDrawn)
+        {
+          dSum += 1.0 * edge.N;
+        }
+        // TerminalEdgeDecisive: D=0, no contribution
+      }
+    }
+    return dSum / N;
+  }
 
   /// <summary>
   /// Average win percentage.

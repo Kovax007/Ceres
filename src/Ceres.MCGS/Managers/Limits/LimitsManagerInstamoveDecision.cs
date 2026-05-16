@@ -17,27 +17,26 @@
 #endregion
 
 
-namespace Ceres.MCGS.Managers.Limits
+namespace Ceres.MCGS.Managers.Limits;
+
+/// <summary>
+/// Decision made by an IManagerGameLimit
+/// if an instamove should be made in a given search state.
+/// </summary>
+public enum LimitsManagerInstamoveDecision
 {
   /// <summary>
-  /// Decision made by an IManagerGameLimit
-  /// if an instamove should be made in a given search state.
+  /// The manager does not request any particular decision.
   /// </summary>
-  public enum LimitsManagerInstamoveDecision
-  {
-    /// <summary>
-    /// The manager does not request any particular decision.
-    /// </summary>
-    NoDecision,
+  NoDecision,
 
-    /// <summary>
-    /// The manager requests an instamove.
-    /// </summary>
-    Instamove,
+  /// <summary>
+  /// The manager requests an instamove.
+  /// </summary>
+  Instamove,
 
-    /// <summary>
-    /// The manager requests instamove not be made.
-    /// </summary>
-    DoNotInstamove
-  }
+  /// <summary>
+  /// The manager requests instamove not be made.
+  /// </summary>
+  DoNotInstamove
 }

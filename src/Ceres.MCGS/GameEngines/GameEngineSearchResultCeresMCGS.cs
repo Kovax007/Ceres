@@ -19,6 +19,7 @@ using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Base.Benchmarking;
 
+using Ceres.MCGS.Managers;
 using Ceres.MCGS.Search;
 using Ceres.Chess.MoveGen;
 using Ceres.MCGS.Search.Coordination;
@@ -46,10 +47,6 @@ public record GameEngineSearchResultCeresMCGS : GameEngineSearchResult
   /// Information about the best (selected move) from the search.
   /// </summary>
   public readonly BestMoveInfoMCGS BestMoveInfo;
-
-  public MGMove BestMoveMG { get; private set; }
-
-  public float ScoreQRoot { get; private set; }
 
   public GameEngineSearchResultsStats Stats;
 
@@ -90,5 +87,20 @@ public record GameEngineSearchResultCeresMCGS : GameEngineSearchResult
     BestMoveInfo = bestMoveInfo;
     ScoreQRoot = scoreQRoot;
     Stats = new GameEngineSearchResultsStats() with { RatioVisitsToNodes = ratioVisitsToNodes };
+
+    // Populate the new search statistics fields from the manager.
+    MCGSManager manager = search.Manager;
+    NumNodesWhenChoseTopNNode = manager.NumNodesWhenChoseTopNNode;
+    NumNNBatches = search.SearchRootNode.Graph.NNBatchesCount;
+    NumNNNodes = search.SearchRootNode.Graph.NNPositionEvaluationsCount;
+    TopNNodeN = manager.TopNChildN;
+    FractionNumNodesWhenChoseTopNNode = manager.FractionNumNodesWhenChoseTopNNode;
+    AvgDepth = manager.AvgDepth;
+    MaxDepth = manager.MaxDepth;
+    NodeSelectionYieldFrac = manager.Engine.NodeSelectionYieldFrac;
+    PickedNonTopNMoveStr = bestMoveInfo?.BestMoveWasTopN == false ? "!" : " ";
+    CountTablebaseHits = manager.CountTablebaseHits;
+    CountSearchContinuations = search.CountSearchContinuations;
+    VisitEntropy = manager.Engine.Graph.CalcAvgVisitEntropy();
   }
 }

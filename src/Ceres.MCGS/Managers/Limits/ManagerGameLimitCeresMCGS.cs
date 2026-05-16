@@ -50,11 +50,11 @@ public class ManagerGameLimitCeresMCGS : IManagerGameLimit
   {
     int priorRootN = inputs.PriorMoveStats != null && inputs.PriorMoveStats.Count > 1 ? inputs.PriorMoveStats[^2].FinalN : 0;
     int thisRootN = inputs.RootN;
-    float treeReuseShrinkageMultiplier = 1.0f;
+    float graphReuseShrinkageMultiplier = 1.0f;
     if (inputs.QuickMoveEnabled && priorRootN != 0 && thisRootN != 0)
     {
       float fracNodesRetainedSinceLastMove = (float)thisRootN / priorRootN;
-      treeReuseShrinkageMultiplier = MapFractionGraphReusedToShrinkageMultiplier(fracNodesRetainedSinceLastMove);
+      graphReuseShrinkageMultiplier = MapFractionGraphReusedToShrinkageMultiplier(fracNodesRetainedSinceLastMove);
 //Console.WriteLine(treeReuseShrinkageMultiplier + "  " + fracNodesRetainedSinceLastMove);
     }
 
@@ -76,7 +76,7 @@ public class ManagerGameLimitCeresMCGS : IManagerGameLimit
     const bool VERBOSE = false;
     if (VERBOSE)
     {
-      Console.WriteLine($"{treeReuseShrinkageMultiplier,5:F2}" + " " + priorRootN + " -> " + thisRootN + "  (+" + (thisRootN - priorRootN) + ")");
+      Console.WriteLine($"{graphReuseShrinkageMultiplier,5:F2}" + " " + priorRootN + " -> " + thisRootN + "  (+" + (thisRootN - priorRootN) + ")");
     }
 
     // When we are behind then it's worth taking a gamble and using more time
@@ -92,7 +92,7 @@ public class ManagerGameLimitCeresMCGS : IManagerGameLimit
     };
 
 
-    // Spend 2.5x time first move of game (definitely no tree reuse available)
+    // Spend 2.5x time first move of game (definitely no graph reuse available)
     float factorFirstMove = inputs.IsFirstMoveOfGame ? 2.5f : 1.0f;
 
     // Make a divisor which is between about 13 and 18
@@ -130,7 +130,7 @@ public class ManagerGameLimitCeresMCGS : IManagerGameLimit
 
     float adjustedBaseMultiplier = earlyGameExtension ? BASE_MULTIPLIER_EARLY : BASE_MULTIPLIER_NOT_EARLY;
     float ret = Aggressiveness
-              * treeReuseShrinkageMultiplier 
+              * graphReuseShrinkageMultiplier 
               * adjustedBaseMultiplier 
               * (1.0f / baseDivisor) 
               * factorWinningness 
@@ -163,7 +163,7 @@ public class ManagerGameLimitCeresMCGS : IManagerGameLimit
   /// <summary>
   /// Returns the shrinkage multiplier to be applied to limits allocation
   /// based on the fraction of the graph which is being retained from prior position.
-  /// If for example the full tree size was retained (input = 1.0) 
+  /// If for example the full graph size was retained (input = 1.0) 
   /// allocation would be cut to = 45%.
   /// </summary>
   /// <param name="fracReused"></param>

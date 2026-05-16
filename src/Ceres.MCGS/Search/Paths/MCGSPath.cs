@@ -16,9 +16,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
+using Ceres.Base.DataTypes;
 using Ceres.Chess;
 using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.MoveGen;
+using Ceres.Chess.Positions;
 using Ceres.MCGS.Graphs;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
@@ -26,8 +28,8 @@ using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.PathEvaluators;
 using Ceres.MCGS.Search.Phases;
+using Ceres.MCGS.Search.Phases.Evaluation;
 using Ceres.MCGS.Search.Strategies;
-using Ceres.MCGS.Storage;
 
 # endregion
 
@@ -106,6 +108,18 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   public PosHash96MultisetRunning RunningHash;
 
   /// <summary>
+  /// Per-square ply-since-last-move values at the current path frontier (64 bytes).
+  /// Maintained incrementally during selection via PossiblyBranched.
+  /// Only valid when Engine.NeedsPlySinceLastMove is true.
+  /// </summary>
+  internal PlySinceLastMoveArray PlySinceLastMove;
+
+  /// <summary>
+  /// Ping-pong buffer used by PlySinceLastMoveUpdater.ApplyMoveWithSwap.
+  /// </summary>
+  internal PlySinceLastMoveArray PlySinceLastMoveTemp;
+
+  /// <summary>
   /// Total number of nodes in the complete path 
   /// (including all antecedent segments before the final branch).
   /// </summary>
@@ -136,6 +150,9 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     RunningHash = default;
     NumVisitsInPath = default;
     PendingResumptionNextSlotToUse = default;
+    // Note: PlySinceLastMove and PlySinceLastMoveTemp are NOT reset here.
+    // They are value types that are re-populated when the path is initialized in ExtendPathsRecursively.
+    // Their contents are overwritten when Engine.NeedsPlySinceLastMove is true.
   }
 
   #region Helper accessors
@@ -300,7 +317,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   {
     Debug.Assert(parentNode.IsEvaluated);
 
-    EnsureCapacity(numSlotsUsed + 1);    
+    EnsureCapacity(numSlotsUsed + 1);
 
     slots[numSlotsUsed].Init(this, parentNode, indexInParent,
                              childHashStandalone64,
@@ -313,7 +330,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
 
     if (numSlotsUsed > 1)
     {
-      Debug.Assert(slots[numSlotsUsed - 1].ParentChildEdge.ParentNode 
+      Debug.Assert(slots[numSlotsUsed - 1].ParentChildEdge.ParentNode
                 != slots[numSlotsUsed - 2].ParentChildEdge.ParentNode);
     }
 
@@ -345,7 +362,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
       ref readonly MCGSPathVisit visitRef = ref pathMember.PathVisitRef;
       ref readonly GEdge visitEdge = ref visitRef.ParentChildEdge;
 
-      if (visitEdge.Type == GEdgeStruct.EdgeType.ChildEdge 
+      if (visitEdge.Type == GEdgeStruct.EdgeType.ChildEdge
        && !pathMember.IsPathLeaf
        && visitEdge.ChildNode.Index == descendentNodeIndex)
       {
@@ -368,7 +385,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     return false;
   }
 
-  
+
   /// <summary>
   /// Returns if a cycle exists in the path.
   /// </summary>
@@ -399,7 +416,78 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   public ref MCGSPathVisit LeafVisitRef => ref slots[numSlotsUsed - 1];
 
 
-  public ref MCGSPathVisit LastVisitDuringBackup => 
+  /// <summary>
+  /// Returns a PositionWithHistory representing the full sequence of positions
+  /// from the search root (including prehistory) to the leaf position.
+  /// </summary>
+  public PositionWithHistory LeafPositionWithHistory
+  {
+    get
+    {
+      // Get prehistory positions from Graph.Store.HistoryHashes.
+      ReadOnlySpan<MGPosition> prehistoryPositions = Graph.Store.HistoryHashes.PriorPositionsMG;
+
+      // Get positions from graph root to search root.
+      GraphRootToSearchRootNodeInfo[] graphToSearchRootPath = Engine.SearchRootPathFromGraphRoot;
+      int graphToSearchRootCount = graphToSearchRootPath?.Length ?? 0;
+
+      // Count path visits (excluding root initialization paths).
+      int pathVisitCount = IsRootInitializationPath ? 0 : NumVisitsInPath;
+
+      // Calculate total positions:
+      // - Prehistory positions
+      // - Graph-root-to-search-root positions
+      // - Path visit positions (child positions from each visit)
+      int totalPositions = prehistoryPositions.Length
+                         + graphToSearchRootCount
+                         + pathVisitCount;
+
+      // Collect all positions in order.
+      Position[] allPositions = new Position[totalPositions];
+      int index = 0;
+
+      // 1. Add prehistory positions.
+      for (int i = 0; i < prehistoryPositions.Length; i++)
+      {
+        allPositions[index++] = prehistoryPositions[i].ToPosition;
+      }
+
+      // 2. Add positions from graph root to search root.
+      if (graphToSearchRootPath != null)
+      {
+        for (int i = 0; i < graphToSearchRootPath.Length; i++)
+        {
+          allPositions[index++] = graphToSearchRootPath[i].ChildPosMG.ToPosition;
+        }
+      }
+
+      // 3. Add path visit positions (from root to leaf).
+      if (pathVisitCount > 0)
+      {
+        // Collect path visits from leaf to root, then reverse.
+        Span<MGPosition> pathPositions = stackalloc MGPosition[pathVisitCount];
+        int pathIndex = pathVisitCount - 1;
+
+        foreach (MCGSPathVisitMember visitMember in PathVisitsLeafToRoot)
+        {
+          pathPositions[pathIndex--] = visitMember.PathVisitRef.ChildPosition;
+        }
+
+        // Copy path positions in forward order.
+        for (int i = 0; i < pathVisitCount; i++)
+        {
+          allPositions[index++] = pathPositions[i].ToPosition;
+        }
+      }
+
+      // Construct PositionWithHistory from the collected positions.
+      // The first position may be missing en passant info when reconstructing moves.
+      return new PositionWithHistory(allPositions.AsSpan(), firstPositionMayBeMissingEnPassant: true, recalcRepetitions: true);
+    }
+  }
+
+
+  public ref MCGSPathVisit LastVisitDuringBackup =>
     ref PendingResumptionNextSlotToUse is null ? ref slots[numSlotsUsed - 1]
                                                : ref slots[PendingResumptionNextSlotToUse.Value];
 
@@ -435,7 +523,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
       return true;
     }
 
-    return HashFoundInGraphRootPathOrPrehistory(Engine.Graph, Engine.SearchRootPathFromGraphRoot, 
+    return HashFoundInGraphRootPathOrPrehistory(Engine.Graph, Engine.SearchRootPathFromGraphRoot,
                                                 matchHashValue, ref haveSeenRepetition);
   }
 
@@ -458,9 +546,10 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
   /// <param name="moveWasIrreversibleMove"></param>
   /// <returns></returns>
   public MCGSPath PossiblyBranched(int numVisitsRemaining,
-                                   int numVisitsAttemptedThisPath, 
-                                   PosHash96 thisChildHashStandalone, 
-                                   bool moveWasIrreversibleMove)
+                                   int numVisitsAttemptedThisPath,
+                                   PosHash96 thisChildHashStandalone,
+                                   bool moveWasIrreversibleMove,
+                                   MGMove moveMG)
   {
     if (numVisitsRemaining == 0)
     {
@@ -472,6 +561,12 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
       }
 
       RunningHash.Add(thisChildHashStandalone);
+
+      if (Engine.NeedsPlySinceLastMove)
+      {
+        PlySinceLastMoveArray.ApplyMoveWithSwap(ref PlySinceLastMove, ref PlySinceLastMoveTemp, in moveMG);
+      }
+
       return this;
     }
 
@@ -503,7 +598,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     // already copied above      splittingPath.slots[0].ParentFirstVisitCacheInfoIndex = this.slots[numSlotsUsed - 1].ParentFirstVisitCacheInfoIndex;
 
     splittingPath.numSlotsUsed = 1;
-    
+
     splittingPath.NumVisitsInPath = this.NumVisitsInPath;
     splittingPath.TerminationReason = this.TerminationReason;
     splittingPath.MaxQSubOptimality = this.MaxQSubOptimality;
@@ -515,7 +610,13 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     }
 
     splittingPath.RunningHash.Add(thisChildHashStandalone);
-   
+
+    if (Engine.NeedsPlySinceLastMove)
+    {
+      ((ReadOnlySpan<byte>)PlySinceLastMove.SquarePlySince).CopyTo(splittingPath.PlySinceLastMove.SquarePlySince);
+      PlySinceLastMoveArray.ApplyMoveWithSwap(ref splittingPath.PlySinceLastMove, ref splittingPath.PlySinceLastMoveTemp, in moveMG);
+      // this.PlySinceLastMove stays at pre-move state (correct for next child)
+    }
 
     // Remove the last visit from the current path (unless keepLastVisit is true).
     TerminationReason = MCGSPathTerminationReason.NotYetTerminated;
@@ -525,7 +626,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     return splittingPath;
   }
 
-# endregion
+  #endregion
 
 
   /// <summary>
@@ -563,7 +664,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
         }
         haveSeenAccepted = true;
       }
-    
+
       Console.WriteLine($"#{i,3} {visit}");
     }
     Console.WriteLine();
@@ -715,7 +816,8 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
 
     if (NumVisitsInPath > 0 && LeafVisitRef.ParentChildEdge.Type == GEdgeStruct.EdgeType.TerminalEdgeDrawn)
     {
-      Debug.Assert(TerminationReason == MCGSPathTerminationReason.TerminalEdge);
+      Debug.Assert(TerminationReason == MCGSPathTerminationReason.TerminalEdge
+                || TerminationReason == MCGSPathTerminationReason.DrawByRepetitionInCoalesceMode);
     }
   }
 
@@ -757,7 +859,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
     if (PendingResumptionNextSlotToUse is not null)
     {
       ref readonly MCGSPathVisit lastProcessedPathVisit = ref slots[PendingResumptionNextSlotToUse.Value];
-//        ref readonly InFlightInfo inFlightInfo = ref lastProcessedPathVisit.ParentInFlightInfo;
+      //        ref readonly InFlightInfo inFlightInfo = ref lastProcessedPathVisit.ParentInFlightInfo;
     }
 
     string lastPathVisitStr;
@@ -811,7 +913,7 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
 
 
 
-  public enum PathRepetitionResult { None, InPreHistory, InPath};
+  public enum PathRepetitionResult { None, InPreHistory, InPath };
 
   /// <summary>
   /// Returns if the path contains any repetitions.
@@ -911,9 +1013,79 @@ public partial class MCGSPath : IEquatable<MCGSPath>, IComparable<MCGSPath>
         return (terminationInfo.GameResult, terminationInfo.V, terminationInfo.DrawP, false);
       }
     }
+    else if (possiblyUseTablebase && TryGetTablebasePly1Termination(in childPos, childMoves, out float tbV, out float tbD))
+    {
+      // Ply-1 tablebase extension: position has one more piece than tablebase covers,
+      // but a capture move exists that leads to a tablebase-proven win.
+      return (GameResult.Checkmate, tbV, tbD, false);
+    }
 
-    // TODO: Also do Ply1 test too?
     return (GameResult.Unknown, float.NaN, float.NaN, false);
+  }
+
+
+  /// <summary>
+  /// Attempts to evaluate a position that is 1 ply away from tablebase coverage.
+  /// Succeeds only when:
+  ///   - the position has exactly one more piece than tablebase max cardinality, and
+  ///   - there exists at least one capture move leading to a tablebase-proven loss for the opponent.
+  /// </summary>
+  /// <param name="childPos">The position to evaluate.</param>
+  /// <param name="childMoves">Legal moves from the position.</param>
+  /// <param name="v">Output: the value (1.0 for win).</param>
+  /// <param name="d">Output: the draw probability (0.0 for decisive).</param>
+  /// <returns>True if a winning capture into tablebase was found.</returns>
+  private bool TryGetTablebasePly1Termination(in MGPosition childPos, MGMoveList childMoves, out float v, out float d)
+  {
+    v = float.NaN;
+    d = float.NaN;
+
+    EvaluatorSyzygy evaluatorTB = Engine.Manager.evaluatorTB;
+    if (evaluatorTB == null)
+    {
+      return false;
+    }
+
+    // Only applies when position has exactly one more piece than tablebase covers.
+    if (childPos.PieceCount != evaluatorTB.MaxCardinality + 1)
+    {
+      return false;
+    }
+
+    // Iterate over capture moves looking for one that leads to a tablebase loss for opponent.
+    for (int i = 0; i < childMoves.NumMovesUsed; i++)
+    {
+      MGMove move = childMoves.MovesArray[i];
+      if (!move.Capture)
+      {
+        continue;
+      }
+
+      // Apply the capture move.
+      MGPosition capturePos = childPos;
+      capturePos.MakeMove(move);
+
+      // After capture, piece count should now be within tablebase range.
+      if (capturePos.PieceCount > evaluatorTB.MaxCardinality)
+      {
+        continue;
+      }
+
+      // Probe the tablebase for the resulting position.
+      SelectTerminationInfo tbInfo = new();
+      bool found = evaluatorTB.Lookup(this, capturePos.ToPosition, ref tbInfo);
+
+      if (found && tbInfo.V < 0)
+      {
+        // Opponent loses after this capture, meaning we have a winning move.
+        // Return win from our perspective.
+        v = 1.0f;
+        d = 0.0f;
+        return true;
+      }
+    }
+
+    return false;
   }
 
 

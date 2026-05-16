@@ -16,106 +16,108 @@
 using System;
 using System.Diagnostics;
 using Ceres.Base.DataTypes;
+using Ceres.MCGS.Graphs;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Managers;
 using Ceres.MCGS.Search.Coordination;
-using Ceres.MCGS.Search.PathEvaluators;
-using Ceres.MCGS.Storage;
-using Ceres.MCGS.Storage.Structs;
-using ManagedCuda.BasicTypes;
-using static Tensorflow.CostGraphDef;
 
 #endregion
 
-namespace Ceres.MCGS.Search.Strategies
+namespace Ceres.MCGS.Search.Strategies;
+
+/// <summary>
+/// Accumulator computed during the selection phase that captures:
+///   - the sum of edge visit counts (N) (plus 1 for itself)
+///   - sum of (N * Q) over children (plus V of the node itself)
+/// over both the node itself and all of its children.
+/// </summary>
+/// <param name="SumN"></param>
+/// <param name="SumW"></param>
+/// <param name="SumD"></param>
+/// <param name="NumVisitsAccepted"></param>
+public readonly record struct NodeSelectAccumulator(double SumN, double SumW, double SumD, int NumVisitsAccepted);
+
+
+/// <summary>
+/// Abstract base class for any selection and backup (backpropagation) strategy.
+/// </summary>
+public abstract class MCGSSelectBackupStrategyBase
 {
-  /// <summary>
-  /// Accumulator computed during the selection phase that captures:
-  ///   - the sum of edge visit counts (N) (plus 1 for itself)
-  ///   - sum of (N * Q) over children (plus V of the node itself)
-  /// over both the node itself and all of its children.
-  /// </summary>
-  /// <param name="SumN"></param>
-  /// <param name="SumW"></param>
-  /// <param name="SumD"></param>
-  /// <param name="NumVisitsAccepted"></param>
-  public readonly record struct NodeSelectAccumulator(double SumN, double SumW, double SumD, int NumVisitsAccepted);
+  public MCGSEngine Engine { get; internal set; }
 
 
   /// <summary>
-  /// Abstract base class for any selection and backup (backpropagation) strategy.
+  /// Constructor.
   /// </summary>
-  public abstract class MCGSSelectBackupStrategyBase
+  /// <param name="engine"></param>
+  public MCGSSelectBackupStrategyBase(MCGSEngine engine)
   {
-    public MCGSEngine Engine { get; internal set; }
-
-
-    /// <summary>
-    /// Constructor.
-    /// </summary>
-    /// <param name="engine"></param>
-    public MCGSSelectBackupStrategyBase(MCGSEngine engine)
-    {
-      Engine = engine;
-    }
-
-
-    /// <summary>
-    /// Runs an algorithm to select the set of children to be next visited.
-    /// </summary>
-    /// <param name="parentNode"></param>
-    /// <param name="selectorID"></param>
-    /// <param name="depth"></param>
-    /// <param name="numChildrenToConsider"></param>
-    /// <param name="numTargetVisits"></param>
-    /// <param name="alsoComputeScores"></param>
-    /// <param name="explorationMultiplier"></param>
-    /// <param name="temperatureMultiplier"></param>
-    /// <param name="childVisitCounts">output number visits to be applied to each child</param>
-    /// <param name="childScores"></param>
-    /// <returns></returns>
-    public abstract NodeSelectAccumulator SelectChildren(GNode parentNode,
-                                                         int selectorID,
-                                                         int depth,
-                                                         int numChildrenToConsider,
-                                                         int numTargetVisits,
-                                                         bool alsoComputeScores,
-                                                         float explorationMultiplier,
-                                                         float temperatureMultiplier,
-                                                         bool refreshStaleEdges,
-                                                         MCGSFutilityPruningStatus[] rootMovePruningStatus,
-                                                         out Span<short> childVisitCounts, // TODO: remove out, use a single shared array passed from caller
-                                                         out Span<double> childScores);
-
-
-    /// <summary>
-    /// Backs up the value of a newly evaluated leaf node to a specified node.
-    /// </summary>
-    /// <param name="node"></param>
-    /// <param name="deltaN"></param>
-    /// <param name="deltaW"></param>
-    /// <param name="deltaD"></param>
-    public abstract void BackupToNode(GNode node, int deltaN, double deltaW, double deltaD);
-
-
-    /// <summary>
-    /// Backs up the value of a newly evaluated leaf node to a specified edge.
-    /// </summary>
-    /// <param name="edge"></param>
-    /// <param name="deltaN"></param>
-    /// <param name="newChildQ"></param>
-    /// <param name="newD"></param>
-    /// <param name="drawKnownToExistAtChild"></param>
-    public abstract void BackupToEdge(GEdge edge, int deltaN, double newQChild, double newD, bool drawKnownToExistAtChild);
-
-
-    /// Returns the number of children (starting from index 0) that are eligible to be considered).
-    /// </summary>
-    /// <param name="node"></param>
-    /// <param name="numTargetVisits"></param>
-    /// <returns></returns>
-    internal abstract int NumChildrenToConsider(GNode node, int numTargetVisits);
+    Engine = engine;
   }
 
+
+  /// <summary>
+  /// Runs an algorithm to select the set of children to be next visited.
+  /// </summary>
+  /// <param name="parentNode"></param>
+  /// <param name="selectorID"></param>
+  /// <param name="depth"></param>
+  /// <param name="numChildrenToConsider"></param>
+  /// <param name="numTargetVisits"></param>
+  /// <param name="alsoComputeScores"></param>
+  /// <param name="explorationMultiplier"></param>
+  /// <param name="temperatureMultiplier"></param>
+  /// <param name="childVisitCounts">output number visits to be applied to each child</param>
+  /// <param name="childScores"></param>
+  /// <returns></returns>
+  public abstract NodeSelectAccumulator SelectChildren(GNode parentNode,
+                                                       int selectorID,
+                                                       int depth,
+                                                       int numChildrenToConsider,
+                                                       int numTargetVisits,
+                                                       bool alsoComputeScores,
+                                                       float explorationMultiplier,
+                                                       float temperatureMultiplier,
+                                                       bool refreshStaleEdges,
+                                                       MCGSFutilityPruningStatus[] rootMovePruningStatus,
+                                                       out Span<short> childVisitCounts, // TODO: remove out, use a single shared array passed from caller
+                                                       out Span<double> childScores);
+
+
+  /// <summary>
+  /// Backs up the value of a newly evaluated leaf node to a specified node.
+  /// </summary>
+  /// <param name="node"></param>
+  /// <param name="deltaN"></param>
+  /// <param name="deltaW"></param>
+  /// <param name="deltaD"></param>
+  public abstract void BackupToNode(GNode node, int deltaN, double deltaW, double deltaD);
+
+
+  /// <summary>
+  /// Backs up the value of a newly evaluated leaf node to a specified edge.
+  /// </summary>
+  /// <param name="edge"></param>
+  /// <param name="deltaN"></param>
+  /// <param name="newChildQ"></param>
+  /// <param name="newD"></param>
+  /// <param name="drawKnownToExistAtChild"></param>
+  public abstract void BackupToEdge(GEdge edge, int deltaN, double newQChild, double newD, bool drawKnownToExistAtChild);
+
+
+  /// Returns the number of children (starting from index 0) that are eligible to be considered).
+  /// </summary>
+  /// <param name="node"></param>
+  /// <param name="numTargetVisits"></param>
+  /// <returns></returns>
+  internal abstract int NumChildrenToConsider(GNode node, int numTargetVisits);
+
+
+  /// <summary>
+  /// Possibly reorders unvisited children by PUCT scores (blending policy and action head values)
+  /// on the node's second visit, before any child selection occurs.
+  /// Default implementation is a no-op; overridden by strategies that support action head rearrangement.
+  /// </summary>
+  internal virtual void PossiblyActionResortUnvisitedChildren(GNode node, Graph graph) { }
 }

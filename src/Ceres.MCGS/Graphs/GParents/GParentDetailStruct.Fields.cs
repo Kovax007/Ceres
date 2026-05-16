@@ -24,7 +24,7 @@ namespace Ceres.MCGS.Graphs.GParents;
   /// <summary>
   /// An inline array of a fixed number of MCTSNodeParentInfo.
   /// </summary>
-  [System.Runtime.CompilerServices.InlineArray(GParentDetailsStruct.MAX_ENTRIES_PER_SEGMENT)]
+  [System.Runtime.CompilerServices.InlineArray(GParentsDetailsStruct.MAX_ENTRIES_PER_SEGMENT)]
   struct MCTSNodeParentsListSegmentValueInline
   {
     GParentsHeader Entry;
@@ -39,7 +39,7 @@ namespace Ceres.MCGS.Graphs.GParents;
 /// </summary>
 [Serializable]
 [StructLayout(LayoutKind.Sequential, Pack = 1, Size = MAX_ENTRIES_PER_SEGMENT * sizeof(int))]
-public record struct GParentDetailsStruct
+public record struct GParentsDetailsStruct
 {
   /// <summary>
   /// Up to 8 entries per segment, or entries and a link to next segment.
@@ -83,7 +83,7 @@ public record struct GParentDetailsStruct
 
     int lastIndex = MAX_ENTRIES_PER_SEGMENT - 1;
 
-    GParentDetailsStruct segment = this;
+    GParentsDetailsStruct segment = this;
 
     while (true)
     {

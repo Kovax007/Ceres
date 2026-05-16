@@ -20,7 +20,7 @@ using Ceres.Base.Misc;
 using Ceres.Base.OperatingSystem;
 using Ceres.Chess.UserSettings;
 using Ceres.MCGS.Graphs.GraphStores;
-using Ceres.MCGS.Storage;
+using Ceres.MCGS.Utils;
 
 #endregion
 
@@ -32,7 +32,18 @@ namespace Ceres.MCGS.Search.Params;
 /// </summary>
 public static class MCGSParamsFixed
 {
+  /// <summary>
+  /// If graph rewriting operations should be logged to console.
+  /// </summary>
+  public const bool GRAPH_REWRITE_DUMP_REUSE_DIAGNOSTICS = true;
+
   public const bool LOG_LIVE_STATS = false;
+
+  /// <summary>
+  /// If true, transposition hash tables use ConcurrentDictionary (legacy behavior).
+  /// If false, uses ExtendibleConcurrentHashMap which avoids stop-the-world resize pauses.
+  /// </summary>
+  public const bool USE_LEGACY_CONCURRENT_DICTIONARY = false;
 
   public const bool DEBUG_MODE = false;
   public const bool LOGGING_ENABLED = false; // performance degradation high when in Debug mode
@@ -40,9 +51,16 @@ public static class MCGSParamsFixed
 
   public const bool VALIDATE_GRAPH_EACH_BATCH = false;
 
+  /// <summary>
+  /// If true, CB-GPUCT (Confidence-Bound Graph PUCT) major operations
+  /// emit console traces: activation banner, V_bar recomputation
+  /// (with vanilla-Q comparison), and root-level selection summaries.
+  /// </summary>
+  public const bool DEBUG_CBGPUCT = false;
+
   public const int LOGGING_EXCLUDE_ITERATOR_NUM = -1;
 
-  public const int MIN_N_START_OVERLAP = 1500; // MCTS used 1500
+  public const int MIN_N_START_OVERLAP = 1500;
 
 
   /// <summary>
@@ -87,6 +105,11 @@ public static class MCGSParamsFixed
 
   public const float MOVE_ORDERING_MIN_RATIO_POLICY = 0.15f;
 
+  /// <summary>
+  ///  Someday we might also store ActionV at edges (but would grow size of edges).
+  /// </summary>
+  public const bool GEDGE_HAS_ACTIONV = false;
+
   /// If the DrawKnownToExistAmongChildren field is updated
   /// and used to adjust backed-up values so that 
   /// any "worse than draw" results are converted to draw results
@@ -106,8 +129,6 @@ public static class MCGSParamsFixed
   /// </summary>
   public const bool REDESCENT_MUTIPLIER_ADJUST = true;
 
-  public const bool OUT_OF_ORDER_CHILDREN_ALLOWED = false;
-
 
   // In tests, perhaps especially as N gets larger (e.g. 10000+), numbers less than 0.7 are better (e.g. 0.6 or 0.5)
   public const float RPO_VISIT_COUNT_SHRINK_POWER = 0.6f;//  e.g. 0.5, smaller powers lead to less severe pull toward prior policy
@@ -118,8 +139,6 @@ public static class MCGSParamsFixed
   public const bool LARGE_HARDWARE_CONFIG = true;
 
   public const bool TRACK_NODE_EDGE_UNCERTAINTY = false; // methodology is problematic due to aggregated backups
-
-  public const bool EXPERIMENTAL_FPU_VIA_RPO_ENABLED = false; // this works ok but is slower and shows little/no benefit in strength
 
   /// <summary>
   /// Minimum probability threshold for top policy move to be considered for PV auto-extension.
@@ -176,30 +195,23 @@ public static class MCGSParamsFixed
     throw new System.Exception("Internal error: " + description);
   }
 
-
-    /// <summary>
-    /// If operating system large pages (2MB each under Windows) 
-    /// should be used for the arrays of raw nodes ahd child infos.
-    /// 
-    /// This potentially reduces memory access time, but requires
-    /// elevated priveleges and sufficient contiguous memory available 
-    /// (which cannot be paged)
-    /// 
-    /// NOTE: On a dual socket machine performance was clearly inferior with large pages.
-    ///       On a single socket machine performance was considerably improved, although
-    ///       a limitation (on Windows only) is that larges pages is incompatible 
-    ///       with incremental allocation under Windows.
-    ///       
-    /// NOTE: On Linux sometimes large page allocations may fail and seemingly cannot 
-    ///       be detected in the mreserve or mprotect call, causing access violations.
-    /// </summary>
-    public static bool TryEnableLargePages => CeresUserSettingsManager.Settings.UseLargePages && SoftwareManager.IsLinux;
-
   /// <summary>
-  /// Optionally the storage can make use of an another running process
-  /// which has allocated space for the nodes and children (experimental).
+  /// If operating system large pages (2MB each under Windows) 
+  /// should be used for the arrays of raw nodes ahd child infos.
+  /// 
+  /// This potentially reduces memory access time, but requires
+  /// elevated priveleges and sufficient contiguous memory available 
+  /// (which cannot be paged)
+  /// 
+  /// NOTE: On a dual socket machine performance was clearly inferior with large pages.
+  ///       On a single socket machine performance was considerably improved, although
+  ///       a limitation (on Windows only) is that larges pages is incompatible 
+  ///       with incremental allocation under Windows.
+  ///       
+  /// NOTE: On Linux sometimes large page allocations may fail and seemingly cannot 
+  ///       be detected in the mreserve or mprotect call, causing access violations.
   /// </summary>
-  public const bool STORAGE_USE_EXISTING_SHARED_MEM = GraphStoreConfig.STORAGE_USE_EXISTING_SHARED_MEM;
+  public static bool TryEnableLargePages => CeresUserSettingsManager.Settings.UseLargePages && SoftwareManager.IsLinux;
 
   /// <summary>
   /// In incremental storage mode memory is reserved at initialization
@@ -207,17 +219,8 @@ public static class MCGSParamsFixed
   /// </summary>
   public const bool STORAGE_USE_INCREMENTAL_ALLOC = GraphStoreConfig.STORAGE_USE_INCREMENTAL_ALLOC;
 
-  /// <summary>
-  /// If the IMCTSNodeCache contents should be preserved and 
-  /// subsequently reused after doing tree reuse with swap root method.
-  /// However the speedup is negligible, and there appears to be
-  /// correctness problem when caching of Parent MCTSNodeInfo is enabled
-  /// (including fact that cached Annotation.Pos could have repetition count that's no longer valid).
-  /// </summary>
-  public const bool NEW_ROOT_SWAP_RETAIN_NODE_CACHE = false;
-
-  public const int PARALLEL_SELECT_NUM_INITIAL_WORKERS = 8;
-  public const int PARALLEL_SELECT_NUM_WORKERS_GROWTH_INCREMENT = 4;
+  public const int PARALLEL_SELECT_NUM_INITIAL_WORKERS = 4;
+  public const int PARALLEL_SELECT_NUM_WORKERS_GROWTH_INCREMENT = 2;
 
 
   // **************************************

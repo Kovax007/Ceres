@@ -18,8 +18,6 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using Ceres.Base.OperatingSystem;
 using Ceres.MCGS.Graphs.GraphStores;
-using Ceres.MCGS.Storage;
-using Microsoft.Extensions.Logging;
 
 
 #endregion
@@ -58,7 +56,7 @@ public class GEdgeHeadersStore : MemoryBufferOSBlocked<GEdgeHeaderStruct>
   /// children, as constrained by the data structures.
   /// See comment above.
   /// </summary>
-  public const int MAX_NODES = GraphStoreConfig.ENABLE_MAX_SEARCH_TREE ? 2_100_000_000 : 1_050_000_000;
+  public const int MAX_NODES = GraphStoreConfig.ENABLE_MAX_SEARCH_GRAPH ? 2_100_000_000 : 1_100_000_000;
 
   /// <summary>
   /// Extra edge headers for oversizing.
@@ -77,8 +75,8 @@ public class GEdgeHeadersStore : MemoryBufferOSBlocked<GEdgeHeaderStruct>
              (int)NUM_EDGE_HEADERS_PER_BLOCK,
              BUFFER_EXTRA_EDGE_HEADERS,
              tryEnableLargePages,
-             GraphStoreConfig.STORAGE_USE_EXISTING_SHARED_MEM ? "CeresSharedEdgeHeaders" : null,
-             GraphStoreConfig.STORAGE_USE_EXISTING_SHARED_MEM,
+             null,
+             false,
              GraphStoreConfig.STORAGE_USE_INCREMENTAL_ALLOC)
   {
     parentStore.DebugLogInfo($"GEdgeHeadersStore: Allocating {MaxEdgeHeaders} edge headers," 
@@ -114,7 +112,17 @@ public class GEdgeHeadersStore : MemoryBufferOSBlocked<GEdgeHeaderStruct>
   [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
   public Span<GEdgeHeaderStruct> SpanAtBlockIndex(long moveInfosStartBlockIndex, byte numPolicyMoves)
     => SpanAtBlockIndex(moveInfosStartBlockIndex, (int)numPolicyMoves);
-  
+
+
+  /// <summary>
+  /// Resets the next free block index.
+  /// </summary>
+  internal new int NextFreeBlockIndex
+  {
+    get => nextFreeBlockIndex;
+    set => nextFreeBlockIndex = value;
+  }
+
 
   /// <summary>
   /// Returns a string representation of this store.

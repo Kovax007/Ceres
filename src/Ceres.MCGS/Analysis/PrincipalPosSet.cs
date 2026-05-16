@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
-using Ceres.MCGS.Storage;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 

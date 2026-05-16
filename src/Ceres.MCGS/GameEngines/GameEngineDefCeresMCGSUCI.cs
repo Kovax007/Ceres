@@ -13,20 +13,21 @@
 
 #region Using directives
 
-using Ceres.Chess.NNEvaluators.Defs;
-using Ceres.Chess.GameEngines;
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+
+using Ceres.Chess.NNEvaluators.Defs;
+using Ceres.Chess.GameEngines;
 using Ceres.MCGS.Search.Params;
 
 
 #endregion
 
-namespace Ceres.Features.GameEngines;
+namespace Ceres.MCGS.GameEngines;
 
 /// <summary>
-/// Subclass of GameEngineDef for Ceres engines which are
+/// Subclass of GameEngineDef for Ceres MCGS engines which are
 /// controlled via UCI protocol and live in a separate process.
 /// 
 /// More commonly GameEmgineCeresMCGSInProcess is used due to greater

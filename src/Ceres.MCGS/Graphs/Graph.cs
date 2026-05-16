@@ -22,7 +22,6 @@ using System.Threading;
 using Ceres.Base.DataTypes;
 using Ceres.Base.Misc;
 using Ceres.Base.OperatingSystem;
-
 using Ceres.Chess;
 using Ceres.Chess.MoveGen;
 using Ceres.Chess.Positions;
@@ -31,11 +30,11 @@ using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Graphs.GParents;
 using Ceres.MCGS.Graphs.GraphStores;
-using Ceres.MCGS.LowLevel;
-
 using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.PathEvaluators;
+using Ceres.MCGS.Search.Phases.Evaluation;
 using Ceres.MCGS.Search.PUCT;
+using Ceres.MCGS.Utils;
 
 #endregion
 
@@ -76,7 +75,7 @@ public readonly record struct GraphRootToSearchRootNodeInfo(GNode ChildNode, in 
 /// Managers a rooted directed acyclic graph (DAG) consistig of GNodes (for chess positions)
 /// and associated information (e.g. parent/child linkages).
 /// </summary>
-public unsafe class Graph : IDisposable
+public unsafe partial class Graph : IDisposable
 {
   public readonly GraphStore Store;
 
@@ -93,24 +92,30 @@ public unsafe class Graph : IDisposable
   /// <summary>
   /// Cached pointer to root node (for efficient IsRoot determination).
   /// </summary>
-  internal GNodeStruct* NodesRootNodePtr { get; private set; }
+  internal GNodeStruct* NodesRootNodePtr { get; set; }
 
   public bool IsDisposed => Store == null;
 
   public bool GraphEnabled => Store.GraphEnabled;
 
   /// <summary>
-  /// Dictionary of already extant positions, 
+  /// When true and PositionEquivalence mode is active, eliminates the 96-bit
+  /// position+sequence dictionary and uses the standalone 64-bit dictionary
+  /// as the primary dedup mechanism in LookupOrCreateAndAcquire.
+  /// When false, preserves original dual-dictionary behavior.
+  /// </summary>
+  internal const bool SINGLE_DICTIONARY_POSITION_MODE = true;
+
+  /// <summary>
+  /// Dictionary of already extant positions,
   /// mapping their hash to corresponding node index.
   /// </summary>
-  ConcurrentDictionary<PosHash96MultisetFinalized, int> transpositionPositionAndSequence;
-  //ShardedDictionary<PosHash96MultisetFinalized, int> transpositionPositionAndSequence;
+  internal IConcurrentDictionary<PosHash96MultisetFinalized, int> transpositionPositionAndSequence;
 
   /// <summary>
   /// Dictionary mapping hash to NodeIndexSetIndex (reference to set of nodes with same standalone hash).
   /// </summary>
-  public ConcurrentDictionary<PosHash64WithMove50AndReps, GNodeIndexSetIndex> transpositionsPosStandalone;
-  //public ShardedDictionary<PosHash64WithMove50AndReps, GNodeIndexSetIndex> transpositionsPosStandalone;
+  public IConcurrentDictionary<PosHash64WithMove50AndReps, GNodeIndexSetIndex> transpositionsPosStandalone;
 
 
   /// <summary>
@@ -139,15 +144,6 @@ public unsafe class Graph : IDisposable
 
 
   public int NumLinksToExistingNodes;
-
-#if BLOOM
-    /// <summary>
-    /// Maintain the state of a Bloom filter to which
-    /// all of the prior positions have been applied
-    /// (to serve as the initialization for the start of a search).
-    /// </summary>
-    public BloomFilterSmall PriorPositionsBloom;
-#endif
 
   public bool HasState => Store.HasState;
 
@@ -273,7 +269,6 @@ public unsafe class Graph : IDisposable
     rootNode.SetQNaN();
     rootNode.D = 0;// double.NaN;
     rootNode.NumEdgesExpanded = byte.MaxValue;
-    rootNode.NumEdgesVisited = byte.MaxValue;
     rootNode.NumPolicyMoves = byte.MaxValue;
     // rootNode.blockIndexIntoEdgeHeaderStore = int.MinValue;    
 
@@ -297,43 +292,33 @@ public unsafe class Graph : IDisposable
   }
 
 
-  private void InitEncodedPriorPositions(PositionWithHistory positionHistory)
-  {
-#if BLOOM
-      PriorPositionsBloom.Initialize();
-
-      foreach (Position pos in positionHistory.Positions)
-      {
-        // TODO: consider if the RepetitionCount is/should be considered in the hash value for MGPosition (probably not?)
-        PositionHash96 h96 = MGPositionHashing.HashValue96(pos.ToMGPosition, MCGSParamsFixed.HASH_MODE);
-        PriorPositionsBloom.Add(h96.Low);
-      }
-#endif
-  }
-
-
-
   private void Initialize(int maxNodes)
   {
     // Try to size Dictionary based on maxNodes but don't allow to be too large.
-    // Resizes can be catastrophic (take up to a few seconds if dozens to hundreds of millions)
-    const int MAX_DICTIONARY_SIZE_HINT = 10_000_000; // (probably 8 bytes each)
+    const int MAX_DICTIONARY_SIZE_HINT = 2_000_000; 
     int dictionarySizeHint = Math.Min(maxNodes, MAX_DICTIONARY_SIZE_HINT);
     const int DICTIONARY_CONCURRENCY = 16;
 
-    transpositionPositionAndSequence = GraphEnabled ?
-      new(concurrencyLevel: DICTIONARY_CONCURRENCY,
-          capacity: MAX_DICTIONARY_SIZE_HINT)
-      : null;
+    bool skipPosSeqDict = SINGLE_DICTIONARY_POSITION_MODE && Store.UsesPositionEquivalenceMode;
 
-
-    transpositionsPosStandalone = new(DICTIONARY_CONCURRENCY, dictionarySizeHint);
+    if (MCGSParamsFixed.USE_LEGACY_CONCURRENT_DICTIONARY)
+    {
+      transpositionPositionAndSequence = (GraphEnabled && !skipPosSeqDict)
+        ? new ConcurrentDictionaryAdapter<PosHash96MultisetFinalized, int>(DICTIONARY_CONCURRENCY, dictionarySizeHint)
+        : null;
+      transpositionsPosStandalone = new ConcurrentDictionaryAdapter<PosHash64WithMove50AndReps, GNodeIndexSetIndex>(DICTIONARY_CONCURRENCY, dictionarySizeHint);
+    }
+    else
+    {
+      transpositionPositionAndSequence = (GraphEnabled && !skipPosSeqDict)
+        ? new ConcurrentDictionaryExtendible<PosHash96MultisetFinalized, int>(DICTIONARY_CONCURRENCY, dictionarySizeHint)
+        : null;
+      transpositionsPosStandalone = new ConcurrentDictionaryExtendible<PosHash64WithMove50AndReps, GNodeIndexSetIndex>(DICTIONARY_CONCURRENCY, dictionarySizeHint);
+    }
 
     // Ensure NodeIndexSetStore is cached locally before we use it
     NodeIndexSetStore = Store.NodeIndexSetStore;
-
-    InitEncodedPriorPositions(Store.PositionHistory);
-
+    
     // Initialize the root node with basic information.
     MGPosition initialPos = Store.NodesStore.PositionHistory.FinalPosMG;
     PosHash64 hash64 = MGPositionHashing.Hash64(in initialPos);
@@ -346,7 +331,7 @@ public unsafe class Graph : IDisposable
   }
 
 
-  NodeIndex priorSearchRoot = default;
+  internal NodeIndex priorSearchRoot = default;
 
   /// <summary>
   /// Sets the search root for the graph.
@@ -403,7 +388,8 @@ public unsafe class Graph : IDisposable
   /// <param name="hash"></param>
   /// <param name="okToCreate"></param>
   /// <returns></returns>
-  (GNode node, bool wasCreated, bool wasCollision) LookupOrCreateAndAcquire(PosHash96MultisetFinalized hash, bool okToCreate)
+  (GNode node, bool wasCreated, bool wasCollision) LookupOrCreateAndAcquire(
+    PosHash96MultisetFinalized hash, PosHash64WithMove50AndReps standaloneKey, bool okToCreate)
   {
     int index;
     GNode node;
@@ -418,7 +404,59 @@ public unsafe class Graph : IDisposable
       return (node, true, false);
     }
 
-    // Check if node with exactly same position and sequence already in graph.
+    // In single-dictionary position mode, dedup via the standalone 64-bit dict
+    // instead of the 96-bit position+sequence dict.
+    if (SINGLE_DICTIONARY_POSITION_MODE && Store.UsesPositionEquivalenceMode)
+    {
+      if (transpositionsPosStandalone.TryGetValue(standaloneKey, out GNodeIndexSetIndex setIndex)
+          && !setIndex.IsNull)
+      {
+        int existingIdx = setIndex.IsDirectNodeIndex
+          ? setIndex.DirectNodeIndex
+          : NodeIndexSetStore.sets[setIndex.NodeSetIndex][0].Index;
+        node = this[existingIdx];
+        node.AcquireLock();
+        return (node, false, false);
+      }
+
+      if (!okToCreate)
+      {
+        return (default, false, false);
+      }
+
+      NodeIndex candIdx = Store.NodesStore.AllocateNext();
+      GNode cand = this[candIdx];
+      cand.AcquireLock();
+      cand.NodeRef.WinP = FP16.NaN;
+
+      GNodeIndexSetIndex directIdx = GNodeIndexSetIndex.FromDirectNodeIndex(candIdx.Index);
+      if (transpositionsPosStandalone.TryAdd(standaloneKey, directIdx))
+      {
+        return (cand, true, false);
+      }
+      else
+      {
+        // Lost race: another thread inserted first.
+        cand.ReleaseLock();
+        cand.NodeRef.IsOldGeneration = true;
+
+        if (transpositionsPosStandalone.TryGetValue(standaloneKey, out setIndex) && !setIndex.IsNull)
+        {
+          int existingIdx = setIndex.IsDirectNodeIndex
+            ? setIndex.DirectNodeIndex
+            : NodeIndexSetStore.sets[setIndex.NodeSetIndex][0].Index;
+          GNode collisionNode = this[existingIdx];
+          collisionNode.AcquireLock();
+          return (collisionNode, false, true);
+        }
+        else
+        {
+          throw new NotImplementedException("Internal error: requery after standalone dict add collision failed");
+        }
+      }
+    }
+
+    // Original path: dedup via 96-bit position+sequence dict.
     if (transpositionPositionAndSequence.TryGetValue(hash, out index))
     {
       node = this[index];
@@ -432,25 +470,27 @@ public unsafe class Graph : IDisposable
     }
 
     // Allocate a new node and immediately lock it.
-    NodeIndex candIdx = Store.NodesStore.AllocateNext();
-    GNode cand = this[candIdx];
-    cand.AcquireLock();
+    NodeIndex candIdx2 = Store.NodesStore.AllocateNext();
+    GNode cand2 = this[candIdx2];
+    cand2.AcquireLock();
 
     // Since IsEvaluated method looks for for NaN on WinP
     // it is essential to immediately set WinP before this node becomes visible.
     // TODO: consider having a separate flag for IsEvaluated?
-    cand.NodeRef.WinP = FP16.NaN;
+    cand2.NodeRef.WinP = FP16.NaN;
 
-    if (transpositionPositionAndSequence.TryAdd(hash, candIdx.Index))
+    if (transpositionPositionAndSequence.TryAdd(hash, candIdx2.Index))
     {
       // Successfully added to dictionary as the node representing this position+sequence.
-      return (cand, true, false);
+      return (cand2, true, false);
     }
     else
     {
       // Lost the race: someone else inserted first.
       // Release lock on this (now orphaned) node.
-      cand.ReleaseLock();
+      cand2.ReleaseLock();
+
+      cand2.NodeRef.IsOldGeneration = true; // mark as orphaned
 
       // Requery to find the winning node.
       // Mark this return as a collision that should result in an aborted visit.
@@ -529,6 +569,12 @@ public unsafe class Graph : IDisposable
   public Func<Graph> ReuseGraphProvider;
 
 
+  /// <summary>
+  /// Reusable native memory buffers for GraphRewriter.
+  /// Created lazily on first rewrite, disposed with the Graph.
+  /// </summary>
+  internal GraphRewriterScratchBuffers RewriterScratchBuffers;
+
   private bool disposedValue;
 
   void InitializeNodeForPos(GNode node,
@@ -563,9 +609,28 @@ public unsafe class Graph : IDisposable
         standaloneTranspositionNode = this[siblingSet[0]]; // TODO: choice of first is arbitrary, can we do better?
       }
     }
-    else if (ReuseGraphProvider is not null)
+
+    // In single-dictionary mode we may find ourselves (pre-registered but unevaluated),
+    // so also check ReuseGraphProvider when the found sibling is not usable.
+    if (SINGLE_DICTIONARY_POSITION_MODE && Store.UsesPositionEquivalenceMode)
     {
-      // Attempt to find the node in another graph.
+      if ((standaloneTranspositionNode.IsNull || !standaloneTranspositionNode.IsEvaluated)
+          && ReuseGraphProvider is not null)
+      {
+        Graph otherGraph = ReuseGraphProvider();
+        if (otherGraph != null)
+        {
+          GNode lookupNode = otherGraph.TryLookupNode(hash64WithMoveAndReps);
+          if (!lookupNode.IsNull && lookupNode.IsEvaluated)
+          {
+            standaloneTranspositionNode = lookupNode;
+          }
+        }
+      }
+    }
+    else if (standaloneTranspositionNode.IsNull && ReuseGraphProvider is not null)
+    {
+      // Original path: only check ReuseGraphProvider when no sibling was found.
       Graph otherGraph = ReuseGraphProvider();
       if (otherGraph != null)
       {
@@ -590,23 +655,28 @@ public unsafe class Graph : IDisposable
         // We already have an entry for this hash
         if (setIndex.IsDirectNodeIndex)
         {
-          // There's currently only one node stored directly - need to convert to a NodeIndexSet
+          // There's currently only one node stored directly - need to convert to a NodeIndexSet.
           int existingNodeIndex = setIndex.DirectNodeIndex;
 
-          // Create a new NodeIndexSet in the store
-          int newSetIndex = NodeIndexSetStore.AllocateNext();
-          NodeIndexSet siblingSet = new();
+          // Skip if we found ourselves (already pre-registered by LookupOrCreateAndAcquire
+          // in single-dictionary mode).
+          if (existingNodeIndex != node.Index.Index)
+          {
+            // Create a new NodeIndexSet in the store
+            int newSetIndex = NodeIndexSetStore.AllocateNext();
+            NodeIndexSet siblingSet = new();
 
-          // Add both the existing node and the new node
-          // TODO: make a more efficient method to set slots 0 and 1 directly (update Count to 2).
-          siblingSet.Add(new NodeIndex(existingNodeIndex), true);
-          siblingSet.Add(node.Index, true);
+            // Add both the existing node and the new node
+            // TODO: make a more efficient method to set slots 0 and 1 directly (update Count to 2).
+            siblingSet.Add(new NodeIndex(existingNodeIndex), true);
+            siblingSet.Add(node.Index, true);
 
-          // Store the NodeIndexSet in the store
-          NodeIndexSetStore.sets[newSetIndex] = siblingSet;
+            // Store the NodeIndexSet in the store
+            NodeIndexSetStore.sets[newSetIndex] = siblingSet;
 
-          // Update the dictionary with the reference to the NodeIndexSet
-          transpositionsPosStandalone[hash64WithMoveAndReps] = GNodeIndexSetIndex.FromNodeSetIndex(newSetIndex);
+            // Update the dictionary with the reference to the NodeIndexSet
+            transpositionsPosStandalone[hash64WithMoveAndReps] = GNodeIndexSetIndex.FromNodeSetIndex(newSetIndex);
+          }
         }
         else
         {
@@ -626,8 +696,8 @@ public unsafe class Graph : IDisposable
       }
     }
 
-    // Update hash table
-    if (GraphEnabled)
+    // Update hash table (null when single-dictionary mode skips 96-bit dict allocation).
+    if (transpositionPositionAndSequence != null)
     {
       transpositionPositionAndSequence[posAndSequenceHash] = node.Index.Index;
     }
@@ -753,7 +823,15 @@ public unsafe class Graph : IDisposable
       Debug.Assert(!parentNode.ChildEdgeHeaderAtIndex(indexOfChildInParent).IsUnintialized); // expected that MoveInfo will be set before creation
     }
 
-    (GNode childNode, wasCreated, bool wasCollision) = LookupOrCreateAndAcquire(lookupHash, okToCreate);
+    // Use position-only dedup key (RepetitionCount=0, Move50Category=default) to match
+    // the 96-bit hash behavior in PositionEquivalence mode. This ensures draw-by-repetition
+    // positions (RepetitionCount=1) find the existing node instead of creating phantom nodes
+    // with Q=NaN that break PUCT selection.
+    PosHash64WithMove50AndReps standaloneKey = (SINGLE_DICTIONARY_POSITION_MODE && Store.UsesPositionEquivalenceMode)
+      ? MGPositionHashing.Hash64WithMove50AndRepsAdded(standaloneHash, 0, default)
+      : default;
+
+    (GNode childNode, wasCreated, bool wasCollision) = LookupOrCreateAndAcquire(lookupHash, standaloneKey, okToCreate);
     Debug.Assert(childNode.IsNull || childNode.IsLocked);
 
     if (!wasCreated)
@@ -784,8 +862,24 @@ public unsafe class Graph : IDisposable
     //      because another thread might see and then follow the child reference.
     // no longer need parent[indexOfChildInParent].MoveInfoRef.SetExpandedChildIndex(childNode.Index);
 
-    // Create a parent edge to point back to parent
+    // Create a parent edge to point back to parent.
+    // For newly created nodes, this establishes the tree-parent invariant:
+    // the creating parent becomes position 0 in the parent list, guaranteeing
+    // a cycle-free path to the root via TreeParentEdge/TreeParentNodeIndex.
     Store.ParentsStore.CreateParentEdge(parentNode.Index, childNode.Index);
+
+#if DEBUG
+    // Verify tree-parent invariant for newly created nodes:
+    // the creating parent must be position 0 (single direct entry).
+    if (wasCreated && !wasCollision)
+    {
+      Debug.Assert(childNode.NodeRef.ParentsHeader.IsDirectEntry,
+        "Newly created node should have single direct parent entry");
+      Debug.Assert(childNode.NodeRef.ParentsHeader.AsDirectParentNodeIndex == parentNode.Index,
+        "Newly created node's first parent should be the creating parent");
+    }
+#endif
+
     GEdge ret = CreateEdge(parentNode, childNode, indexOfChildInParent);
 
     childNode.ReleaseLock();
@@ -838,6 +932,13 @@ public unsafe class Graph : IDisposable
     Debug.Assert(indexOfChildInParent < parentNode.NumPolicyMoves);
 
     // Update number of expanded edges at the parent.
+    // N.B. A node may have NumEdgesExpanded > 0 with corresponding edge N values of 0,
+    //      yielding N = sumEdgeN + 1 where sumEdgeN = 0.
+    //      This occurs when an edge is created during selection but the visit is 
+    //      subsequently aborted (e.g.PiggybackPendingNNEval failure or transposition collision),
+    //      so BackupToEdge/ BackupToNode are never called.
+    //      The state is harmless — PUCT treats an expanded edge with N = 0 identically
+    //      to an unexpanded move — and self-corrects on the next visit.
     parentNode.NodeRef.NumEdgesExpanded++;
 
     Span<GEdgeHeaderStruct> edgeHeaderStructsSpan = parentNode.EdgeHeadersSpan;
@@ -960,10 +1061,13 @@ public unsafe class Graph : IDisposable
 
     // Copy the expanded edges one at a time
     // (since the source node headers are now just pointers we need to follow to get header info).
+    // GEdgeStruct.ActionV is currently a stub, not ActionV only available on head headers.
+    ReadOnlySpan<GEdgeHeaderStruct> copyFromHeadersForExpanded = copyFrom.EdgeHeadersSpan;
     foreach ((GEdge edge, int childIndex) in copyFrom.ChildEdgesExpandedWithIndex)
     {
 #if ACTION_ENABLED
-        copyToHeaders[childIndex].SetUnexpandedValues(edge.Move, edge.P, edge.ActionV, edge.ActionU);
+      ref readonly GEdgeHeaderStruct srcHdr = ref copyFromHeadersForExpanded[childIndex];
+      copyToHeaders[childIndex].SetUnexpandedValues(edge.Move, edge.P, srcHdr.ActionV, srcHdr.ActionU);
 #else
       copyToHeaders[childIndex].SetUnexpandedValues(edge.Move, edge.P, FP16.NaN, FP16.NaN);
 #endif
@@ -974,6 +1078,30 @@ public unsafe class Graph : IDisposable
     Span<GEdgeHeaderStruct> copyFromHeaders = copyFrom.EdgeHeadersSpan[numExpanded..];
     copyToHeaders = copyToHeaders.Slice(numExpanded);
     copyFromHeaders.CopyTo(copyToHeaders);
+
+    // When the source has expanded edges (numExpanded > 0), their P values may not be in
+    // descending order — e.g. after selective rewrite Phase 4b compacts surviving expanded
+    // edges by visit count (N), not policy (P). When continued search later re-expands all
+    // reverted edges, the resulting fully-expanded node has two separately P-sorted segments.
+    // Since all target headers are unexpanded, sort them by P descending to restore the invariant.
+    if (numExpanded > 0)
+    {
+      Span<GEdgeHeaderStruct> allHeaders = allNewHeaders.HeaderStructsSpan;
+      int nPol = copyFrom.NumPolicyMoves;
+      for (int i = 1; i < nPol; i++)
+      {
+        GEdgeHeaderStruct key = allHeaders[i];
+        float keyP = (float)key.RawP;
+        int j = i - 1;
+        while (j >= 0 && (float)allHeaders[j].RawP < keyP)
+        {
+          allHeaders[j + 1] = allHeaders[j];
+          j--;
+        }
+        allHeaders[j + 1] = key;
+      }
+
+    }
   }
 
 
@@ -1047,11 +1175,10 @@ public unsafe class Graph : IDisposable
         p[i] = refEdge.P;
         n[i] = refEdge.N;
 #if ACTION_ENABLED
-          a[i] = (double)refEdge.ActionV;
+        a[i] = (double)childEdgeHeaders[i].ActionV; // Read from header (survives expansion; edge struct has no storage)
 #endif
         // Extract value uncertainty with fill-in if missing
-        const double DEFAULT_UNCERTAINTY = 0.10f;
-        uv[i] = float.IsNaN(refEdge.UncertaintyV) ? DEFAULT_UNCERTAINTY :  (double)refEdge.UncertaintyV;
+        uv[i] = (double)refEdge.UncertaintyV;
 
         w[i] = refEdge.N == 0 ? 0 : (refEdge.Q * refEdge.N);
 
@@ -1072,7 +1199,7 @@ public unsafe class Graph : IDisposable
         p[i] = (childEdgeHeaders[i].P);
         n[i] = 0;
 #if ACTION_ENABLED
-        a[i] = 0;
+        a[i] = (double)childEdgeHeaders[i].ActionV;
 #endif
         uv[i] = 0;
         w[i] = 0;
@@ -1142,14 +1269,27 @@ public unsafe class Graph : IDisposable
     {
       if (!kvp.Value.IsNull)
       {
-        NodeIndexSet siblingSet = NodeIndexSetStore.sets[kvp.Value.NodeSetIndex];
-        Console.WriteLine($"  Hash {kvp.Key,20} has {siblingSet.Count} siblings: {siblingSet}");
-        for (int i = 0; i < siblingSet.Count; i++)
+        if (kvp.Value.IsDirectNodeIndex)
         {
-          NodeIndex nodeIndex = siblingSet[i];
+          // Direct node index case (single sibling)
+          NodeIndex nodeIndex = new NodeIndex(kvp.Value.DirectNodeIndex);
           GNode node = this[nodeIndex];
-          Console.WriteLine($"   {i,2:N0} {nodeIndex,-10:N0}  N={node.NodeRef.N,-10:N0}  V={node.NodeRef.V,6:F2} Q={node.NodeRef.Q,6:F2} "
+          Console.WriteLine($"  Hash {kvp.Key,20} has 1 sibling (direct):");
+          Console.WriteLine($"   {0,2:N0} {nodeIndex,-10:N0}  N={node.NodeRef.N,-10:N0}  V={node.NodeRef.V,6:F2} Q={node.NodeRef.Q,6:F2} "
                           + $"{node.NodeRef.Move50Category} {(node.NodeRef.HasRepetitions ? "R" : " ")}  {node.CalcPosition().ToPosition.FEN}");
+        }
+        else
+        {
+          // Set of node indices case
+          NodeIndexSet siblingSet = NodeIndexSetStore.sets[kvp.Value.NodeSetIndex];
+          Console.WriteLine($"  Hash {kvp.Key,20} has {siblingSet.Count} siblings: {siblingSet}");
+          for (int i = 0; i < siblingSet.Count; i++)
+          {
+            NodeIndex nodeIndex = siblingSet[i];
+            GNode node = this[nodeIndex];
+            Console.WriteLine($"   {i,2:N0} {nodeIndex,-10:N0}  N={node.NodeRef.N,-10:N0}  V={node.NodeRef.V,6:F2} Q={node.NodeRef.Q,6:F2} "
+                            + $"{node.NodeRef.Move50Category} {(node.NodeRef.HasRepetitions ? "R" : " ")}  {node.CalcPosition().ToPosition.FEN}");
+          }
         }
       }
     }
@@ -1218,7 +1358,7 @@ public unsafe class Graph : IDisposable
 
     foreach (GEdge childEdge in node.ChildEdgesExpanded)
     {
-      if ((node.NumEdgesVisited > 0 || dumpUnvisited) && childEdge.N >= minEdgeN)
+      if ((node.NumEdgesExpanded > 0 || dumpUnvisited) && childEdge.N >= minEdgeN)
       {
         if (childEdge.Type == GEdgeStruct.EdgeType.ChildEdge)
         {
@@ -1540,6 +1680,8 @@ public unsafe class Graph : IDisposable
       if (disposing)
       {
         Store.Dispose();
+        RewriterScratchBuffers?.Dispose();
+        RewriterScratchBuffers = null;
       }
 
       // Set large fields to null

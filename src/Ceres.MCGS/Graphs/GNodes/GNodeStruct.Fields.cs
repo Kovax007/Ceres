@@ -18,8 +18,8 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Ceres.Base.DataTypes;
 using Ceres.MCGS.Graphs.GEdgeHeaders;
-using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Graphs.GParents;
+using Ceres.MCGS.Utils;
 
 #endregion
 
@@ -35,7 +35,7 @@ namespace Ceres.MCGS.Graphs.GNodes;
 /// N.B. Changes/additions to these fields may require update in
 ///      initialization logic in GNode or Graph, for example:
 ///        Graph.CopyChildValues
-// *************************************************************
+/// *************************************************************
 /// </summary>
 [Serializable]
 [StructLayout(LayoutKind.Sequential, Pack = 1, Size = 64)]
@@ -102,16 +102,22 @@ public unsafe partial struct GNodeStruct
 
   /// <summary>
   /// Average of draw scores across self and all child visits.
+  /// 
+  /// NOTE: 
+  ///   Children's D values are maintained via running average, refreshed on every on-path visit.
+  ///   Heavily visited children are backed up nearly every batch — near-exact D.
+  ///   Rarely visited children may have stale D but contribute proportionally tiny amounts to root D.
+  ///   This is the same structural staleness that Q has for non-backed-up sibling edges (Q's delta-W
+  ///   only refreshes the one edge being backed up; other edges retain stale edge.QChild values).
+  ///   The error attenuates toward the root: high-N children are fresh, low-N children are negligible.
   /// </summary>
   public double D;
 
   /// <summary>
-  /// The number of children that have been visited in the current search
-  /// Note that children are always visited in descending order by the policy prior probability.
-  /// Also note that in rare circumstances nodes could have been visited (as counted by this number)
-  /// but might actually have an N of 0 (e.g if they were abandoned nodes due to NN buffer hitting its optimal batch size).
+  /// Fortress probability metric stored as packed byte.
+  /// Values 0-254 map to [0.0, 1.0], value 255 represents NaN.
   /// </summary>
-  public byte NumEdgesVisited;
+  public byte FortressPByte;
 
 
   /// <summary>
@@ -229,6 +235,19 @@ public unsafe partial struct GNodeStruct
     readonly get => (siblingsQ / 29752.0) - 1.1;
     set => siblingsQ = (ushort)Math.Round((Math.Clamp(value, -1.1, 1.1) + 1.1) * 29752.0);
   }
+
+
+  /// <summary>
+  /// Fortress probability metric: minimum (1 - P(NEVER)) over all pawn squares.
+  /// Low values indicate a pawn unlikely to ever move, suggesting fortress-like structure.
+  /// Encoded: 0-254 maps to [0.0, 1.0], 255 represents NaN.
+  /// </summary>
+  public float FortressP
+  {
+    readonly get => FortressPByte == 255 ? float.NaN : FortressPByte * (1.0f / 254.0f);
+    set => FortressPByte = float.IsNaN(value) ? (byte)255 : (byte)Math.Round(Math.Clamp(value, 0f, 1f) * 254.0f);
+  }
+
 
   //    public NodeIndex NodeHashSibling;
   public RunningStdDevShort StdDevEstimate;

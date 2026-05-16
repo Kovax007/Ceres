@@ -21,26 +21,6 @@ using Ceres.Chess.UserSettings;
 
 namespace Ceres.MCGS.Search.Params;
 
-public enum MCGSPhase
-{
-  /// <summary>
-  /// Select batch of paths with new visits.
-  /// </summary>
-  Select,
-
-  /// <summary>
-  /// Evaluate selected leaf nodes (those requiring neural network evaluation).
-  /// </summary>
-  Evaluate,
-
-  /// <summary>
-  /// Backup results of evaluations, updating node statistics based on new evaluation.
-  /// </summary>
-  Backup
-}
-
-
-
 /// <summary>
 /// Specifies the mode (rules used for establishing equivalence classes over positions/histories)
 /// used for transposition matching.
@@ -196,7 +176,15 @@ public record ParamsSearch
   /// at the current node and surrounding nodes (e.g. the parent node).
   /// Therefore the weight of large-N pseudotranspositions is tightly constrained.
   /// </summary>
-  public bool EnablePseudoTranspositionBlending = true;
+  public bool EnablePseudoTranspositionBlendingInPositionAndEquivalenceMode = true;
+
+  /// <summary>
+  /// If pseudotransposition blending is enabled.
+  /// This is only applicable in PositionAndHistoryEquivalence
+  /// (otherwise the nodes sharing same position are already coalesced).
+  /// </summary>
+  public bool EnablePseudoTranspositionBlending => EnablePseudoTranspositionBlendingInPositionAndEquivalenceMode
+                                                && PathTranspositionMode == PathMode.PositionAndHistoryEquivalence;
 
   // Optionally stop descent at a transposition node only if it has a
   // sufficiently large number of visits. 
@@ -210,7 +198,15 @@ public record ParamsSearch
   //   3.0 --> -42 Elo
   //   5.0 --> -50 Elo
   //  20.0 --> -52 Elo
-  public float TranspositionStopMinSupportRatio = 3f;
+  public float TranspositionStopMinSupportRatioPositionAndHistoryMode = 3f;
+
+
+  /// <summary>
+  /// MinSupportRatio when running in Position mode.
+  /// Because visits are coalesced across all transposition paths,
+  /// the expectation for subgraph size is typically higher than with PositionAndHistory mode.
+  /// </summary>
+  public float TranspositionStopMinSupportRatioPositionMode = 5f;
 
 
   /// <summary>
@@ -267,6 +263,8 @@ public record ParamsSearch
   /// beyond those directly on the visit path that gave rise to a leaf visit
   /// (recursively upward to specified number of levels).
   /// Value of 0 disables the feature.
+  /// Value of 1 propagates only to immediate parents and is known threadsafe (but does not seem to gain Elo).
+  /// Values greater than 1 should not be used due to threadsafety concerns.
   /// </summary>
   public int OffPathBackupNumAdditionalLevelsToPropagate = 0;
 
@@ -281,7 +279,7 @@ public record ParamsSearch
   public bool EnablePathDependentCPUCTScaling = false;
 
   /// <summary>
-  /// Maximum number of nodes allowed in the search tree.
+  /// Maximum number of nodes allowed in the search graph.
   /// Some internal efficiencies may result if a smaller value 
   /// than the large default is specified.
   /// </summary>
@@ -339,41 +337,35 @@ public record ParamsSearch
   public bool AutoOptimizeEnabled = true;
 
   /// <summary>
-  /// If the tree generated from a prior move will potentially
+  /// If the graph generated from a prior move will potentially
   /// be carried forward as a starting point for the subsequent search.
   /// 
   /// Note that the search parameters used may also be impacted by this setting,
   /// (for example, investing in more visits for the best move represents a deferred asset).
-  /// Therefore this setting should only be enabled when tree reuse is possible 
+  /// Therefore this setting should only be enabled when graph reuse is possible 
   /// (i.e. games rather than single test positions).
   /// 
   /// TODO: Consider speeding up via one or both of:
   ///   - allocate a second store (transiently) and just copy nodes over - possibly much faster
-  ///   - just keep the old nodes in the tree and change the root (at least until/if it has too much wasted space)
+  ///   - just keep the old nodes in the graph and change the root (at least until/if it has too much wasted space)
   /// </summary>
   public bool GraphReuseEnabled = true;
 
   /// <summary>
-  /// If tree reuse may possibly make use of swapping root node into place
-  /// rather than rewriting entire tree. This can consume additional memory
-  /// but reduce time spent preparing tree for reuse.
+  /// If graph reuse may possibly make use of swapping root node into place
+  /// rather than rewriting entire graph. This can consume additional memory
+  /// but reduce time spent preparing graph for reuse.
   /// </summary>
-  public bool TreeReuseSwapRootEnabled = !CeresUserSettingsManager.Settings.ReducedMemoryMode;
+  public bool GraphReuseRewriteEnabled = false;// !CeresUserSettingsManager.Settings.ReducedMemoryMode;
 
   /// <summary>
-  /// If reachable nodes in search tree undergoing rebuild are retained in a separate cache.
-  /// However seemingly not useful because only about 4% of positions saved are actually subsequently used.
-  /// </summary>
-  public bool TreeReuseRetainedPositionCacheEnabled = false;
-
-  /// <summary>
-  /// If another search tree should be consulted to possibly reuse NN evaluations.
-  /// The other tree might for example come from the opponent when playing a tournament, 
-  /// or a comparison tree when doing suite testing.
+  /// If another search graph should be consulted to possibly reuse NN evaluations.
+  /// The other graph might for example come from the opponent when playing a tournament, 
+  /// or a comparison graph when doing suite testing.
   /// This will only take effect if the neural networks and certain other parameters are compatible/identical.
   /// </summary>
   /// TODO: move this into SuiteTestDef and TournamentDef instead.
-  public bool ReusePositionEvaluationsFromOtherTree = false;
+  public bool ReusePositionEvaluationsFromOtherGraph = false;
 
   /// <summary>
   /// Scaling factor to batch sizes:
@@ -420,7 +412,7 @@ public record ParamsSearch
 
   /// <summary>
   /// If search considers positions arising twice as already a draw.
-  /// Seems to slightly improve play quality due to early detection of draw by repetition subtrees.
+  /// Seems to slightly improve play quality due to early detection of draw by repetition subgraphs.
   /// </summary>
   public bool TwofoldDrawEnabled = true;
 
@@ -432,7 +424,7 @@ public record ParamsSearch
   /// <summary>
   /// If searches are possibly terminated early if it is determined the top move
   /// is unlikely or impossible to change before search ends due to time or nodes limit.
-  /// Note that when using nodes or time per move will be strictly inferior if tree reuse is enabled.
+  /// Note that when using nodes or time per move will be strictly inferior if graph reuse is enabled.
   /// </summary>
   [CeresOption(Name = "early-stop-search-enabled", Desc = "If searches are possibly exited early due to leading move being ahead.", Default = "true")]
   public bool FutilityPruningStopSearchEnabled = true;
@@ -443,7 +435,7 @@ public record ParamsSearch
   /// (including the best/only remaining move if FutilityPruningStopSearchEnabled is true)
   /// from further visits due to impossibility or implausability that they will be the best move.
   /// </summary>
-  [CeresOption(Name = "move-futility-pruning-aggressiveness", Desc = "Aggresiveness for early termination of searches to less promising root search subtrees in range [0..1.5], 0 disables.", Default = "0.4")]
+  [CeresOption(Name = "move-futility-pruning-aggressiveness", Desc = "Aggresiveness for early termination of searches to less promising root search subgraphs in range [0..1.5], 0 disables.", Default = "0.4")]
   public float MoveFutilityPruningAggressiveness = 0.4f;
 
 
@@ -460,6 +452,14 @@ public record ParamsSearch
   /// QuickMoves are only made if FutilityPruningStopSearchEnabled is also true.
   /// </summary>
   public bool EnableQuickMoves = true;
+
+  /// <summary>
+  /// If nonzero, top-level moves within this Q distance (e.g. 0.05) of the best move
+  /// are considered as alternate choices if they appear to lead to
+  /// more concrete progress (irreverisble moves in the principal variation)
+  /// than the otherwise best move.
+  /// </summary>
+  public float AntiShufflingQThreshold = 0f;
 
   /// <summary>
   /// If the limits (time or nodes) initially allocated for a search may
@@ -479,10 +479,12 @@ public record ParamsSearch
   public int PaddedExtraNodesBase = 5;
   public float PaddedExtraNodesMultiplier = 0.03f;
 
+
   /// <summary>
-  /// Fraction of weight given to action head when performing child expansion selection.
+  /// If nonzero, the V stored for the node is no longer the exact value from the value head,
+  /// but rather a partial blend with the action head value.
   /// </summary>
-  public float ActionHeadSelectionWeight = 0f;
+  public float ActionHeadWeightInV = 0f;
 
   /// <summary>
   /// Nonzero values cause greater exploration at nodes with high uncertainty
@@ -507,6 +509,12 @@ public record ParamsSearch
   /// </summary>
   /// 
   public bool EnableUncertaintyBoosting = false;
+
+  /// <summary>
+  /// If the policy uncertainty value should be used to 
+  /// adjust the per-position temperature on the policy.
+  /// </summary>
+  public bool EnablePolicyUncertaintyTemperatureBoosting = false;
 
 
   /// <summary>
@@ -584,11 +592,6 @@ public record ParamsSearch
   /// </summary>
   public void Validate()
   {
-    if (PathTranspositionMode == PathMode.PositionEquivalence)
-    {
-      EnablePseudoTranspositionBlending = false; // incompatible
-    }
-
     if (OffPathBackupNumAdditionalLevelsToPropagate > 1
      && Execution.BackupMode == BackupMethodEnum.ReductionMultiThread)
     {

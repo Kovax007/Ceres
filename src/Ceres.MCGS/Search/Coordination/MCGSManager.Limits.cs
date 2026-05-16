@@ -20,11 +20,11 @@ using Ceres.Base.Math;
 using Ceres.Chess;
 using Ceres.Chess.MoveGen;
 using Ceres.MCGS.Graphs.GEdges;
-using Ceres.MCGS.LowLevel;
+using Ceres.MCGS.Graphs.GNodes;
 
 #endregion
 
-namespace Ceres.MCGS.Search;
+namespace Ceres.MCGS.Search.Coordination;
 
 /// <summary>
 /// Partial class containing methods and properties 
@@ -168,14 +168,14 @@ public partial class MCGSManager : IDisposable
      && Engine.SearchRootNode.N >= SearchLimit.MaxTreeVisits
      && NumNodesVisitedThisSearch > 0) // always allow a little search to insure state fully initialized
     {
-      return SearchStopStatus.MaxTreeVisitsExceeded;
+      return SearchStopStatus.MaxGraphVisitsExceeded;
     }
 
     if (SearchLimit.MaxTreeNodes != null
      && Engine.SearchRootNode.Graph.Store.NodesStore.NumTotalNodes >= (SearchLimit.MaxTreeNodes - 2048)
      && NumNodesVisitedThisSearch > 0) // always allow a little search to insure state fully initialized
     {
-      return SearchStopStatus.MaxTreeAllocatedNodesExceeded;
+      return SearchStopStatus.MaxGraphAllocatedNodesExceeded;
     }
 
     int numNotShutdowChildren = TerminationManager.NumberOfNotShutdownChildren();

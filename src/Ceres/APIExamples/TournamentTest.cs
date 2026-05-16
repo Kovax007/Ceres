@@ -27,7 +27,6 @@ using Ceres.Chess;
 using Ceres.Chess.GameEngines;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.UserSettings;
-using Ceres.Features.Players;
 using Ceres.Features.Suites;
 using Ceres.Features.Tournaments;
 using Ceres.Features.GameEngines;
@@ -46,6 +45,7 @@ using Ceres.Chess.Games.Utils;
 using Ceres.Chess.Data.Nets;
 using Chess.Ceres.PlayEvaluation;
 using System.Linq;
+using Ceres.MCTS.GameEngines;
 
 #endregion
 
@@ -55,11 +55,11 @@ namespace Ceres.APIExamples
   {
     const bool POOLED = false;
 
-    static int CONCURRENCY = POOLED ? 8 : Environment.MachineName.ToUpper().Contains("DEV") ? 1 : 1;
+    static int CONCURRENCY = POOLED ? 8 : Environment.MachineName.ToUpper().Contains("DEV") ? 2 : 2;
     static int[] OVERRIDE_DEVICE_IDs = /*POOLED ? null*/
        (Environment.MachineName.ToUpper() switch
        {
-         var name when name.ToUpper().Contains("SUPER") => new int[] { 0 },
+         var name when name.ToUpper().Contains("SUPER") => new int[] { 0,1 },
          var name when name.ToUpper().Contains("DGX") => [0, 1, 2, 3],
          var name when name.ToUpper().Contains("HOP") => [0, 1, 2, 3],
          _ => new int[] { 0 }
@@ -963,6 +963,8 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
 
       //baseName = "UHO_Lichess_4852_v1.epd"; // recommended by Kovax
       baseName = "UHO_Lichess_4852_v1_first.epd"; // approximately first 2500 positions for faster loading
+      //baseName = "DFRC_4852_v1.epd";
+      baseName = "DFRC_80_120.epd"; // lepned filtered (probably from DFRC_4852_v1)
       //baseName = "tcec_big";
       //baseName = "test1.epd";
       //baseName = "UHO_Lichess_4582_v1_last_10000.epd";
@@ -974,6 +976,7 @@ BT4 800 nodes vs SF17 0.20sec (6 threads)
 
       //baseName = "endingbook-10man-3181.pgn";
 //      baseName = "endingbook-16man-9609.pgn";
+      //baseName = @"endgames_cdb95105.epd";
       //  baseName = "endingbook-12man-4624.pgn";
 
       string postfix = (baseName.ToUpper().EndsWith(".EPD") || baseName.ToUpper().EndsWith(".PGN")) ? "" : ".pgn";

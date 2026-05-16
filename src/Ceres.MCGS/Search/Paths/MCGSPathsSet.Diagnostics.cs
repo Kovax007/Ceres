@@ -19,7 +19,6 @@ using System.Linq;
 using Ceres.Base.Misc;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Storage;
 
 #endregion
 
@@ -115,10 +114,10 @@ public partial class MCGSPathsSet
           continue;
         }
 
-        int absoluteSlotIndex = path.slots.startIndex + localIndex; // identity of this visit slot in the pool
+        int absoluteSlotIndex = path.slots.StartIndex + localIndex; // identity of this visit slot in the pool
         NodeIndex nodeIndex = childNode.Index;
 
-        if (!crossingGroups.TryGetValue(nodeIndex, out var list))
+        if (!crossingGroups.TryGetValue(nodeIndex, out List<(MCGSPath Path, MCGSPathVisit Visit, int SlotIndex)> list))
         {
           list = new List<(MCGSPath, MCGSPathVisit, int)>();
           crossingGroups[nodeIndex] = list;
@@ -128,7 +127,7 @@ public partial class MCGSPathsSet
     }
 
     // Filter to nodes with more than one distinct slot (ignore ourself)
-    var crossingNodes = crossingGroups
+    List<KeyValuePair<NodeIndex, List<(MCGSPath Path, MCGSPathVisit Visit, int SlotIndex)>>> crossingNodes = crossingGroups
       .Select(kvp => new KeyValuePair<NodeIndex, List<(MCGSPath Path, MCGSPathVisit Visit, int SlotIndex)>>(
         kvp.Key,
         kvp.Value
@@ -233,9 +232,9 @@ public partial class MCGSPathsSet
           continue;
         }
 
-        int absoluteSlotIndex = path.slots.startIndex + localIndex;
+        int absoluteSlotIndex = path.slots.StartIndex + localIndex;
 
-        if (!crossingGroups.TryGetValue(edge, out var list))
+        if (!crossingGroups.TryGetValue(edge, out List<(MCGSPath Path, MCGSPathVisit Visit, int SlotIndex)> list))
         {
           list = new List<(MCGSPath, MCGSPathVisit, int)>();
           crossingGroups[edge] = list;
@@ -245,7 +244,7 @@ public partial class MCGSPathsSet
     }
 
     // Filter to edges with more than one distinct slot (ignore ourself)
-    var crossingEdges = crossingGroups
+    List<KeyValuePair<GEdge, List<(MCGSPath Path, MCGSPathVisit Visit, int SlotIndex)>>> crossingEdges = crossingGroups
       .Select(kvp => new KeyValuePair<GEdge, List<(MCGSPath Path, MCGSPathVisit Visit, int SlotIndex)>>(
         kvp.Key,
         kvp.Value

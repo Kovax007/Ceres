@@ -54,6 +54,12 @@ public struct GEdgeHeaderStruct : IEquatable<GEdgeHeaderStruct>
   #endregion
 
 
+  /// <summary>
+  /// Reads the raw FP16 at offset 0 (the P field) without checking IsExpanded.
+  /// </summary>
+  internal readonly FP16 RawP => p;
+
+     
   // Because the uppermost bit is used to distinguish 
   // between child index (if 1) or probability, we can only use positive values
   public const int MaxChildIndex = int.MaxValue;
@@ -182,12 +188,19 @@ public struct GEdgeHeaderStruct : IEquatable<GEdgeHeaderStruct>
   /// Converts the struct to represent an expanded child with specified edge block.
   /// </summary>
   /// <param name="edgeBlockIndex"></param>
-  internal void SetAsExpandedToEdgeBlock(int edgeBlockIndex)
-  {
-    Debug.Assert(!IsUnintialized);
-    Debug.Assert(!IsExpanded);
-    this.edgeBlockIndex = -edgeBlockIndex;
-  }
+   internal void SetAsExpandedToEdgeBlock(int edgeBlockIndex)
+   {
+     Debug.Assert(!IsUnintialized);
+     Debug.Assert(!IsExpanded);
+     this.edgeBlockIndex = -edgeBlockIndex;
+   }
+
+
+  /// <summary>
+  /// Forces the edge block index to a new value without assertions.
+  /// Used during graph compaction when edge blocks are relocated.
+  /// </summary>
+  internal void ForceSetEdgeBlockIndex(int edgeBlockIndex) => this.edgeBlockIndex = -edgeBlockIndex;
 
 
   /// <summary>

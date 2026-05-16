@@ -253,7 +253,7 @@ namespace Ceres.Chess.EncodedPositions
             {
               break;
             }
-            moveIndices[i] = (ushort)moveIndex;
+            moveIndices[numMovesUsed] = (ushort)moveIndex;
 
             // Get this probability and make sure is in expected sorted order
             float thisProb = probs[i];
@@ -263,11 +263,11 @@ namespace Ceres.Chess.EncodedPositions
             ushort encoded = EncodedProbability(thisProb);
             if (encoded != 0)
             {
+              moveProbabilitiesEncoded[numMovesUsed] = encoded;
               numMovesUsed++;
-              moveProbabilitiesEncoded[i] = encoded;
               probabilityAcc += thisProb;
             }
-            else
+            else if (alreadySorted)
             {
               break; // moves are sorted, so we will not see any more above MIN_VALUE
             }
@@ -281,11 +281,16 @@ namespace Ceres.Chess.EncodedPositions
             moveIndices[numMovesUsed] = SPECIAL_VALUE_SENTINEL_TERMINATOR;
           }
 
-          // Normalize to sum to 1.0
-          float adj = 1.0f / probabilityAcc;
-          for (int i = 0; i < numMovesUsed; i++)
+          // Normalize to sum to 1.0. Decode each stored value back to a float in [0,1]
+          // before applying the scale -- multiplying the raw ushort encoding would yield
+          // values >> 1.0 and clobber every entry to ushort.MaxValue (uniform policy).
+          if (Math.Abs(1 - probabilityAcc) > 0.002)
           {
-            moveProbabilitiesEncoded[i] = EncodedProbability(probs[i] * adj);
+            float adj = 1.0f / probabilityAcc;
+            for (int i = 0; i < numMovesUsed; i++)
+            {
+              moveProbabilitiesEncoded[i] = EncodedProbability(DecodedProbability(moveProbabilitiesEncoded[i]) * adj);
+            }
           }
         }
 

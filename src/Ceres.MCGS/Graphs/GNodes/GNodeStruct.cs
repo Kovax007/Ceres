@@ -150,20 +150,12 @@ public partial struct GNodeStruct
 
   /// <summary>
   /// Returns index of node within node array.
-  /// 
-  /// TODO: someday we want to mark this as readonly (which is critical for readonly refs)
-  ///       However seemingly no efficient way to do that (using Unsafe class). See CTNodeStorage.NodeOffsetFromFirst.
   /// </summary>
-  public unsafe readonly NodeIndex Index
+  public readonly NodeIndex Index
   {
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    get
-    {
-      return new NodeIndex(1);
-      throw new Exception();
-      //return IndexInStore(Context.Store);
-    }
+    get => throw new NotSupportedException("GNodeStruct.Index requires a store reference. Use IndexInStore(store) instead.");    
   }
+
 
   // Choice of divisor of 64 is very important for performance, for two reasons:
   //   - cache line is generally 64 bytes, thus this allows us to allocate in an array 
@@ -190,24 +182,5 @@ public partial struct GNodeStruct
     //Debug.Assert(System.Runtime.GCSettings.LargeObjectHeapCompactionMode == GCLargeObjectHeapCompactionMode.Default);
 
     Debug.Assert(Marshal.SizeOf<NodeIndex>() == 4);
-  }
-
-
-
-  public override readonly string ToString()
-  {
-    string indexStr = $"#{Index.Index}";
-
-    string oldStr = IsOldGeneration ? " OLD" : "";
-
-    throw new NotImplementedException();
-    //bool isWhite = true;// (DepthInTree % 2 == 1) == (Context.Store.Nodes.PositionHistory.FinalPosition.IsWhite);
-
-    //      return $"<Node [#{indexStr}] {oldStr} Depth{DepthInTree} {Terminal}  ({N},) "
-    //            + $"V={V:F3}" + $" Q={Q:F3} "
-    //            + $"MPos={M:F3} MAvg={MAvg:F3} "
-    //           + $"Parent={(ParentIndex.IsNull ? "none" : ParentIndex.Index.ToString())}"
-    //           + $" Score=(?) > with {NumPolicyMoves} policy moves");
-    //    + $" Score={score,6:F2} > with {NumPolicyMoves} policy moves"; // can't do this until/if we restore IndexWithinParentsChildren or do linear search to find
   }
 }

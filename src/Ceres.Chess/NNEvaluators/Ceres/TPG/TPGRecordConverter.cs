@@ -116,13 +116,15 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         ConvertToTPGEvalInfo(targetInfo.Value, ref tpgRecord, validate);
       }
 
-#if USE_V2_TPG_RECORD
-      if (targetInfo != null)
+      if (TPGRecord.USE_V2_TPG_RECORD)
       {
-        tpgRecord.PlyUntilSquareChangePiece = targetInfo.Value.PlyUntilSquareChangePiece;
-        tpgRecord.PlyUntilSquarePieceCapture = targetInfo.Value.PlyUntilSquarePieceCapture;
+        if (targetInfo != null)
+        {
+          tpgRecord.PlyUntilSquareChangePiece = targetInfo.Value.PlyUntilSquareChangePiece;
+          tpgRecord.PlyUntilSquarePieceCapture = targetInfo.Value.PlyUntilSquarePieceCapture;
+        }
       }
-#endif
+
 
       if (policyVector is not null)
       {
@@ -205,13 +207,9 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
         int tpgSquaresStartOffset = i * 64 * TPGRecord.BYTES_PER_SQUARE_RECORD;
         fixed (byte* ptrSquareBytes = &squareBytesAllLocalRef[tpgSquaresStartOffset])
         {
-          if (!lastMovePliesEnabled)
-          {
-            // Disable any values possibly passed for last used plies since they are not to be used.
-            pliesSinceLastMoveAllPositions = null;
-          }
-
-          Span<byte> thesePliesSinceLastMove = pliesSinceLastMoveAllPositions == null ? default : new Span<byte>(pliesSinceLastMoveAllPositions, i * 64, 64);
+          Span<byte> thesePliesSinceLastMove = (!lastMovePliesEnabled || pliesSinceLastMoveAllPositions == null || pliesSinceLastMoveAllPositions.Length == 0)
+            ? default
+            : new Span<byte>(pliesSinceLastMoveAllPositions, i * 64, 64);
 
           float thisQNegativeBlunders;
           float thisQPositiveBlunders;
@@ -365,10 +363,11 @@ namespace Ceres.Chess.NNEvaluators.Ceres.TPG
       Debug.Assert(qPositiveBlunders == targetInfo.ForwardSumPositiveBlunders);
 #endif
 
-#if USE_V2_TPG_RECORD
-      tpgRecord.PlyUntilSquareChangePiece = targetInfo.PlyUntilSquareChangePiece;
-      tpgRecord.PlyUntilSquarePieceCapture = targetInfo.PlyUntilSquarePieceCapture;
-#endif
+      if (TPGRecord.USE_V2_TPG_RECORD)
+      {
+        tpgRecord.PlyUntilSquareChangePiece = targetInfo.PlyUntilSquareChangePiece;
+        tpgRecord.PlyUntilSquarePieceCapture = targetInfo.PlyUntilSquarePieceCapture;
+      }
 
       // Write squares.
       ConvertToTPGRecordSquares(trainingPos.PositionWithBoards, includeHistory, tpgRecord.Squares,

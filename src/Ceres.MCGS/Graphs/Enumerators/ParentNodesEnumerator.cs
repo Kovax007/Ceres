@@ -13,54 +13,50 @@
 
 #region Using directives
 
-using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Graphs.GParents;
-using Ceres.MCGS.Storage;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 
+using Ceres.MCGS.Graphs.GNodes;
+using Ceres.MCGS.Graphs.GParents;
+
 #endregion
 
-namespace Ceres.MCGS.Graphs.Enumerators
+namespace Ceres.MCGS.Graphs.Enumerators;
+
+/// <summary>
+/// Enumerator over parent nodes of a given child node.
+/// </summary>
+public ref struct ParentNodesEnumerator : IEnumerator<GNode>
 {
   /// <summary>
-  /// Enumerator over parent nodes of a given child node.
-  /// TODO: figure out why making this readonly causes hang!
+  /// Parent graph.
   /// </summary>
-  public ref struct ParentNodesEnumerator : IEnumerator<GNode>
+  public Graph Graph;
+
+  /// <summary>
+  /// Provides access to the underlying enumerator used for parent index traversal.
+  /// </summary>
+  ParentIndexEnumerator inner;
+
+  /// <summary>
+  /// Constructor.
+  /// </summary>
+  /// <param name="graph"></param>
+  /// <param name="childIndex"></param>
+  public ParentNodesEnumerator(Graph graph, NodeIndex childIndex)
   {
-    /// <summary>
-    /// Parent graph.
-    /// </summary>
-    public Graph Graph;
-
-    /// <summary>
-    /// Provides access to the underlying enumerator used for parent index traversal.
-    /// </summary>
-    ParentIndexEnumerator inner;
-
-
-    /// <summary>
-    /// Constructor.
-    /// </summary>
-    /// <param name="graph"></param>
-    /// <param name="childIndex"></param>
-    public ParentNodesEnumerator(Graph graph, NodeIndex childIndex)
-    {
-      Graph = graph;
-      inner = new ParentIndicesEnumerable(graph.Store.ParentsStore, childIndex).GetEnumerator();
-    }
-
-    public GNode Current => new GNode(Graph, new NodeIndex(inner.Current));
-
-    object IEnumerator.Current => new GNode(Graph, new NodeIndex(inner.Current));
-
-    public bool MoveNext() => inner.MoveNext();
-
-    public void Dispose() { }
-
-    public void Reset() =>  throw new NotImplementedException();
+    Graph = graph;
+    inner = new ParentIndicesEnumerable(graph.Store.ParentsStore, childIndex).GetEnumerator();
   }
 
+  public GNode Current => new GNode(Graph, new NodeIndex(inner.Current));
+
+  object IEnumerator.Current => new GNode(Graph, new NodeIndex(inner.Current));
+
+  public bool MoveNext() => inner.MoveNext();
+
+  public void Dispose() { }
+
+  public void Reset() =>  throw new NotImplementedException();
 }

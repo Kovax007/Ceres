@@ -139,7 +139,7 @@ internal struct GNodeMiscFieldsStruct
   }
 
   /// <summary>
-  /// If the node belonged to a prior seacrh tree but is 
+  /// If the node belonged to a prior seacrh graph but is 
   /// now unreachable due to a new root having been swapped into place.
   /// </summary>
   internal bool IsOldGeneration
@@ -221,6 +221,7 @@ internal struct GNodeMiscFieldsStruct
 
   /// <summary>
   /// Number of pieces on board.
+  /// The value actually stored is N-1 so that we fit in the range [0..31].
   /// </summary>
   internal byte NumPieces
   {

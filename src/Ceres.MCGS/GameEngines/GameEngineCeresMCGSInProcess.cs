@@ -21,6 +21,7 @@ using System.Threading;
 
 using Ceres.Base.Benchmarking;
 using Ceres.Base.Misc;
+using Ceres.Base.OperatingSystem;
 using Ceres.Base.Threading;
 using Ceres.Chess;
 using Ceres.Chess.ExternalPrograms.UCI;
@@ -33,19 +34,20 @@ using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.Positions;
 using Ceres.Chess.SearchResultVerboseMoveInfo;
 using Ceres.Chess.UserSettings;
-using Ceres.Features.Commands;
-using Ceres.Features.UCI;
-using Ceres.Features.Visualization.AnalysisGraph;
+
+using Ceres.MCGS.UCI;
+
 using Ceres.MCGS.Graphs;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Graphs.GraphStores;
+using Ceres.MCGS.Managers;
 using Ceres.MCGS.Managers.Limits;
 using Ceres.MCGS.Search;
 using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
-using Ceres.MCGS.Storage;
 using Ceres.MCGS.Utils;
+using Ceres.MCGS.Visualization.AnalysisGraph;
 using static Ceres.MCGS.Search.Phases.MCGSSelect;
 
 #endregion
@@ -57,8 +59,6 @@ namespace Ceres.MCGS.GameEngines;
 /// </summary>
 public class GameEngineCeresMCGSInProcess : GameEngine
 {
-  public const string CERES_MCGS_VERSION_STR = "2.12";
-
   /// <summary>
   /// Definition of neural network evaluator used for execution.
   /// </summary>
@@ -122,6 +122,12 @@ public class GameEngineCeresMCGSInProcess : GameEngine
 
   public bool DisposeGraphAfterSearch;
 
+  /// <summary>
+  /// Optional fixed search limit known at engine creation time.
+  /// When specified, allows optimizations for small searches.
+  /// </summary>
+  public readonly SearchLimit FixedSearchLimit;
+
 
   #region Internal data
 
@@ -138,7 +144,6 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   #endregion
 
 
-
   /// <summary>
   /// Constructor.
   /// </summary>
@@ -151,6 +156,10 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// <param name="logFileName">optional name of file to which to write detailed log</param>
   /// <param name="moveImmediateIfOnlyOneMove">if engine should chose best move immediately without search if only one legal move</param>
   /// <param name="processorGroupID">id of processor group on which engine should execute</param>
+  /// <param name="disposeGraphAfterSearch">if the graph should be disposed after each search</param>
+  /// <param name="infoLogger">optional action to log info messages</param>
+  /// <param name="forcedMoves">optional list of moves to force</param>
+  /// <param name="fixedSearchLimit">optional fixed search limit known at engine creation time</param>
   public GameEngineCeresMCGSInProcess(string id,
                                       NNEvaluatorDef evaluatorDef,
                                       ParamsSearch searchParams = null,
@@ -161,7 +170,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
                                       int processorGroupID = 0,
                                       bool disposeGraphAfterSearch = true,
                                       Action<string> infoLogger = null,
-                                      List<MGMove> forcedMoves = null) : base(id, processorGroupID)
+                                      List<MGMove> forcedMoves = null,
+                                      SearchLimit fixedSearchLimit = null) : base(id, processorGroupID)
   {
     // Use default settings for search and select params if not specified.
     if (searchParams == null)
@@ -172,6 +182,21 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     if (selectParams == null)
     {
       selectParams = new ParamsSelect();
+    }
+
+    // Optimization: disable dual evaluators/iterators for small searches
+    // since the overhead is not worth it. This must be done before storing SearchParams
+    // because MCGSManager will check these flags.
+    if (ShouldDisableDualEvaluatorsForLimit(fixedSearchLimit))
+    {
+      searchParams = searchParams with
+      {
+        Execution = searchParams.Execution with
+        {
+          DualOverlappedIterators = false,
+          DualEvaluators = false
+        }
+      };
     }
 
     gameLimitManager = InitializeGameLimitManager(searchParams, gameLimitManager);
@@ -186,6 +211,7 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     OutputVerboseMoveStats = CeresUserSettingsManager.Settings.VerboseMoveStats;
     InfoLogger = infoLogger;
     ForcedMoves = forcedMoves;
+    FixedSearchLimit = fixedSearchLimit;
 
     if (logFileName == null && !string.IsNullOrEmpty(CeresUserSettingsManager.Settings.SearchLogFile))
     {
@@ -238,21 +264,6 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   /// <param name="gameID">optional game descriptive string</param>
   public override void ResetGame(string gameID = null)
   {
-#if NOT
-    LastSearch?.Manager.Dispose();
-    Search?.Manager.Dispose();
-
-    Search = null;
-    LastSearch = null;
-#endif
-
-#if NOT
-    if (!DisposeGraphAfterSearch && LastSearch != null)
-    {
-      LastSearch.Manager.Dispose();
-      LastSearch.Manager = null;
-    }
-#endif
     Search?.Manager.Engine.Graph.Dispose();
 
     Search = null;
@@ -316,6 +327,15 @@ public class GameEngineCeresMCGSInProcess : GameEngine
       ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "WARNING: With Prefetching enabled the NodesLimit is not inclusive of prefetched nodes.");
     }
 
+    // Validate that the search limit is compatible with FixedSearchLimit (if specified).
+    if (FixedSearchLimit != null 
+        && FixedSearchLimit.IsNodesLimit 
+        && searchLimit.IsNodesLimit
+        && searchLimit.Value > FixedSearchLimit.Value)
+    {
+      throw new InvalidOperationException($"Search limit ({searchLimit.Value} nodes) is incompatible with FixedSearchLimit ({FixedSearchLimit.Value} nodes) ");
+    }
+
     // Possibly set a forced move if a list of such moves was provided and is not yet exhausted.
     MGMove forcedMove = (ForcedMoves == null || ForcedMoves.Count < curPositionAndMoves.Count)
                           ? default
@@ -326,7 +346,6 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     {
       MaxTreeVisits = searchLimit.MaxTreeVisits ?? MCGSParamsFixed.MAX_VISITS,
     };
-
 
     // Set up callback passthrough if provided
     MCGSManager.MCGSProgressCallback callbackMCGS = null;
@@ -347,9 +366,9 @@ public class GameEngineCeresMCGSInProcess : GameEngine
       {
         AnalysisGraphOptions optionsObj = AnalysisGraphOptions.FromString(options);
         Console.WriteLine($"Writing Analysis Graph (detail level {optionsObj.DetailLevel})");
-        throw new Exception("AnalysisGraphGenerator not yet supported by GameEngineCeresMCGSInProcess");
-        //AnalysisGraphGenerator graphGenerator = new AnalysisGraphGenerator(Search, optionsObj);
-        //graphGenerator.Write(true);
+        throw new Exception("AnalysisGraphGenerator constructor below needs remeidation to use MCGSSearch as argument, not null");
+        AnalysisGraphGenerator graphGenerator = new AnalysisGraphGenerator(null, optionsObj);
+        graphGenerator.Write(true);
       }
       callbackMCGS?.Invoke(manager);
     }
@@ -433,7 +452,7 @@ public class GameEngineCeresMCGSInProcess : GameEngine
     // Possibly use the context of opponent to reuse position evaluations
     if (OpponentEngine is not null && !haveEstablishedOpponentGraphReuse)
     {
-      if (Search is not null && Search.Manager.ParamsSearch.ReusePositionEvaluationsFromOtherTree)
+      if (Search is not null && Search.Manager.ParamsSearch.ReusePositionEvaluationsFromOtherGraph)
       {
         GameEngineCeresMCGSInProcess ceresOpponentEngine = OpponentEngine as GameEngineCeresMCGSInProcess;
         if (ceresOpponentEngine is null)
@@ -468,10 +487,26 @@ public class GameEngineCeresMCGSInProcess : GameEngine
   }
 
 
+  /// <summary>
+  /// Determines if dual evaluators/iterators should be disabled based on a search limit.
+  /// Small searches (below THRESHOLD_BEGIN_OVERLAPPING) don't benefit from dual evaluators.
+  /// </summary>
+  /// <param name="searchLimit">The search limit to check (can be null).</param>
+  /// <returns>True if the search is small enough to disable dual evaluators.</returns>
+  internal static bool ShouldDisableDualEvaluatorsForLimit(SearchLimit searchLimit)
+  {
+    return searchLimit != null
+           && searchLimit.IsNodesLimit
+           && searchLimit.Value < ParamsSearchExecutionChooser.THRESHOLD_BEGIN_OVERLAPPING;
+  }
+
+
   void PrepareEvaluators()
   {
     if (Evaluators == null)
     {
+      // Use SearchParams.Execution.DualEvaluators which was already adjusted
+      // in the constructor based on FixedSearchLimit.
       Evaluators = new NNEvaluatorSet(EvaluatorDef, SearchParams.Execution.DualEvaluators, null);
       if (overrideEvaluator1 != null)
       {
@@ -529,7 +564,8 @@ public class GameEngineCeresMCGSInProcess : GameEngine
                   SelectParams, SearchParams, GameLimitManager,
                   curPositionAndMoves, searchLimit, verbose, lastSearchStartTime,
                   gameMoveHistory, callback, null, isFirstMoveOfGame,
-                  MoveImmediateIfOnlyOneMove, forcedMove: forcedMove);
+                  MoveImmediateIfOnlyOneMove, forcedMove: forcedMove,
+                  fixedSearchLimit: FixedSearchLimit);
     return Search;
   }
 

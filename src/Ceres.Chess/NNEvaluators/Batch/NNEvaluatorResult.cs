@@ -60,9 +60,14 @@ namespace Ceres.Chess.NetEvaluation.Batch
     public readonly float UncertaintyP;
 
     /// <summary>
-    /// Policy head output.
+    /// Policy head output (blended if P2FRAC > 0 and policy2 exists).
     /// </summary>
     public readonly CompressedPolicyVector Policy;
+
+    /// <summary>
+    /// Secondary policy head output (unblended), or default if not available.
+    /// </summary>
+    public readonly CompressedPolicyVector Policy2;
 
     /// <summary>
     /// Action win/draw/loss probabilities.
@@ -132,6 +137,13 @@ namespace Ceres.Chess.NetEvaluation.Batch
     /// </summary>
     private readonly byte theirKingSquare;
 
+    /// <summary>
+    /// Fortress probability metric: minimum (1 - P(NEVER)) over all pawn squares.
+    /// Low values indicate a pawn unlikely to ever move, suggesting fortress-like structure.
+    /// Returns NaN if PlyBinMoveProbs unavailable or no pawns on board.
+    /// </summary>
+    public readonly float FortressP;
+
 
     /// <summary>
     /// Constructor.
@@ -151,15 +163,17 @@ namespace Ceres.Chess.NetEvaluation.Batch
     /// <param name="extraStat1"></param>
     /// <param name="ourKingSquare">Square index of the side-to-move's king (for VCapture).</param>
     /// <param name="theirKingSquare">Square index of the opponent's king (for VCapture).</param>
-    public NNEvaluatorResult(float winP, float lossP, 
+    /// <param name="fortressP">Fortress probability metric (min pChange over pawn squares).</param>
+    public NNEvaluatorResult(float winP, float lossP,
                              float win1P, float loss1P,
                              float win2P, float loss2P,
                              float m, float uncertaintyV, float uncertaintyP,
                              CompressedPolicyVector policy,
+                             CompressedPolicyVector policy2,
                              CompressedActionVector actionsWDL,
                              NNEvaluatorResultActivations activations,
                              Half[] priorState,
-                             FP16? extraStat0 = null, 
+                             FP16? extraStat0 = null,
                              FP16? extraStat1 = default,
                              FP16[][] rawNetworkOutputs = null,
                              string[] rawNetworkOutputNames = null,
@@ -168,7 +182,8 @@ namespace Ceres.Chess.NetEvaluation.Batch
                              Half[] punimSelfProbs = null,
                              Half[] punimOpponentProbs = null,
                              byte ourKingSquare = 0,
-                             byte theirKingSquare = 0)
+                             byte theirKingSquare = 0,
+                             float fortressP = float.NaN)
     {
       this.winP = winP;
       this.lossP = lossP;
@@ -182,6 +197,7 @@ namespace Ceres.Chess.NetEvaluation.Batch
       UncertaintyV = uncertaintyV;
       UncertaintyP = uncertaintyP;
       Policy = policy;
+      Policy2 = policy2;
       Activations = activations;
       PriorState = priorState;
       ExtraStat0 = extraStat0;
@@ -194,6 +210,7 @@ namespace Ceres.Chess.NetEvaluation.Batch
       PunimOpponentProbs = punimOpponentProbs;
       this.ourKingSquare = ourKingSquare;
       this.theirKingSquare = theirKingSquare;
+      FortressP = fortressP;
     }
 
 
@@ -250,6 +267,91 @@ namespace Ceres.Chess.NetEvaluation.Batch
 
 
     /// <summary>
+    /// Computes the FortressP metric from ply-bin move probabilities and position.
+    /// FortressP = min(P(NEVER)) over all squares containing pawns.
+    /// A high value indicates a pawn unlikely to ever move, suggesting a fortress-like structure.
+    /// </summary>
+    /// <param name="plyBinMoveProbs">512-element array (64 squares × 8 bins) of move probabilities.</param>
+    /// <param name="pos">The position (MGPosition) to analyze for pawn squares.</param>
+    /// <param name="blackToMove">True if black is to move (requires rank-flip for NN output perspective).</param>
+    /// <returns>Minimum P(NEVER) over all pawn squares, or 0 if no pawns, or NaN if probs unavailable.</returns>
+    public static float ComputeFortressP(ReadOnlySpan<Half> plyBinMoveProbs, in MGPosition pos, bool blackToMove)
+    {
+      const bool DEBUG_OUTPUT_FORTRESS = false;
+
+      if (plyBinMoveProbs.IsEmpty)
+      {
+        return float.NaN;
+      }
+
+      const int NUM_BINS = 8;
+      const int NEVER_MOVE_BIN = 7;
+
+      // Extract pawn bitboards using MGPosition encoding:
+      // Pawns: A=1, B=0, C=0 (piece type 001). D distinguishes color (D=0 white, D=1 black).
+      ulong whitePawns = ~pos.D & ~pos.C & ~pos.B & pos.A;
+      ulong blackPawns = pos.D & ~pos.C & ~pos.B & pos.A;
+      ulong allPawns = whitePawns | blackPawns;
+
+      if (allPawns == 0)
+      {
+        // No pawns on board - return 0 (not NaN) per specification.
+        return 0f;
+      }
+
+      if (DEBUG_OUTPUT_FORTRESS)
+      {
+        Console.WriteLine($"FortressP computation (blackToMove={blackToMove}):");
+      }
+
+      float minPNever = float.MaxValue;
+
+      while (allPawns != 0)
+      {
+        // Get next pawn square in MGPosition bit-order (H1=0, file-mirrored).
+        int mgSquare = System.Numerics.BitOperations.TrailingZeroCount(allPawns);
+        allPawns &= allPawns - 1; // Clear lowest bit
+
+        // Convert MGPosition square to standard square (A1=0).
+        // MGPosition: H1=0, bit index = rank*8 + (7-file), so file = 7 - (mgSquare % 8).
+        int rank = mgSquare / 8;
+        int file = 7 - (mgSquare % 8);
+        int stdSquare = rank * 8 + file;
+
+        // Rank-flip for black-to-move (NN outputs in side-to-move perspective).
+        if (blackToMove)
+        {
+          stdSquare ^= 56;
+        }
+
+        // Read P(NEVER move) for this square.
+        float pNever = (float)plyBinMoveProbs[stdSquare * NUM_BINS + NEVER_MOVE_BIN];
+
+        if (DEBUG_OUTPUT_FORTRESS)
+        {
+          bool isWhitePawn = (whitePawns & (1UL << mgSquare)) != 0;
+          string pawnColor = isWhitePawn ? "White" : "Black";
+          char fileChar = (char)('a' + file);
+          int rankNum = rank + 1;
+          Console.WriteLine($"  {pawnColor} pawn at {fileChar}{rankNum}: P(NEVER) = {pNever * 100:F1}%");
+        }
+
+        if (pNever < minPNever)
+        {
+          minPNever = pNever;
+        }
+      }
+
+      if (DEBUG_OUTPUT_FORTRESS)
+      {
+        Console.WriteLine($"  --> FortressP (min P(NEVER)) = {minPNever * 100:F1}%");
+      }
+
+      return minPNever;
+    }
+
+
+    /// <summary>
     /// Draw probability.
     /// </summary>
     public readonly float D => 1.0f - (winP + lossP);
@@ -263,18 +365,18 @@ namespace Ceres.Chess.NetEvaluation.Batch
     /// <summary>
     /// Win probability.
     /// </summary>
-    public readonly float W => float.IsNaN(lossP) ? float.NaN : winP;
+    public readonly float W => float.IsNaN(winP) ? float.NaN : winP;
 
 
     /// <summary>
     /// Win probability (primary value head).
     /// </summary>
-    public readonly float W1 => float.IsNaN(loss1P) ? float.NaN : winP;
+    public readonly float W1 => float.IsNaN(win1P) ? float.NaN : win1P;
 
     /// <summary>
     /// Win probability (secondary value head).
     /// </summary>
-    public readonly float W2 => float.IsNaN(loss2P) ? float.NaN : win2P;
+    public readonly float W2 => float.IsNaN(win2P) ? float.NaN : win2P;
 
 
     /// <summary>
@@ -285,7 +387,7 @@ namespace Ceres.Chess.NetEvaluation.Batch
     /// <summary>
     /// Loss probability (primary value head).
     /// </summary>
-    public readonly float L1 => float.IsNaN(loss1P) ? float.NaN : lossP;
+    public readonly float L1 => float.IsNaN(loss1P) ? float.NaN : loss1P;
 
     /// <summary>
     /// Loss probability (secondary value head).
@@ -294,9 +396,9 @@ namespace Ceres.Chess.NetEvaluation.Batch
 
 
     /// <summary>
-    /// Returns most probably game result (win, draw, loss) as an integer (-1, 0, 1).
+    /// Returns most probable game result (win, draw, loss) as an integer (1, 0, -1).
     /// </summary>
-    public readonly int MostProbableGameResult => W > 0.5f ? 1 : (L > 0.5 ? -1 : 0);
+    public readonly int MostProbableGameResult => W > 0.5f ? 1 : (L > 0.5f ? -1 : 0);
 
     /// <summary>
     /// Returns the action head evaluation for a specified move.
@@ -326,9 +428,9 @@ namespace Ceres.Chess.NetEvaluation.Batch
           return ((float)thisAction.W, 1 - (float)thisAction.W - (float)thisAction.L, (float)thisAction.L);
         }
         policyIndex++;
-      } 
+      }
 
-      throw new Exception("Move not found in policy " + move);
+      throw new ArgumentException($"Move {move} not found in policy.", nameof(move));
     }
 
 
@@ -346,8 +448,8 @@ namespace Ceres.Chess.NetEvaluation.Batch
       }
 
       (Half W, Half L) thisAction = ActionsWDL[moveIndexInCompressedPolicyVector];
-      return ((float) thisAction.W, 1 - (float)thisAction.W - (float)thisAction.L, (float)thisAction.L); 
-    } 
+      return ((float)thisAction.W, 1 - (float)thisAction.W - (float)thisAction.L, (float)thisAction.L);
+    }
 
 
     /// <summary>
@@ -364,15 +466,15 @@ namespace Ceres.Chess.NetEvaluation.Batch
         dev = $" QDEV [{ExtraStat0.Value,4:F2} {ExtraStat1.Value,4:F2}] ";
       }
 
-      string extras = $" WDL ({W:F2} {1-(W+L):F2} {L:F2}) ";
+      string extras = $" WDL ({W:F2} {D:F2} {L:F2}) ";
       if (!float.IsNaN(W2))
       {
-        extras += $" WDL2 ({W2:F2} {1 - (W2 + L2):F2} {L2:F2}) ";
+        extras += $" WDL2 ({W2:F2} {D2:F2} {L2:F2}) ";
       }
 
       if (!float.IsNaN(M))
       {
-        extras += $" MLH={M,6:F2}";
+        extras += $" MLH={Math.Round(M),3:F0}";
       }
 
       if (!float.IsNaN(UncertaintyV))
@@ -385,7 +487,18 @@ namespace Ceres.Chess.NetEvaluation.Batch
         extras += $" UP={UncertaintyP,5:F2}";
       }
 
-      return $"<NNPositionEvaluation V={V,6:F2}{extraV}{extras}{dev} Policy={Policy}>";
+      if (!float.IsNaN(VCapture))
+      {
+        extras += $" VC={VCapture,5:F2}";
+      }
+
+      if (!float.IsNaN(FortressP))
+      {
+        extras += $" FP={FortressP,5:F2}";
+      }
+
+      string policy2Str = Policy2.Count > 0 ? $" Policy2={Policy2}" : "";
+      return $"<NNPositionEvaluation V={V,6:F2}{extraV}{extras}{dev} Policy={Policy}{policy2Str}>";
     }
   }
 }

@@ -92,39 +92,112 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
 
 
   /// <summary>
-  /// Determines the position this node represents.
-  /// Note that this is not efficient (requires ascending to the root node).
+  /// Returns the NodeIndex of this node's BFS-tree parent (position 0 in parent list).
+  /// This parent lies on a guaranteed cycle-free path to the graph root.
+  /// Invalid to call on the graph root (which has no parent).
   /// </summary>
-  /// <returns></returns>
+  /// <remarks>
+  /// The tree-parent invariant ensures position 0 in each node's parent list is always a 
+  /// BFS-tree parent. During normal search, the creating parent is naturally position 0.
+  /// GraphRewriter Phase 5 uses BFS discovery to preserve this invariant when rebuilding parents.
+  /// </remarks>
+  public NodeIndex TreeParentNodeIndex
+  {
+    get
+    {
+      GParentsHeader header = NodeRef.ParentsHeader;
+      Debug.Assert(!header.IsEmpty, "TreeParentNodeIndex called on node with no parents");
+      return header.IsDirectEntry
+        ? header.AsDirectParentNodeIndex
+        : GraphStore.ParentsStore.DetailSegments.SegmentRef(header.AsSegmentLinkIndex).Entries[0].AsDirectParentNodeIndex;
+    }
+  }
+
+
+  /// <summary>
+  /// Returns the edge from this node's BFS-tree parent (position 0 in parent list).
+  /// This parent lies on a guaranteed cycle-free path to the graph root.
+  /// Invalid to call on the graph root (which has no parent).
+  /// </summary>
+  /// <remarks>
+  /// The tree-parent invariant ensures position 0 in each node's parent list is always a 
+  /// BFS-tree parent. During normal search, the creating parent is naturally position 0.
+  /// GraphRewriter Phase 5 uses BFS discovery to preserve this invariant when rebuilding parents.
+  /// </remarks>
+  public GEdge TreeParentEdge
+  {
+    get
+    {
+      Debug.Assert(!IsGraphRoot, "TreeParentEdge called on graph root node");
+      GParentsHeader header = NodeRef.ParentsHeader;
+      Debug.Assert(!header.IsEmpty, "TreeParentEdge called on node with no parents");
+
+      NodeIndex parentIdx = header.IsDirectEntry
+        ? header.AsDirectParentNodeIndex
+        : GraphStore.ParentsStore.DetailSegments.SegmentRef(header.AsSegmentLinkIndex).Entries[0].AsDirectParentNodeIndex;
+
+      GNode parent = Graph[parentIdx];
+      int childSlot = parent.IndexOfChildInChildEdges(Index);
+      Debug.Assert(childSlot != -1, "Tree parent does not have child edge to this node");
+      return parent.ChildEdgeAtIndex(childSlot);
+    }
+  }
+
+
+  /// <summary>
+  /// Returns the depth of this node from the search root, following tree-parent edges.
+  /// </summary>
+  /// <remarks>
+  /// Follows the tree-parent invariant to guarantee O(depth) traversal with no cycles.
+  /// </remarks>
+  public int DepthFromSearchRoot()
+  {
+    int depth = 0;
+    GNode node = this;
+    while (!node.IsSearchRoot)
+    {
+      node = Graph[node.TreeParentNodeIndex];
+      depth++;
+      Debug.Assert(depth < 512, "DepthFromSearchRoot: depth exceeded maximum — tree-parent invariant may be broken");
+    }
+    return depth;
+  }
+
+
+  /// <summary>
+  /// Determines the position this node represents by following tree-parent edges to the graph root.
+  /// </summary>
+  /// <returns>The MGPosition represented by this node.</returns>
+  /// <remarks>
+  /// Uses the tree-parent invariant to guarantee O(depth) traversal with no cycles.
+  /// The first-created parent (position 0) is always on a BFS-tree path to the root,
+  /// eliminating the need for cycle detection.
+  /// Note: Uses IsGraphRoot (not IsSearchRoot) because PriorPositionsMG[^1] contains
+  /// the graph root position, which doesn't change when the search root moves.
+  /// </remarks>
   public MGPosition CalcPosition()
   {
-    List<EncodedMove> movesToRoot = [];
-    GNode thisNode = this;
-    while (!thisNode.IsGraphRoot)
+    const int MAX_DEPTH = 512;
+    Span<EncodedMove> moves = stackalloc EncodedMove[MAX_DEPTH];
+    int depth = 0;
+
+    GNode node = this;
+    while (!node.IsGraphRoot)
     {
-      // Arbitrarily choose one parent edge to ascend to the root.
-      // TODO: make a helper method that does this more efficiently/elegantly.
-      // TODO: Fix if possible, this is actually not always exactly correct! (e.g. move 50 counter might differ)
-      //       If can't be fixed, just make sure this method used only in diagnostic/informative scenarios
-      foreach (GEdge edge in thisNode.ParentEdges)
-      {
-        thisNode = edge.ParentNode;
-        movesToRoot.Add(edge.Move);
-        break;
-      }
+      Debug.Assert(depth < MAX_DEPTH, "CalcPosition: depth exceeded maximum — tree-parent invariant may be broken");
+      GEdge treeEdge = node.TreeParentEdge;
+      moves[depth++] = treeEdge.Move;
+      node = treeEdge.ParentNode;
     }
 
-    movesToRoot.Reverse();
-
-    // Finally, successively apply the moves starting at the root position.
-    MGPosition thisPos = Graph.Store.HistoryHashes.PriorPositionsMG[^1]; // start at root
-    foreach (EncodedMove move in movesToRoot)
+    // Apply moves starting from graph root position.
+    MGPosition pos = Graph.Store.HistoryHashes.PriorPositionsMG[^1];
+    for (int i = depth - 1; i >= 0; i--)
     {
-      MGMove mgMove = ConverterMGMoveEncodedMove.EncodedMoveToMGChessMove(move, thisPos);
-      thisPos.MakeMove(mgMove);
+      MGMove mgMove = ConverterMGMoveEncodedMove.EncodedMoveToMGChessMove(moves[i], pos);
+      pos.MakeMove(mgMove);
     }
-
-    return thisPos;
+    return pos;
   }
 
 
@@ -154,9 +227,10 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
   /// <returns></returns>
   public GEdge EdgeForMove(MGMove move)
   {
+    EncodedMove encodedMove = ConverterMGMoveEncodedMove.MGChessMoveToEncodedMove(move);
     foreach (GEdge edge in ChildEdgesExpanded)
     {
-      if (edge.MoveMG == move)
+      if (edge.Move == encodedMove)
       {
         return edge;
       }
@@ -191,10 +265,14 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
   }
 
 
+  /// <summary>
+  /// Returns the index of the child edge corresponding to the specified child node, or -1 if not found.
+  /// We could use 1 byte in GNodeStruct to make this more efficient, but this method is not on the hot path for search.
+  /// </summary>
+  /// <param name="childIndex"></param>
+  /// <returns></returns>
   public int IndexOfChildInChildEdges(NodeIndex childIndex)
   {
-    // TODO: slow! perhaps instead store IndexOfChildInParent somewhere
-    // TODO: performance: consider using AVXHelper.FindFirstMatchF1 below
     int i = 0;
     foreach (GEdge childEdge in ChildEdgesExpanded)
     {
@@ -408,7 +486,7 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
       NodeRef.NumPolicyMoves = (byte)numEdgeHeaders;
       BlockIndexIntoEdgeHeaderStore = (int)GraphStore.EdgeHeadersStore.AllocateEntriesStartBlock(numEdgeHeaders);
 
-      var span = GraphStore.EdgeHeadersStore.SpanAtBlockIndex(BlockIndexIntoEdgeHeaderStore, (byte)numEdgeHeaders);
+      Span<GEdgeHeaderStruct> span = GraphStore.EdgeHeadersStore.SpanAtBlockIndex(BlockIndexIntoEdgeHeaderStore, (byte)numEdgeHeaders);
       return new GNodeEdgeHeaders(this, span);
     }
   }
@@ -564,7 +642,7 @@ public readonly unsafe partial struct GNode : IComparable<GNode>, IEquatable<GNo
            + (float.IsNaN(NodeRef.UncertaintyValue)  ? "" : $"UV={NodeRef.UncertaintyValue,4:F3} ") 
            + (float.IsNaN(NodeRef.UncertaintyPolicy) ? "" : $"UP={NodeRef.UncertaintyPolicy,4:F3} ")
            + $"H={NodeRef.HashStandalone.Hash % 10000} Sib={100*NodeRef.SiblingsQFrac}%/{NodeRef.SiblingsQ,4:F2} "
-           + $"E/V={NumEdgesExpanded}/{NumEdgesVisited} "
+           + $"E={NumEdgesExpanded} "
            + $"{CalcPosition().ToPosition.FEN}>";
     }
   }

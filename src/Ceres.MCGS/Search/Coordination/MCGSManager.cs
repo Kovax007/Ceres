@@ -33,19 +33,17 @@ using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.NNEvaluators.LC0DLL;
 using Ceres.Chess.Positions;
 
+using Ceres.MCGS.Environment;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Iteration;
-using Ceres.MCGS.LowLevel;
 using Ceres.MCGS.Managers;
 using Ceres.MCGS.Managers.Limits;
-using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
-using Ceres.MCGS.Search.PathEvaluators;
+using Ceres.MCGS.Search.Phases.Evaluation;
 
 #endregion
 
-namespace Ceres.MCGS.Search;
+namespace Ceres.MCGS.Search.Coordination;
 
 public partial class MCGSManager : IDisposable
 {
@@ -97,7 +95,10 @@ public partial class MCGSManager : IDisposable
   public readonly MCGSEvaluatorNeuralNet EvaluatorNN1;
 
 
-  public PositionWithHistory StartPosAndPriorMoves;
+  /// <summary>
+  /// Position and prior moves from the start of the search.
+  /// </summary>
+  public PositionWithHistory StartPosAndPriorMoves => Engine?.Graph.Store.NodesStore.PositionHistory;
 
   /// <summary>
   /// Position at the root of the search
@@ -131,7 +132,7 @@ public partial class MCGSManager : IDisposable
   private bool disposed;
   private MCGSIterator iterator0;
   private MCGSIterator iterator1;
-  
+
   public float FractionExtendedSoFar = 0;
 
 
@@ -163,7 +164,7 @@ public partial class MCGSManager : IDisposable
 
   /// <summary>
   /// Time when visits were started 
-  /// (after any preparatory steps such as tree reuse preparation).
+  /// (after any preparatory steps such as graph reuse preparation).
   /// </summary>
   public DateTime StartTimeFirstVisit;
 
@@ -177,6 +178,12 @@ public partial class MCGSManager : IDisposable
   /// (possibly multiple of search was extended).
   /// </summary>
   public SearchLimit SearchLimit;
+
+  /// <summary>
+  /// Optional fixed search limit known at engine creation time.
+  /// When specified, allows optimizations for small searches.
+  /// </summary>
+  public readonly SearchLimit FixedSearchLimit;
 
 
   public bool ExternalStopRequested;
@@ -199,7 +206,7 @@ public partial class MCGSManager : IDisposable
 
   /// <summary>
   /// The N of the root node when search started
-  /// (possibly nonzero due to tree reuse)
+  /// (possibly nonzero due to graph reuse)
   /// </summary>
   public int RootNWhenSearchStarted;
 
@@ -226,6 +233,7 @@ public partial class MCGSManager : IDisposable
   /// <param name="paramsSelect"></param>
   /// <param name="forceNoTablebaseTerminals"></param>
   /// <param name="searchMovesTablebaseRestricted"></param>
+  /// <param name="fixedSearchLimit"></param>
   public MCGSManager(NNEvaluatorSet evaluatorSet,
                      ParamsSearch paramsSearch,
                      ParamsSelect paramsSelect,
@@ -236,8 +244,12 @@ public partial class MCGSManager : IDisposable
                      bool isFirstMoveOfGame,
                      bool forceNoTablebaseTerminals,
                      List<MGMove> searchMovesTablebaseRestricted,
-                     bool engineIsWhite)
+                     bool engineIsWhite,
+                     SearchLimit fixedSearchLimit = null)
   {
+    // Ensure engine initialization is performed (thread-safe, only runs once)
+    MCGSEngineInitialization.BaseInitialize();
+
     if (searchLimit.IsPerGameLimit)
     {
       throw new Exception("Per game search limits not supported");
@@ -252,6 +264,7 @@ public partial class MCGSManager : IDisposable
 
     SearchLimit = searchLimit;
     SearchLimitInitial = searchLimit;
+    FixedSearchLimit = fixedSearchLimit;
     if (searchLimit.IsPerGameLimit)
     {
       throw new Exception("Per game search limits not supported");
@@ -304,7 +317,7 @@ public partial class MCGSManager : IDisposable
     // Possibly allocate a device allocator to be shared across evaluators.
     // This enables possible concurrent non-overlapping placement across devices.
     ItemsInBucketsAllocator nnDeviceAllocator = null;
-    if (ENABLE_SHARED_NN_ALLOCATOR 
+    if (ENABLE_SHARED_NN_ALLOCATOR
      && paramsSearch.Execution.DualOverlappedIterators
      && NNEvaluator0 is NNEvaluatorSplit splitEvaluator)
     {
@@ -376,7 +389,7 @@ public partial class MCGSManager : IDisposable
 
   internal void RunPeriodicMaintenance(int batchSequenceNum)
   {
-    // Use this time to perform housekeeping (tree is quiescent)
+    // Use this time to perform housekeeping (graph is quiescent)
     using (new NodeLockBlock(Engine.SearchRootNode))
     {
       try
@@ -401,7 +414,7 @@ public partial class MCGSManager : IDisposable
   }
 
 
-  public void RunLoopUntilTreeSize(PositionWithHistory pos, SearchLimit searchLimit)
+  public void RunLoopUntilGraphSize(PositionWithHistory pos, SearchLimit searchLimit)
   {
     throw new NotImplementedException(); // old
 #if NOT
@@ -461,7 +474,7 @@ public partial class MCGSManager : IDisposable
     manager.RootNWhenSearchStarted = manager.Engine.SearchRootNode.N;
     manager.NumEvalsThisSearch = 0;
 
-    PositionWithHistory priorMoves = manager.Engine.Graph.Store.NodesStore.PositionHistory; 
+    PositionWithHistory priorMoves = manager.Engine.Graph.Store.NodesStore.PositionHistory;
 
     // Make sure not already checkmate/stalemate
     GameResult terminalStatus = priorMoves.FinalPosition.CalcTerminalStatus();
@@ -665,7 +678,7 @@ public partial class MCGSManager : IDisposable
       StartTimeFirstVisit = DateTime.Now;
       if (shouldProcess)
       {
-        int hardMaxRootN = hardLimitNumNodesToCompute == null ? int.MaxValue 
+        int hardMaxRootN = hardLimitNumNodesToCompute == null ? int.MaxValue
                                                               : Engine.SearchRootNode.N + hardLimitNumNodesToCompute.Value;
         if (Engine.SearchRootNode.N < hardMaxRootN)
         {
@@ -676,7 +689,7 @@ public partial class MCGSManager : IDisposable
 
     // Make sure nothing was left in flight after the search
     foreach (GEdge edge in Engine.SearchRootNode.ChildEdgesExpanded)
-    { 
+    {
       if ((edge.NumInFlight0 > 0 || edge.NumInFlight1 > 0) && !haveWarnedInFlight)
       {
         Console.WriteLine($"Internal error: search ended with N={Engine.SearchRootNode.N}  {Engine.SearchRootNode} {edge}");
@@ -685,10 +698,10 @@ public partial class MCGSManager : IDisposable
       }
     }
 
-    // Possibly validate tree integrity.
+    // Possibly validate graph integrity.
     if (Engine.Manager.ParamsSearch.ValidateAfterSearch)
     {
-      Engine.Graph.Validate(fastMode:true);
+      Engine.Graph.Validate(fastMode: true);
     }
 
     return stats;
@@ -725,7 +738,8 @@ public partial class MCGSManager : IDisposable
     NNEvaluatorResult[] valueEvalResults = null;
     (MGMove bestMove, float bestV, float bestD) = BestValueMove(manager.EvaluatorNN0.Evaluator, priorMoves,
                                                                 ref moves, ref valueEvalResults,
-                                                                manager.ParamsSearch.HistoryFillIn, false);
+                                                                manager.ParamsSearch.HistoryFillIn, false,
+                                                                manager.Engine.SearchRootPlySinceLastMove);
     GNode rootNode = manager.Engine.SearchRootNode;
     rootNode.NodeRef.Q = bestV;
     rootNode.NodeRef.D = bestD;
@@ -749,7 +763,7 @@ public partial class MCGSManager : IDisposable
     foreach ((EncodedMove Move, float Probability) policyMove in rootResult.Policy.ProbabilitySummary())
     {
       (float w, float d, float l) zz = rootResult.ActionWDLForMove(policyMove.Move);
-      float actionV = zz.w - zz.l;
+      float actionV = -(zz.w - zz.l);
       if (actionV > bestActionV)
       {
         bestMove = ConverterMGMoveEncodedMove.EncodedMoveToMGChessMove(policyMove.Move, thisPos);
@@ -788,7 +802,7 @@ public partial class MCGSManager : IDisposable
     disposed = true;
     iterator0?.Dispose();
     iterator1?.Dispose();
-//    EvaluatorsSet?.Dispose(); // do not release, shared (passed in)
+    //    EvaluatorsSet?.Dispose(); // do not release, shared (passed in)
     GC.SuppressFinalize(this);
   }
 

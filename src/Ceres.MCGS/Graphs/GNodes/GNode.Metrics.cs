@@ -17,7 +17,6 @@ using System;
 using System.Collections.Generic;
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GEdgeHeaders;
-using Ceres.MCGS.LowLevel;
 
 #endregion
 
@@ -77,9 +76,9 @@ public readonly partial struct GNode
 
       using (new NodeLockBlock(this))
       {
-        int numVisitedEdges = NumEdgesVisited;
+        int numExpandedEdges = NumEdgesExpanded;
 
-        for (int i = 0; i < numVisitedEdges; i++)
+        for (int i = 0; i < numExpandedEdges; i++)
         {
           GEdge edge = ChildEdgeAtIndex(i);
           int edgeN = edge.N;
@@ -103,7 +102,16 @@ public readonly partial struct GNode
   /// An irreversible move is one that resets the 50-move counter (pawn move or capture).
   /// </summary>
   /// <returns>The number of plies until an irreversible move, or null if no irreversible move is found in the PV.</returns>
-  public readonly int? PlyUntilPVIsIrreversibleMove()
+  public readonly int? PlyUntilPVIsIrreversibleMove() => PlyUntilPVIsIrreversibleMoveWithMove().ply;
+
+
+  /// <summary>
+  /// Descends the principal variation (following the child edge with highest N at each step)
+  /// and returns the number of plies until an irreversible move is encountered along with the move itself.
+  /// An irreversible move is one that resets the 50-move counter (pawn move or capture).
+  /// </summary>
+  /// <returns>A tuple containing the number of plies until an irreversible move (or null if none found) and the irreversible move edge (or null if none found).</returns>
+  public readonly (int? ply, GEdge? irreversibleEdge) PlyUntilPVIsIrreversibleMoveWithMove()
   {
     int plyCount = 0;
     GNode currentNode = this;
@@ -133,7 +141,7 @@ public readonly partial struct GNode
       // Check if this move is irreversible (resets the 50-move counter).
       if (bestEdge.MoveMG.ResetsMove50Count)
       {
-        return plyCount;
+        return (plyCount, bestEdge);
       }
 
       // Descend to the child node.
@@ -148,6 +156,6 @@ public readonly partial struct GNode
     }
 
     // No irreversible move found in the PV.
-    return null;
+    return (null, null);
   }
 }

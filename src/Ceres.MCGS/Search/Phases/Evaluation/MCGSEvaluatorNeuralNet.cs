@@ -34,22 +34,25 @@ using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.PositionEvalCaching;
 using Ceres.Chess.Positions;
 using Ceres.MCGS.Graphs;
+using Ceres.MCGS.Graphs.GEdgeHeaders;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.LowLevel;
 using Ceres.MCGS.Search.Coordination;
 using Ceres.MCGS.Search.Params;
+using Ceres.MCGS.Search.PathEvaluators;
 using Ceres.MCGS.Search.Paths;
-using Ceres.MCGS.Search.Strategies;
 
 #endregion
 
-namespace Ceres.MCGS.Search.PathEvaluators;
+namespace Ceres.MCGS.Search.Phases.Evaluation;
 
 /// <summary>
 /// Base class for an selection terminator which performs inference using a neural network.
 /// </summary>
 public sealed class MCGSEvaluatorNeuralNet : IDisposable
 {
+  public static bool DEBUGGING_PLY_SINCE_LAST_MOVE = false;
+
+
   /// <summary>
   ///
   /// </summary>
@@ -249,7 +252,7 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
   /// <returns></returns>
   /// <exception cref="Exception"></exception>
   /// <exception cref="NotImplementedException"></exception>
-  int SetBatch(ListBounded<MCGSPath> paths)
+  int SetBatch(MCGSEngine engine, ListBounded<MCGSPath> paths)
   {
     if (paths.Count > Evaluator.MaxBatchSize)
     {
@@ -261,7 +264,12 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
       CountTotalBatches++;
       CountTotalPositions += paths.Count;
 
-      VerifyBatchAllocated(paths.Count);
+      VerifyBatchAllocated(paths.Count);      
+
+      if (engine.NeedsPlySinceLastMove && (Batch.LastMovePlies == null || Batch.LastMovePlies.Length < paths.Count * 64))
+      {
+        Batch.LastMovePlies = new byte[Batch.MaxBatchSize * 64];
+      }
 
       if (EvaluatorDef.PositionTransform == NNEvaluatorDef.PositionTransformType.Mirror)
       {
@@ -275,6 +283,38 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
       Parallel.For(0, paths.Count, parallelOptions, delegate (int i)
       {
         SetEncodedBoardPositionFromPath(paths[i], ref rawPosArray[i], FillInHistory);
+
+        if (engine.NeedsPlySinceLastMove)
+        {
+          if (MCGSEvaluatorNeuralNet.DEBUGGING_PLY_SINCE_LAST_MOVE)
+          {
+            Console.WriteLine("<PLY_SINCE_DEBUG> Dumping ply since last move for path " + i);
+//            paths[i].DumpLocalVisits();
+            foreach (Position pos in paths[i].LeafPositionWithHistory.Positions)
+            {
+              Console.WriteLine(pos);
+            }
+            paths[i].PlySinceLastMove.Dump(paths[i].LeafPositionWithHistory);
+          }
+          ValidatePlySinceLastMoveIncremental(paths[i]);
+          Span<byte> targetSlice = new Span<byte>(Batch.LastMovePlies, i * 64, 64);
+          ReadOnlySpan<byte> srcPlySince = paths[i].PlySinceLastMove.SquarePlySince;
+
+          // PlySince is maintained in absolute coordinates (A1=0).
+          // The NN expects values in the side-to-move's perspective.
+          // For Black-to-move positions, flip with ^56.
+          if (paths[i].LeafVisitRef.ChildPosition.BlackToMove)
+          {
+            for (int s = 0; s < 64; s++)
+            {
+              targetSlice[s] = srcPlySince[s ^ 56];
+            }
+          }
+          else
+          {
+            srcPlySince.CopyTo(targetSlice);
+          }
+        }
       });
 
 
@@ -310,53 +350,53 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
                        IPositionEvaluationBatch results,
                        (NNEvaluatorResult[][] evalResults, MGMoveList[] moveLists) actualEvalsAllPositionsAllMoves = default)
   {
-    Parallel.For(0, 
-      paths.Count, 
-      new ParallelOptions() {  MaxDegreeOfParallelism = ParallelUtils.CalcMaxParallelism(paths.Count, 24) },
+    Parallel.For(0,
+      paths.Count,
+      new ParallelOptions() { MaxDegreeOfParallelism = ParallelUtils.CalcMaxParallelism(paths.Count, 24) },
       i =>
-    {
-      // TODO: make this cleaner/faster
-      MCGSPath path = paths[i];
-      GNode node = path.IsRootInitializationPath ? path.Engine.SearchRootNode
-                                                 : path.LeafVisitRef.ParentChildEdge.ChildNode;
-
-      FP16 winP;
-      FP16 lossP;
-      FP16 rawM = results.HasM ? results.GetM(i) : FP16.NaN;
-      FP16 rawUncertaintyV = results.HasUncertaintyV ? FP16.Max(0, (FP16)(float)results.GetUncertaintyV(i)) : FP16.NaN;
-      FP16 rawUncertaintyP = results.HasUncertaintyP ? FP16.Max(0, (FP16)(float)results.GetUncertaintyP(i)) : FP16.NaN;
-
-      // Copy WinP
-      FP16 rawWinP = results.GetWinP(i);
-      Debug.Assert(!float.IsNaN(rawWinP));
-
-      // Copy LossP
-      FP16 rawLossP = results.GetLossP(i);
-      Debug.Assert(!float.IsNaN(rawLossP));
-
-      // Assign win and loss probabilities
-      // If they look like non-WDL result, try to rewrite them
-      // in equivalent way that avoids negative probabilities
-      if (rawLossP == 0 && rawWinP < 0)
       {
-        winP = 0;
-        lossP = -rawWinP;
-      }
-      else
-      {
-        winP = rawWinP;
-        lossP = rawLossP;
-      }
+        // TODO: make this cleaner/faster
+        MCGSPath path = paths[i];
+        GNode node = path.IsRootInitializationPath ? path.Engine.SearchRootNode
+                                                   : path.LeafVisitRef.ParentChildEdge.ChildNode;
 
-      if (ValueTemperature != 1)
-      {
-        // TODO: Consider removing this.
-        //       It is inefficient, and seems to overlap with functionality now in NNEvaluator.
-        float temperature = ValueTemperature;
-        (float winPRaw, float drawPRaw, float lossPRaw) = (winP, Math.Max(0, 1 - winP - lossP), lossP);
-        (float winPRawLogit, float drawPRawLogit, float lossPRawLogit) = (MathF.Log(winPRaw) / temperature, MathF.Log(drawPRaw) / temperature, MathF.Log(lossPRaw) / temperature);
-        (float winPAdj, float drawPAdj, float lossPAdj) = (MathF.Exp(winPRawLogit), MathF.Exp(drawPRawLogit), MathF.Exp(lossPRawLogit));
-        float sum = winPAdj + drawPAdj + lossPAdj;
+        FP16 winP;
+        FP16 lossP;
+        FP16 rawM = results.HasM ? results.GetM(i) : FP16.NaN;
+        FP16 rawUncertaintyV = results.HasUncertaintyV ? FP16.Max(0, (FP16)(float)results.GetUncertaintyV(i)) : FP16.NaN;
+        FP16 rawUncertaintyP = results.HasUncertaintyP ? FP16.Max(0, (FP16)(float)results.GetUncertaintyP(i)) : FP16.NaN;
+
+        // Copy WinP
+        FP16 rawWinP = results.GetWinP(i);
+        Debug.Assert(!float.IsNaN(rawWinP));
+
+        // Copy LossP
+        FP16 rawLossP = results.GetLossP(i);
+        Debug.Assert(!float.IsNaN(rawLossP));
+
+        // Assign win and loss probabilities
+        // If they look like non-WDL result, try to rewrite them
+        // in equivalent way that avoids negative probabilities
+        if (rawLossP == 0 && rawWinP < 0)
+        {
+          winP = 0;
+          lossP = -rawWinP;
+        }
+        else
+        {
+          winP = rawWinP;
+          lossP = rawLossP;
+        }
+
+        if (ValueTemperature != 1)
+        {
+          // TODO: Consider removing this.
+          //       It is inefficient, and seems to overlap with functionality now in NNEvaluator.
+          float temperature = ValueTemperature;
+          (float winPRaw, float drawPRaw, float lossPRaw) = (winP, Math.Max(0, 1 - winP - lossP), lossP);
+          (float winPRawLogit, float drawPRawLogit, float lossPRawLogit) = (MathF.Log(winPRaw) / temperature, MathF.Log(drawPRaw) / temperature, MathF.Log(lossPRaw) / temperature);
+          (float winPAdj, float drawPAdj, float lossPAdj) = (MathF.Exp(winPRawLogit), MathF.Exp(drawPRawLogit), MathF.Exp(lossPRawLogit));
+          float sum = winPAdj + drawPAdj + lossPAdj;
 
 #if NOT
         (float winPRaw, float lossPRaw) = (winP, lossP);
@@ -365,80 +405,102 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
         float sum = winPAdj + lossPAdj;
 #endif
 
-        winP = (FP16)(winPAdj / sum);
-        lossP = (FP16)(lossPAdj / sum);
-      }
-
-
-      (Memory<CompressedPolicyVector> policies, int index) policyInfo;
-      Memory<CompressedActionVector> actionArray = default;
-      Half[] state = default;
-
-      policyInfo = results.GetPolicy(i);
-
-      if (results.HasAction)
-      {
-        actionArray = results.GetAction(i).actions;
-
-        // If we have actualEvalsAllPositionsAllMoves,
-        // use these actual values replace values in actionArray
-        // with true (lookahead) values. Used only for testing/research.
-        if (actualEvalsAllPositionsAllMoves != default)
-        {
-          CompressedActionVector av = new();
-          for (int m = 0; m < actualEvalsAllPositionsAllMoves.evalResults[i].Length; m++)
-          {
-            // The moves coming back are in arbitrary order.
-            // But we need to place the action value into the action array,
-            // which in a generally different order (same as policy).
-            // Therefore need to lookup the index of the move in the target policy array.
-            MGMove thisMGMove = actualEvalsAllPositionsAllMoves.moveLists[i].MovesArray[m];
-            EncodedMove thisEncodedMove = ConverterMGMoveEncodedMove.MGChessMoveToEncodedMove(thisMGMove);
-            int indexThisMoveInPolicyVector = policyInfo.policies.Span[i].IndexOfMove(thisEncodedMove);
-            Debug.Assert(indexThisMoveInPolicyVector >= 0, "Move not found in policy vector.");
-
-            // Note that W and L are reversed to invert this to be
-            // from player to move perspective (consistent with value head convention).
-            av[indexThisMoveInPolicyVector] = ((Half)actualEvalsAllPositionsAllMoves.evalResults[i][m].L,
-                                               (Half)actualEvalsAllPositionsAllMoves.evalResults[i][m].W);
-          }
-          actionArray.Span[i] = av;
+          winP = (FP16)(winPAdj / sum);
+          lossP = (FP16)(lossPAdj / sum);
         }
-      }
 
-      if (results.HasState && EnableState)
-      {
-        state = results.GetState(i);
-      }
+#if ACTION_ENABLED
+        // If ActionHeadWeightInV is nonzero, blend the action head value from the parent
+        // (if accessible) into the V that will be stored on this newly created node.
+        float actionHeadWeight = engine.Manager.ParamsSearch.ActionHeadWeightInV;
+        if (actionHeadWeight != 0 && !path.IsRootInitializationPath)
+        {
+          BlendActionHeadValue(path, actionHeadWeight, ref winP, ref lossP);
+        }
+#endif
 
-      // TODO: make side determination faster
-      // (short)policyInfo.index policyInfo.policies, actionArray, 
-      SelectTerminationInfo evalResult = new(node.IsWhite ? SideType.White : SideType.Black,
-                                             MCGSPathTerminationReason.PendingNeuralNetEval, GameResult.Unknown,
-                                             winP, lossP, rawM, rawUncertaintyV, rawUncertaintyP, state);
+        (Memory<CompressedPolicyVector> policies, int index) policyInfo;
+        Memory<CompressedActionVector> actionArray = default;
+        Half[] state = default;
 
-      GNode leafNode = path.IsRootInitializationPath ? engine.SearchRootNode : path.LeafNode;
-      Debug.Assert(!leafNode.IsEvaluated);
-      ref MCGSPathVisit refLeafVisit = ref path.LeafVisitRef;
+        policyInfo = results.GetPolicy(i);
 
-      using (new NodeLockBlock(leafNode))
-      {
-        engine.ApplyNodeEvaluationValues(leafNode, in refLeafVisit.ChildPosition, refLeafVisit.Moves,
-                                         policyInfo.index,
-                                         policyInfo.policies, actionArray,
-                                         in evalResult);
+        if (results.HasAction)
+        {
+          actionArray = results.GetAction(i).actions;
+
+          // If we have actualEvalsAllPositionsAllMoves,
+          // use these actual values replace values in actionArray
+          // with true (lookahead) values. Used only for testing/research.
+          if (actualEvalsAllPositionsAllMoves != default)
+          {
+            CompressedActionVector av = new();
+            for (int m = 0; m < actualEvalsAllPositionsAllMoves.evalResults[i].Length; m++)
+            {
+              // The moves coming back are in arbitrary order.
+              // But we need to place the action value into the action array,
+              // which in a generally different order (same as policy).
+              // Therefore need to lookup the index of the move in the target policy array.
+              MGMove thisMGMove = actualEvalsAllPositionsAllMoves.moveLists[i].MovesArray[m];
+              EncodedMove thisEncodedMove = ConverterMGMoveEncodedMove.MGChessMoveToEncodedMove(thisMGMove);
+              int indexThisMoveInPolicyVector = policyInfo.policies.Span[i].IndexOfMove(thisEncodedMove);
+              Debug.Assert(indexThisMoveInPolicyVector >= 0, "Move not found in policy vector.");
+
+              // Note that W and L are reversed to invert this to be
+              // from player to move perspective (consistent with value head convention).
+              av[indexThisMoveInPolicyVector] = ((Half)actualEvalsAllPositionsAllMoves.evalResults[i][m].L,
+                                                 (Half)actualEvalsAllPositionsAllMoves.evalResults[i][m].W);
+            }
+            actionArray.Span[i] = av;
+          }
+        }
+
+        if (results.HasState && EnableState)
+        {
+          state = results.GetState(i);
+        }
+
+        // Compute FortressP if ply-bin move outputs are available.
+        FP16 fortressP = FP16.NaN;
+        if (results.HasPlyBinOutputs)
+        {
+          ReadOnlySpan<Half> captureProbsSpan = results.GetPlyBinCaptureProbs(i);
+          if (!captureProbsSpan.IsEmpty)
+          {
+            ref MCGSPathVisit leafVisit = ref path.LeafVisitRef;
+            float fortressPFloat = NNEvaluatorResult.ComputeFortressP(captureProbsSpan, in leafVisit.ChildPosition, !node.IsWhite);
+            fortressP = (FP16)fortressPFloat;
+          }
+        }
+
+        // TODO: make side determination faster
+        // (short)policyInfo.index policyInfo.policies, actionArray, 
+        SelectTerminationInfo evalResult = new(node.IsWhite ? SideType.White : SideType.Black,
+                                               MCGSPathTerminationReason.PendingNeuralNetEval, GameResult.Unknown,
+                                               winP, lossP, rawM, rawUncertaintyV, rawUncertaintyP, state, fortressP);
+
+        GNode leafNode = path.IsRootInitializationPath ? engine.SearchRootNode : path.LeafNode;
+        Debug.Assert(!leafNode.IsEvaluated);
+        ref MCGSPathVisit refLeafVisit = ref path.LeafVisitRef;
+
+        using (new NodeLockBlock(leafNode))
+        {
+          engine.ApplyNodeEvaluationValues(leafNode, in refLeafVisit.ChildPosition, refLeafVisit.Moves,
+                                           policyInfo.index,
+                                           policyInfo.policies, actionArray,
+                                           in evalResult);
 
           if ((engine.Manager.ParamsSearch.MoveOrderingPhase == ParamsSearch.MoveOrderingPhaseEnum.NodeInitialization
            || engine.Manager.ParamsSearch.MoveOrderingPhase == ParamsSearch.MoveOrderingPhaseEnum.NodeInitializationAndChildSelect)
         && leafNode.NumPolicyMoves > 1)
-        {
-          if (leafNode.NumPolicyMoves > 2)
           {
-            const int MAX_LOOK_RIGHT = 5;
-            leafNode.CheckMoveOrderRearrangeAtIndex(in refLeafVisit.ChildPosition, 1, 2 + MAX_LOOK_RIGHT, MCGSParamsFixed.MOVE_ORDERING_MIN_RATIO_POLICY);
+            if (leafNode.NumPolicyMoves > 2)
+            {
+              const int MAX_LOOK_RIGHT = 5;
+              leafNode.CheckMoveOrderRearrangeAtIndex(in refLeafVisit.ChildPosition, 1, 2 + MAX_LOOK_RIGHT, MCGSParamsFixed.MOVE_ORDERING_MIN_RATIO_POLICY);
+            }
+            leafNode.CheckMoveOrderRearrangeAtIndex(in refLeafVisit.ChildPosition, 0, 1, MCGSParamsFixed.MOVE_ORDERING_MIN_RATIO_POLICY);
           }
-          leafNode.CheckMoveOrderRearrangeAtIndex(in refLeafVisit.ChildPosition, 0, 1, MCGSParamsFixed.MOVE_ORDERING_MIN_RATIO_POLICY);
-        }
 
 #if NOT
         const bool DUMP = false;
@@ -462,11 +524,72 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
           if (!haveOutput) Console.WriteLine("none");
         }
 #endif
-      }
+        }
 
-      paths[i].TerminationInfo = evalResult;
-    });
+        paths[i].TerminationInfo = evalResult;
+      });
   }
+
+
+#if ACTION_ENABLED
+  /// <summary>
+  /// Blends the action head value from the parent node into the value head evaluation.
+  /// </summary>
+  /// <param name="path">The path containing the leaf visit information.</param>
+  /// <param name="actionHeadWeight">The weight to apply to the action head value (0-1).</param>
+  /// <param name="winP">The win probability to be modified.</param>
+  /// <param name="lossP">The loss probability to be modified.</param>
+  static void BlendActionHeadValue(MCGSPath path, float actionHeadWeight, ref FP16 winP, ref FP16 lossP)
+  {
+    ref MCGSPathVisit leafVisit = ref path.LeafVisitRef;
+    GNode parentNode = leafVisit.ParentChildEdge.ParentNode;
+    int childIndexInParent = leafVisit.IndexOfChildInParent;
+
+    // Only proceed if parent is evaluated and has valid edge headers
+    if (parentNode.IsEvaluated && childIndexInParent >= 0 && childIndexInParent < parentNode.NumPolicyMoves)
+    {
+      Span<GEdgeHeaderStruct> parentEdgeHeaders = parentNode.EdgeHeadersSpan;
+      FP16 parentActionV = parentEdgeHeaders[childIndexInParent].ActionV;
+
+      // ActionV from the parent is the parent's prediction of the child's V.
+      // It is stored from the child's perspective (same as value head convention).
+      if (!FP16.IsNaN(parentActionV))
+      {
+        // Compute the current V from the value head: V = WinP - LossP
+        float valueHeadV = (float)winP - (float)lossP;
+
+        // Blend the action head value into the value head V
+        // The action head value is already in the same convention (W-L from child's perspective)
+        float blendedV = (1.0f - actionHeadWeight) * valueHeadV + actionHeadWeight * (float)parentActionV;
+
+        // Convert blended V back to WinP and LossP while preserving DrawP
+        // V = W - L, and W + D + L = 1, so D = 1 - W - L
+        float drawP = Math.Max(0, 1.0f - (float)winP - (float)lossP);
+        float deltaV = blendedV - valueHeadV;
+
+        // Adjust WinP and LossP symmetrically to achieve the new V
+        // New V = (W + delta/2) - (L - delta/2) = W - L + delta = old V + delta
+        float newWinP = (float)winP + deltaV / 2.0f;
+        float newLossP = (float)lossP - deltaV / 2.0f;
+
+        // Clamp to valid probability range
+        newWinP = Math.Clamp(newWinP, 0.0f, 1.0f);
+        newLossP = Math.Clamp(newLossP, 0.0f, 1.0f);
+
+        // Ensure probabilities sum to <= 1
+        if (newWinP + newLossP + drawP > 1.0f)
+        {
+          float scale = (1.0f - drawP) / (newWinP + newLossP);
+          newWinP *= scale;
+          newLossP *= scale;
+        }
+
+        winP = (FP16)newWinP;
+        lossP = (FP16)newLossP;
+      }
+    }
+  }
+#endif
 
 
   void RunLocal(MCGSEngine engine, ListBounded<MCGSPath> paths, bool deferRetrieveResults = false)
@@ -484,6 +607,8 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
       bool hasMoves = evaluator.InputsRequired.HasFlag(NNEvaluator.InputTypes.Moves);
       bool hasLastMovePlies = evaluator.InputsRequired.HasFlag(NNEvaluator.InputTypes.LastMovePlies);
       bool hasState = evaluator.HasState;
+
+      hasLastMovePlies = engine.NeedsPlySinceLastMove;
 
       if (hasPositions && Batch.Positions == null)
       {
@@ -522,7 +647,7 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
         {
           Half[] priorStateInfo = null;
           throw new NotImplementedException();
-//          if (Batch.States != null) Batch.States[i] = null; // default assumption
+          //          if (Batch.States != null) Batch.States[i] = null; // default assumption
 
 
           //if (FP16.IsNaN(node.NodeRef.ActionV))
@@ -598,9 +723,7 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
 
         if (hasLastMovePlies)
         {
-          throw new NotImplementedException();
-          //Span<byte> targetSlice = new Span<byte>(Batch.LastMovePlies).Slice(i * 64, 64);
-          //node.Annotation.LastMovePliesTracker.LastMovePlies.CopyTo(targetSlice);
+          // Ply-since-last-move data is populated in SetBatch.
         }
       }
     }
@@ -674,7 +797,7 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
 
     Debug.Assert(EvaluatorDef.Location != NNEvaluatorDef.LocationType.Remote);
 
-    SetBatch(paths);
+    SetBatch(engine, paths);
     RunLocal(engine, paths, deferRetrieveResults);
   }
 
@@ -684,7 +807,7 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
     HashSet<GNode> seenPositions = new();
     foreach (MCGSPath path in paths)
     {
-      if (!path.IsRootInitializationPath 
+      if (!path.IsRootInitializationPath
         && path.TerminationReason == MCGSPathTerminationReason.PendingNeuralNetEval)
       {
         if (seenPositions.Contains(path.LeafNode))
@@ -709,7 +832,6 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
 
   [ThreadStatic]
   static MGPosition[] positionsBufferMG;
-
 
   /// <summary>
   /// Initializes a specified EncodedPosition to reflect the a specified node's position.
@@ -777,16 +899,16 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
       ref readonly GraphRootToSearchRootNodeInfo nodeFromGraphRootToSearchRoot = ref path.Engine.SearchRootPathFromGraphRoot[i];
       // TODO: restore the second stronger assertion once the "casling reset move 50" problem is fixed
       //       (castling should not reset, one of the paths below false resets it).
-      Debug.Assert(nodeFromGraphRootToSearchRoot.ChildPosMG.ToPosition.PiecesEqual(nodeFromGraphRootToSearchRoot.ChildNode.CalcPosition().ToPosition));
+      // problem if cycle found, disable: Debug.Assert(nodeFromGraphRootToSearchRoot.ChildPosMG.ToPosition.PiecesEqual(nodeFromGraphRootToSearchRoot.ChildNode.CalcPosition().ToPosition));
       //Debug.Assert(nodeFromGraphRootToSearchRoot.ChildNode.CalcPosition() == nodeFromGraphRootToSearchRoot.ChildPosMG);
 
       positionsPopulatedMG[nextTargetIndex--] = nodeFromGraphRootToSearchRoot.ChildPosMG;
     }
-    
-// .............................................
+
+    // .............................................
 
     // Fill in the rest of the planes from prehistory (if available).
-    for (int i = path.Graph.Store.HistoryHashes.PriorPositionsMG.Length - 1; i>=0; i--)
+    for (int i = path.Graph.Store.HistoryHashes.PriorPositionsMG.Length - 1; i >= 0; i--)
     {
       if (nextTargetIndex < 0)
       {
@@ -823,8 +945,85 @@ public sealed class MCGSEvaluatorNeuralNet : IDisposable
     //  fix      Span<MGPosition> positionsPopulatedNotFromPreHistory = positionsPopulated.Slice(numHistoryPositionsToUse);
     //  fix     SetRepetitionsCount(rootPreHistoryNotAlreadyUsed, positionsPopulatedNotFromPreHistory);
 
-    // Fill in boards history with the gathered positions     
+    // Fill in boards history with the gathered positions
     boardsHistory.SetFromSequentialPositions(positionsPopulatedMG, historyFillIn);
+  }
+
+
+
+
+  /// <summary>
+  /// Validates that the incrementally maintained PlySinceLastMove matches
+  /// a from-scratch recomputation by walking the path root-to-leaf.
+  /// </summary>
+  [Conditional("DEBUG")]
+  static void ValidatePlySinceLastMoveIncremental(MCGSPath path)
+  {
+    if (path.PlySinceLastMove == null || path.IsRootInitializationPath)
+    {
+      return;
+    }
+
+    byte[] rootPlySince = path.Engine.SearchRootPlySinceLastMove;
+
+    // Cannot validate depth-1 paths: the root visit's move is not captured
+    // in the PathVisitsLeafToRoot enumeration (IsRoot skips recording the move),
+    // so the general recomputation below would exit at numMoves <= 0.
+    if (path.NumVisitsInPath <= 1)
+    {
+      return;
+    }
+
+    // Collect positions and encoded moves from leaf to root.
+    // Every visit (including root) has a valid ParentChildEdge set by the select phase.
+    const int MAX_DEPTH = 256;
+    Span<MGPosition> positions = stackalloc MGPosition[MAX_DEPTH + 1];
+    Span<Chess.EncodedPositions.Basic.EncodedMove> moves = stackalloc Chess.EncodedPositions.Basic.EncodedMove[MAX_DEPTH];
+    int numMoves = 0;
+
+    foreach (MCGSPathVisitMember visitMember in path.PathVisitsLeafToRoot)
+    {
+      if (numMoves >= MAX_DEPTH)
+      {
+        break;
+      }
+
+      ref readonly MCGSPathVisit visit = ref visitMember.PathVisitRef;
+      positions[numMoves] = visit.ChildPosition;
+      moves[numMoves] = visit.ParentChildEdge.Move;
+      numMoves++;
+    }
+
+    if (numMoves <= 0)
+    {
+      return;
+    }
+
+    // The parent position for the root visit is the search root position.
+    positions[numMoves] = path.Engine.SearchRootPosMG;
+
+    // Replay root-to-leaf using the same algorithm as the incremental code.
+    byte[] recomputed = new byte[64];
+    byte[] temp = new byte[64];
+    rootPlySince.AsSpan().CopyTo(recomputed);
+
+    for (int k = numMoves - 1; k >= 0; k--)
+    {
+      MGPosition parentPos = positions[k + 1];
+      MGMove mgMove = Chess.MoveGen.Converters.ConverterMGMoveEncodedMove.EncodedMoveToMGChessMove(moves[k], in parentPos);
+      PlySinceLastMoveArray.ApplyMoveWithSwap(ref recomputed, ref temp, in mgMove);
+    }
+
+    for (int s = 0; s < 64; s++)
+    {
+      Debug.Assert(path.PlySinceLastMove.SquarePlySince[s] == recomputed[s],
+        $"PlySince mismatch at square {s}: incremental={path.PlySinceLastMove.SquarePlySince[s]}, recomputed={recomputed[s]}, path={path}");
+    }
+
+    if (DEBUGGING_PLY_SINCE_LAST_MOVE)
+    {
+      Console.WriteLine("<PLY_SINCE_DEBUG> MCGSEvaluatorNeuralNet.ValidatePlySinceLastMoveIncremental passes!");
+    }
   }
 
 

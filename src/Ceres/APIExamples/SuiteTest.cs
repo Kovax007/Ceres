@@ -20,8 +20,8 @@ using Ceres.Chess.LC0.NNFiles;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.UserSettings;
 using Ceres.Features.GameEngines;
-using Ceres.Features.Players;
 using Ceres.Features.Suites;
+using Ceres.MCTS.GameEngines;
 
 
 #endregion

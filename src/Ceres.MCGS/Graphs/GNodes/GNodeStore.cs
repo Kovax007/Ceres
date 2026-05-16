@@ -21,15 +21,13 @@ using Ceres.Base.OperatingSystem;
 using Ceres.Chess;
 using Ceres.Chess.Positions;
 using Ceres.MCGS.Graphs.GraphStores;
-using Ceres.MCGS.Storage;
-using Ceres.MCGS.Storage.Structs;
 
 #endregion
 
 namespace Ceres.MCGS.Graphs.GNodes;
 
 /// <summary>
-/// Manages raw storage of tree nodes in a single contiguous array of structures. 
+/// Manages raw storage of graph nodes in a single contiguous array of structures. 
 /// 
 /// This approach has mostly benefits over using .NET objects for each node, with advantages:
 ///   1) eliminates allocation/garbage collector overhead since no managed objects are created
@@ -37,10 +35,10 @@ namespace Ceres.MCGS.Graphs.GNodes;
 ///   3) enhances memory locality, with the possibility of dynamic node reordering to further enhance
 ///      (though this is probably not helpful if the nodes are already cache-aligned)
 ///   4) enables possibility of using operating system large pages for greater access efficiency
-///   5) the entire tree can be trivially serialized/deserialized by writing contiguous block of memory,
+///   5) the entire graph could be trivially serialized/deserialized by writing contiguous block of memory,
 ///      which could be useful for saving state of game analysis for later use/sharing, or 
-///      transporting subtrees to distributed computers on the network,
-///      or distributing tree across a memory hierarchy with different performance characteristics 
+///      transporting subgraphs to distributed computers on the network,
+///      or distributing graph across a memory hierarchy with different performance characteristics 
 ///      (e.g. DRAM vs. Intel Optane)
 ///   6) "pointers" from one node occupy less memory (4 bytes instead of 8),
 ///      saving perhaps 8 (2 * 4) bytes per node, on average. This is critical because about 2/3
@@ -48,8 +46,8 @@ namespace Ceres.MCGS.Graphs.GNodes;
 /// but disadvantages:
 ///   1) the code is somewhat more complex (using awkward ref structs or unsafe pointers) and possibly error prone
 ///   2) there is some overhead with using array indexing instead of direct memory pointers
-///   3) changing the root of the tree and releasing unused nodes is no longer 
-///      as trivial as just changing the root pointer (the tree somes must be repacked with full rewrite).
+///   3) changing the root of the graph and releasing unused nodes is no longer 
+///      as trivial as just changing the root pointer (the graph somes must be repacked with full rewrite).
 public partial class GNodeStore
 {
   /// <summary>
@@ -98,12 +96,6 @@ public partial class GNodeStore
   /// The index indicating the next free node slot.
   /// </summary>
   internal int nextFreeIndex = FIRST_ALLOCATED_INDEX; // Index 0 reserved, indicates null node
-
-  /// <summary>
-  /// Number of nodes which have been marked as belonging to old generation of tree,
-  /// no longer used or reachable from current root.
-  /// </summary>
-  public int NumOldGeneration;
 
   /// <summary>
   /// Parent store to which this nodes store belongs.

@@ -22,15 +22,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Folder Include="Players\" />
     <Folder Include="Suites\StandardTests\" />
   </ItemGroup>
 
-  <ItemGroup>
-    <None Include="Suites\SearchResultInfo.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+<ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="10.0.5" />
   </ItemGroup>
 
 </Project>

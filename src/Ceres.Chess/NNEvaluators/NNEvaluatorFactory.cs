@@ -28,6 +28,7 @@ using Ceres.Chess.NNEvaluators.Ceres.TPG;
 using Ceres.Chess.NNEvaluators.CUDA;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.NNEvaluators.TensorRT;
+using Ceres.Chess.NNEvaluators.Remote;
 using Ceres.Chess.NNFiles;
 using Ceres.Chess.UserSettings;
 using Chess.Ceres.NNEvaluators;
@@ -244,6 +245,35 @@ namespace Ceres.Chess.NNEvaluators
                                  Dictionary<string, string> optionsDict,
                                  NNEvaluatorOptions optionsEvaluator)
     {
+      // If a remote host is specified, create a remote evaluator instead of a local one.
+      if (deviceDef.RemoteHost != null)
+      {
+        // Reconstruct the network specification string from the netDef.
+        string netPrefix = netDef.Type switch
+        {
+          NNEvaluatorType.LC0 => "LC0",
+          NNEvaluatorType.Ceres => "Ceres",
+          NNEvaluatorType.ONNXViaTRT => "ONNX_TRT",
+          NNEvaluatorType.ONNXViaORT => "ONNX_ORT",
+          NNEvaluatorType.TRT => "TRT",
+          _ => netDef.Type.ToString()
+        };
+        string netSpecStr = netPrefix + ":" + netDef.NetworkID;
+
+        // Reconstruct the device specification string (without @hostname).
+        string devSpecStr = $"GPU:{deviceDef.DeviceIndex}";
+
+        string optionsStr = optionsDict != null && optionsDict.Count > 0
+          ? string.Join(";", optionsDict.Select(kv => kv.Value != null ? $"{kv.Key}={kv.Value}" : kv.Key))
+          : null;
+
+        return new NNEvaluatorRemote(
+          deviceDef.RemoteHost, deviceDef.RemotePort,
+          netSpecStr, devSpecStr, optionsStr,
+          useCompression: true,
+          maxBatchSize: deviceDef.MaxBatchSize ?? 1024);
+      }
+
       NNEvaluator ret = null;
 
       const bool LOW_PRIORITY = false;
@@ -367,7 +397,8 @@ namespace Ceres.Chess.NNEvaluators
             throw new Exception($"Ceres net {netFileName} not found. Use valid full path or set source directory using DirCeresNetworks in Ceres.json");
           }
 
-          NNEvaluatorOptionsCeres optionsCeres = new NNEvaluatorOptionsCeres().OptionsWithOptionsDictApplied(optionsDict) as NNEvaluatorOptionsCeres;
+          NNEvaluatorOptionsCeres optionsCeres = (optionsEvaluator as NNEvaluatorOptionsCeres) ?? new NNEvaluatorOptionsCeres();
+          optionsCeres = optionsCeres.OptionsWithOptionsDictApplied(optionsDict) as NNEvaluatorOptionsCeres;
 
           int maxCeresBatchSize = useTensorRT ? TRT_MAX_BATCH_SIZE : DEFAULT_MAX_BATCH_SIZE;
           maxCeresBatchSize = deviceDef.MaxBatchSize.HasValue ? Math.Min(deviceDef.MaxBatchSize.Value, maxCeresBatchSize) : maxCeresBatchSize;

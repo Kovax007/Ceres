@@ -13,78 +13,75 @@
 
 #region Using directives
 
+using System;
+
 using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Graphs.GParents;
-using Ceres.MCGS.Storage;
-using System;
-using System.Runtime.CompilerServices;
 
 #endregion
 
-namespace Ceres.MCGS.Graphs.Enumerators
+namespace Ceres.MCGS.Graphs.Enumerators;
+
+/// <summary>
+/// Enumerator over parent edges of a given child node.
+/// </summary>
+public ref struct ParentEdgesEnumerator
 {
   /// <summary>
-  /// Enumerator over parent edges of a given child node.
+  /// Parent graph.
   /// </summary>
-  public ref struct ParentEdgesEnumerator
+  public readonly Graph graph;
+
+  /// <summary>
+  /// Index of the child node whose parent edges are being enumerated.
+  /// </summary>
+  public readonly NodeIndex ChildIndex;
+
+  /// <summary>
+  /// Enumerator over parent indices.
+  /// </summary>
+  ParentIndexEnumerator innerEnumerator;
+
+
+  /// <summary>
+  /// Constructor.
+  /// </summary>
+  /// <param name="graph"></param>
+  /// <param name="childIndex"></param>
+  public ParentEdgesEnumerator(Graph graph, NodeIndex childIndex)
   {
-    /// <summary>
-    /// Parent graph.
-    /// </summary>
-    public readonly Graph graph;
+    innerEnumerator = graph.Store.ParentsStore.NodeParentsInfo(childIndex).GetEnumerator();
 
-    /// <summary>
-    /// Index of the child node whose parent edges are being enumerated.
-    /// </summary>
-    public readonly NodeIndex ChildIndex;
+    this.graph = graph;
+    this.ChildIndex = childIndex;
+    Current = default;
+  }
 
-    /// <summary>
-    /// Enumerator over parent indices.
-    /// </summary>
-    ParentIndexEnumerator innerEnumerator;
+  public GEdge Current { get; private set; }
 
 
-    /// <summary>
-    /// Constructor.
-    /// </summary>
-    /// <param name="graph"></param>
-    /// <param name="childIndex"></param>
-    public ParentEdgesEnumerator(Graph graph, NodeIndex childIndex)
+  public bool MoveNext()
+  {
+    if (!innerEnumerator.MoveNext())
     {
-      innerEnumerator = graph.Store.ParentsStore.NodeParentsInfo(childIndex).GetEnumerator();
-
-      this.graph = graph;
-      this.ChildIndex = childIndex;
       Current = default;
+      return false;
     }
 
-    public GEdge Current { get; private set; }
+    // Retrieve parent for this child.
+    NodeIndex parentNodeIndex = new(innerEnumerator.Current);
+    GNode parentNode = graph[parentNodeIndex];
 
-
-    public bool MoveNext()
+    // Find index of this child within parent's child edges.
+    int indexInParent = parentNode.IndexOfChildInChildEdges(ChildIndex);
+    if (indexInParent == -1)
     {
-      if (!innerEnumerator.MoveNext())
-      {
-        Current = default;
-        return false;
-      }
-
-      // Retrieve parent for this child.
-      NodeIndex parentNodeIndex = new(innerEnumerator.Current);
-      GNode parentNode = graph[parentNodeIndex];
-
-      // Find index of this child within parent's child edges.
-      int indexInParent = parentNode.IndexOfChildInChildEdges(ChildIndex);
-      if (indexInParent == -1)
-      {
-        throw new Exception("ParentEdgesEnumerator: Parent not found in child's edges");
-      }
-
-      // Set Current to the edge connecting the parent to this child.
-      Current = parentNode.ChildEdgeAtIndex(indexInParent);
-
-      return true;
+      throw new Exception("ParentEdgesEnumerator: Parent not found in child's edges");
     }
+
+    // Set Current to the edge connecting the parent to this child.
+    Current = parentNode.ChildEdgeAtIndex(indexInParent);
+
+    return true;
   }
 }

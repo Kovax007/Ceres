@@ -21,7 +21,7 @@ using Ceres.Chess;
 
 #endregion
 
-namespace Ceres.Features.UCI;
+namespace Ceres.MCGS.UCI;
 
 /// <summary>
 /// Manages parsing of the various forms of the UCI command "go."

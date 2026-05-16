@@ -26,7 +26,9 @@ using Ceres.Base.Threading;
 using Ceres.Chess;
 using Ceres.Chess.EncodedPositions;
 using Ceres.Chess.MoveGen;
+using Ceres.Chess.Positions;
 using Ceres.Chess.NetEvaluation.Batch;
+using Ceres.Chess.NNEvaluators;
 using Ceres.MCGS.Environment;
 using Ceres.MCGS.Graphs;
 using Ceres.MCGS.Graphs.GEdges;
@@ -36,9 +38,9 @@ using Ceres.MCGS.Search.Params;
 using Ceres.MCGS.Search.PathEvaluators;
 using Ceres.MCGS.Search.Paths;
 using Ceres.MCGS.Search.Phases;
+using Ceres.MCGS.Search.Phases.Backup;
+using Ceres.MCGS.Search.Phases.Evaluation;
 using Ceres.MCGS.Search.Strategies;
-using Ceres.MCGS.Storage;
-using Ceres.MCGS.Storage.Structs;
 using Microsoft.Extensions.Logging;
 using static Ceres.MCGS.Search.Phases.MCGSSelect;
 
@@ -82,6 +84,17 @@ public partial class MCGSEngine
   public GNode SearchRootNode { get; internal set; }
   public MGPosition SearchRootPosMG;
 
+  /// <summary>
+  /// Per-square ply-since-last-move values at the search root position (64 bytes).
+  /// Computed once at search start for TPG neural network evaluation.
+  /// </summary>
+  internal byte[] SearchRootPlySinceLastMove;
+
+  /// <summary>
+  /// If true, PlySinceLastMove values are maintained incrementally on MCGSPath during selection.
+  /// </summary>
+  internal bool NeedsPlySinceLastMove;
+
 
   public PosHash96MultisetRunning SearchRootRunningHash { get; internal set; }
 
@@ -101,7 +114,7 @@ public partial class MCGSEngine
   /// </summary>
   internal readonly ILogger<MCGSEngine> Logger;
 
-  
+
   /// <summary>
   /// Constructor.
   /// </summary>
@@ -109,7 +122,7 @@ public partial class MCGSEngine
   /// <param name="graph">The search graph</param>
   public MCGSEngine(MCGSManager manager,
                     WorkerPool<ExtendPathsWorkerInfo>[] selectWorkerPools,
-                    Graph graph, 
+                    Graph graph,
                     GraphRootToSearchRootNodeInfo[] searchRootPathFromGraphRoot)
   {
     Manager = manager;
@@ -145,7 +158,7 @@ public partial class MCGSEngine
     {
       SearchRootNode = searchRootPathFromGraphRoot[^1].ChildNode;
       SearchRootPosMG = searchRootPathFromGraphRoot[^1].ChildPosMG;
-//Debug.Assert(SearchRootNode.CalcPosition() == SearchRootPosMG);
+      //Debug.Assert(SearchRootNode.CalcPosition() == SearchRootPosMG);
       // Start with graph root running hash and add on nodes
       PosHash96MultisetRunning runningHash = graph.Store.HistoryHashes.PriorPositionsHashesRunning[^1];
       foreach (GraphRootToSearchRootNodeInfo nodeInfo in searchRootPathFromGraphRoot)
@@ -159,7 +172,7 @@ public partial class MCGSEngine
 
       // In position equivalence mode, we need to remove any draw-by-repetition counts
       // which can be proven to no longer valid after graph truncation.
-      if (MCGSParamsFixed.POSITION_MODE_DEPTH_BACKUP_INVALIDATED_REPETITION > 0 
+      if (MCGSParamsFixed.POSITION_MODE_DEPTH_BACKUP_INVALIDATED_REPETITION > 0
         && Manager.ParamsSearch.EnableGraph
         && Manager.ParamsSearch.PathTranspositionMode == PathMode.PositionEquivalence
         && Manager.ParamsSearch.TestFlag
@@ -175,7 +188,7 @@ public partial class MCGSEngine
       SearchRootNode = graph.GraphRootNode;
       SearchRootRunningHash = graph.Store.HistoryHashes.PriorPositionsHashesRunning[^1];
       SearchRootPosMG = graph.Store.HistoryHashes.PriorPositionsMG[^1];
-//Debug.Assert(SearchRootNode.CalcPosition() == SearchRootPosMG);
+      //Debug.Assert(SearchRootNode.CalcPosition() == SearchRootPosMG);
 
     }
 
@@ -193,8 +206,62 @@ public partial class MCGSEngine
 
     evaluatorPrecomputed = new SelectTerminatorPrefetched();
 
+    ComputeSearchRootPlySinceLastMove();
+
     Select = new MCGSSelect(this);
     Backup = new MCGSBackup(this);
+  }
+
+
+  /// <summary>
+  /// Computes the ply-since-last-move array at the search root by walking
+  /// the full game history (prehistory moves + graph-root-to-search-root path).
+  /// </summary>
+  void ComputeSearchRootPlySinceLastMove()
+  {
+    const byte DEFAULT_PLIES_SINCE_LAST_MOVE_STARTPOS = 30;
+
+    PositionWithHistory prehistory = Graph.Store.PositionHistory;
+
+    // Validate: if there are history positions but no moves, this indicates the PositionWithHistory
+    // was constructed from positions only (e.g., from training data) without move information.
+    // The LastMovePlies feature requires actual moves to compute ply-since-last-move correctly.
+    int numHistoryPositions = prehistory.GetPositions().Length;
+    if (numHistoryPositions > 1 && prehistory.Moves.Count == 0)
+    {
+      throw new InvalidOperationException(
+        $"PositionWithHistory has {numHistoryPositions} history positions but Moves.Count is 0. " +
+        $"This indicates the history was constructed from positions without move information " +
+        $"(e.g., from training data via ToPositionWithHistory). " +
+        $"The LastMovePlies feature requires move history to compute ply-since-last-move values. " +
+        $"Either populate the Moves list from the position history, or disable TestFlag/LastMovePlies for this use case.");
+    }
+
+    int totalPlies = prehistory.Moves.Count + SearchRootPathFromGraphRoot.Length;
+
+    byte[] curr = new byte[64];
+    byte initVal = (byte)Math.Max(0, DEFAULT_PLIES_SINCE_LAST_MOVE_STARTPOS - totalPlies);
+    Array.Fill(curr, initVal);
+
+    byte[] temp = new byte[64];
+
+    // Process prehistory moves.
+    foreach (MGMove move in prehistory.Moves)
+    {
+      PlySinceLastMoveArray.ApplyMoveWithSwap(ref curr, ref temp, in move);
+    }
+
+    // Process graph-root-to-search-root path moves.
+    foreach (GraphRootToSearchRootNodeInfo nodeInfo in SearchRootPathFromGraphRoot)
+    {
+      MGMove move = nodeInfo.MoveToChild;
+      PlySinceLastMoveArray.ApplyMoveWithSwap(ref curr, ref temp, in move);
+    }
+
+    // Verify no zero values exist (0 means "never moved" which is invalid after processing moves).
+    Debug.Assert(!curr.Contains((byte)0), "ComputeSearchRootPlySinceLastMove produced a zero value, which is invalid.");
+
+    SearchRootPlySinceLastMove = curr;
   }
 
 
@@ -217,7 +284,7 @@ public partial class MCGSEngine
 
   DateTime? lastCallbackTime;
   DateTime firstCallbackTime;
-  
+
   // High-performance tick counter variables for fast bypass logic
   private long lastTickCheck = 0;
   private static readonly long TicksFor10Ms = Stopwatch.Frequency / 100; // 10ms in ticks
@@ -251,7 +318,7 @@ public partial class MCGSEngine
   internal bool ShouldContinue()
   {
     //  Manager.UpdateSearchStopStatus();
-    return Manager.StopStatus == MCGSManager.SearchStopStatus.Continue 
+    return Manager.StopStatus == MCGSManager.SearchStopStatus.Continue
        && !Manager.ExternalStopRequested;
   }
 
@@ -260,6 +327,7 @@ public partial class MCGSEngine
     if (SelectWorkerPools[iteratorID] == null
      && Manager.ParamsSearch.Execution.SelectOperationParallelThresholdNumVisits < int.MaxValue)
     {
+      // TODO: size this based on expected search length
       SelectWorkerPools[iteratorID] = new(MCGSParamsFixed.PARALLEL_SELECT_NUM_INITIAL_WORKERS,
                                           MCGSParamsFixed.PARALLEL_SELECT_NUM_WORKERS_GROWTH_INCREMENT,
                                           null, "MCGSPathSelect");
@@ -271,7 +339,7 @@ public partial class MCGSEngine
   internal void RunLoop(int hardMaxRootN)
   {
     const bool DEBUG_MODE = false;
-    
+
     Manager.RootNWhenSearchStarted = SearchRootNode.N;
 
     numVisitsInFlight = 0;
@@ -292,8 +360,8 @@ public partial class MCGSEngine
 
     // Execute initial search phase always without overlap
     int numTriesNoProgress = 0;
-    while (SearchRootNode.N < hardMaxRootN 
-        && SearchRootNode.N < startOverlappingN 
+    while (SearchRootNode.N < hardMaxRootN
+        && SearchRootNode.N < startOverlappingN
         && ShouldContinue())
     {
       int startN = SearchRootNode.N;
@@ -370,7 +438,7 @@ public partial class MCGSEngine
     {
       Console.WriteLine("Iterator 0");
       iterator0.PathsSet.DumpDistribution();
-      Console.WriteLine("\r\nIterator 1");      
+      Console.WriteLine("\r\nIterator 1");
       iterator1?.PathsSet.DumpDistribution();
       Console.WriteLine("\r\nAll iterators");
       DumpDistributionPathLengths();
@@ -397,7 +465,7 @@ public partial class MCGSEngine
     targetBatchSize = Math.Min(numVisitsNeededRemaining, targetBatchSize);
     targetBatchSize = Math.Min(targetBatchSize, Manager.MaxBatchSizeDueToPossibleNearTimeExhaustion);
 
-//    Debug.Assert(targetBatchSize > 0);
+    //    Debug.Assert(targetBatchSize > 0);
     return targetBatchSize;
   }
 
@@ -410,8 +478,8 @@ public partial class MCGSEngine
     // Fast exits
     int n = Manager.ParamsSearch.Execution.SyncEveryNBatches;
     if (n <= 0 || iterator1 is null || !ShouldContinue())
-    { 
-      return; 
+    {
+      return;
     }
 
     Barrier barrier = IterationSyncBarrier;
@@ -419,7 +487,7 @@ public partial class MCGSEngine
     {
       return;                      // not initialized (no overlap / disabled)
     }
-    
+
     int batch = iterator.BatchSequenceNum;
     if (batch == 0 || (batch % n) != 0)
     {
@@ -460,7 +528,7 @@ public partial class MCGSEngine
       try { barrier.RemoveParticipant(); } catch { }
     }
   }
-    
+
   private void EvaluateRootAndSetNodeValues(MCGSIterator iterator, bool debugMode)
   {
     Debug.Assert(Manager.Engine.Graph.Store.NodesStore.NumUsedNodes == 1);
@@ -470,6 +538,12 @@ public partial class MCGSEngine
     MCGSPath pathForRootNode = iterator.AllocatedPath(1);
 
     pathForRootNode.AddRoot(Manager.Engine.SearchRootNode.CalcPosition());
+
+    if (NeedsPlySinceLastMove)
+    {
+      SearchRootPlySinceLastMove.AsSpan().CopyTo(pathForRootNode.PlySinceLastMove.SquarePlySince);
+    }
+
     ref MCGSPathVisit refRootPathVisit = ref pathForRootNode.LeafVisitRef;
 
     ListBounded<MCGSPath> visitsList = new(1)
@@ -480,16 +554,9 @@ public partial class MCGSEngine
     terminatorNN.BatchGenerate(this, visitsList);
     Graph.RegisterNNBatch(1);
 
-#if OLD_NN_INIT
-    using (new SpinLockByteBlock(ref SearchRootNode.NodeRef.LockRef, (byte)Graph.LockType.EvaluateRoot))
-    {
-      ApplyNodeEvaluationValues(Manager.Engine.Graph.GraphRootNode, in refRootPathVisit.ChildPosition, refRootPathVisit.Moves, pathForRootNode.TerminationInfo);
-    }
-#endif
-
-
+    Debug.Assert(Manager.Engine.SearchRootNode.N == 0);
     Strategy.BackupToNode(Manager.Engine.SearchRootNode, 1,
-                          pathForRootNode.TerminationInfo.V, 
+                          pathForRootNode.TerminationInfo.V,
                           pathForRootNode.TerminationInfo.DrawP);
 
     Manager.NNEvaluator0.BuffersLock?.Release();
@@ -555,19 +622,46 @@ public partial class MCGSEngine
     nodeRef.M = (byte)MathF.Round(evalResult.M, 0);
     nodeRef.UncertaintyValue = evalResult.UncertaintyV;
     nodeRef.UncertaintyPolicy = evalResult.UncertaintyP;
+    nodeRef.FortressP = evalResult.FortressP.ToFloat;
 
     Debug.Assert(evalResult.GameResult.IsTerminal() || Math.Abs(nodeRef.V) <= 1);
-    
+
 
     if (!nodeRef.Terminal.IsTerminal())
     {
-      node.SetPolicy(overridePolicySoftmax ?? Manager.ParamsSelect.PolicySoftmax, ParamsSelect.MinPolicyProbability,
+      // Determine effective policy softmax, possibly adjusted by uncertainty policy.
+      float effectivePolicySoftmax = overridePolicySoftmax ?? Manager.ParamsSelect.PolicySoftmax;
+
+      // If EnablePolicyUncertaintyTemperatureBoosting is enabled and UncertaintyP head is populated,
+      // apply supplemental temperature.
+      if (Manager.ParamsSearch.EnablePolicyUncertaintyTemperatureBoosting 
+       && !FP16.IsNaN(evalResult.UncertaintyP))
+      {
+        float up = evalResult.UncertaintyP.ToFloat;
+        const bool AGGRESSIVE = false;
+        float tempMultiplier = up switch
+        {
+          <= 0.031f => AGGRESSIVE ? 0.92f : 0.94f,
+          <= 0.076f => AGGRESSIVE ? 0.94f : 0.97f,
+          <= 0.168f => 1.00f,// no adjustment
+          <= 0.321f => AGGRESSIVE ? 1.06f :1.05f,
+          _         => AGGRESSIVE ? 1.13f : 1.09f
+        };
+
+        effectivePolicySoftmax *= tempMultiplier;
+      }
+
+      bool hasAction = actions.Span.Length > 0; //Manager.NNEvaluator0.HasAction ?
+      ref readonly CompressedActionVector actionVectorRef = ref (hasAction
+         ? ref actions.Span[policyActionIndex]
+         : ref EMPTY_ACTION_VECTOR);
+      node.SetPolicy(effectivePolicySoftmax, ParamsSelect.MinPolicyProbability,
                      in position,
                      moves,
                      in policies.Span[policyActionIndex],
 #if ACTION_ENABLED
-                     NNEvaluator.HasAction,
-                     NNEvaluator.HasAction ? in actions.Span[policyActionIndex] : default,
+                     Manager.NNEvaluator0.HasAction,
+                     in actionVectorRef, // TODO: pass structs using in for performance
 #endif
                      Manager.NNEvaluator0.PolicyReturnedSameOrderMoveList);
 
@@ -586,16 +680,24 @@ public partial class MCGSEngine
     }
   }
 
+  static CompressedActionVector EMPTY_ACTION_VECTOR;
+
   /// <summary>
   /// Depth of the deepest path seen so far.
   /// </summary>
-  public int MaxPathDepth => iterator1 == null ? iterator0.MaxPathDepth 
+  public int MaxPathDepth => iterator1 == null ? (iterator0 == null ? 0 : iterator0.MaxPathDepth)
                                                    : Math.Max(iterator0.MaxPathDepth, iterator1.MaxPathDepth);
 
   /// <summary>
   /// Average depth of all paths seen so far.
   /// </summary>
-  public float AvgPathDepth => iterator1 == null ? iterator0.AvgPathDepth
+  public float AvgPathDepth => iterator1 == null ? (iterator0 == null ? 0 : iterator0.AvgPathDepth)
                                                      : StatUtils.Average(iterator0.AvgPathDepth, iterator1.AvgPathDepth);
+
+  /// <summary>
+  /// Fraction of node selection attempts that yielded a usable node.
+  /// </summary>
+  public float NodeSelectionYieldFrac => iterator1 == null ? (iterator0 == null ? 0 : iterator0.NodeSelectionYieldFrac)
+                                                           : StatUtils.Average(iterator0.NodeSelectionYieldFrac, iterator1.NodeSelectionYieldFrac);
 }
 

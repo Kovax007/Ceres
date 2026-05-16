@@ -26,8 +26,6 @@ using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GNodes;
 using Ceres.MCGS.Graphs.GParents;
 using Ceres.MCGS.Search.Params;
-using Ceres.MCGS.Search.PathEvaluators;
-using Ceres.MCGS.Storage.Structs;
 
 using Microsoft.Extensions.Logging;
 
@@ -40,7 +38,7 @@ public static class GraphStoreConfig
   // NOTE: These constants are shadowed in MCGSParamsFixed.
 
   /// <summary>
-  /// If enabled the largest possible search tree is about 2 billion nodes
+  /// If enabled the largest possible search graph is about 2 billion nodes
   /// rather than the default of 1 billion nodes.
   /// 
   /// This should be enabled only if needed and obviously 
@@ -48,15 +46,9 @@ public static class GraphStoreConfig
   /// (because it slightly increases memory usage per node).
   /// 
   /// NOTE: This is not currently supported in the MCGS engine.
-  ///       In the MCTS engine it modified NUM_CHILDREN_PER_BLOCK to increase available slots.
+  ///       In the MCGS engine it modified NUM_CHILDREN_PER_BLOCK to increase available slots.
   /// </summary>
-  public const bool ENABLE_MAX_SEARCH_TREE = false;
-
-  /// <summary>
-  /// Optionally the storage can make use of an another running process
-  /// which has allocated space for the nodes and children (experimental).
-  /// </summary>
-  public const bool STORAGE_USE_EXISTING_SHARED_MEM = false;
+  public const bool ENABLE_MAX_SEARCH_GRAPH = false;
 
   /// <summary>
   /// In incremental storage mode memory is reserved at initialization
@@ -75,6 +67,13 @@ public partial class GraphStore : IDisposable
   /// The root node is guaranteed to occupy the second slot.
   /// </summary>
   public const int ROOT_NODE_INDEX = 1;
+
+  /// <summary>
+  /// Flag indicating that the GraphRewriter is currently active.
+  /// When true, normal lock assertions should be bypassed since the graph
+  /// is quiescent and under exclusive control of the rewriter.
+  /// </summary>
+  internal bool IsRewriting;
 
   /// <summary>
   /// Approximate average total bytes consumed by a node, child pointers, 
@@ -187,6 +186,11 @@ public partial class GraphStore : IDisposable
   public readonly bool GraphEnabled;
 
   /// <summary>
+  /// If positions with identical board state are considered equivalent and coalesced into a single node.
+  /// </summary>
+  public readonly bool UsesPositionEquivalenceMode;
+
+  /// <summary>
   /// If the neural network used to generate position evaluations
   /// supports the "state" feature that carries information forward from move to move.
   /// </summary>
@@ -233,20 +237,28 @@ public partial class GraphStore : IDisposable
 
 
   /// <summary>
+  /// Sets the prior moves during graph rewrite (compaction).
+  /// Updates both position history and history hashes.
+  /// </summary>
+  internal void SetPriorMovesForRewrite(PositionWithHistory newPriorMoves) => SetPriorMoves(newPriorMoves);
+
+
+
+  /// <summary>
   /// Constructor to create a store of specified maximum size.
   /// </summary>
   /// <param name="maxNodes"></param>
   /// <param name="hasAction"></param>
   /// <param name="hasState"></param>
   /// <param name="graphEnabled"></param>
-  /// <param name="coalescedMode"></param>
+  /// <param name="usesPositionEquivalenceMode"></param>
   /// <param name="tryEnableLargePages"></param>
   /// <param name="priorMoves"></param>
   public GraphStore(int maxNodes,
                     bool hasAction,
                     bool hasState,
                     bool graphEnabled,
-                    bool coalescedMode,
+                    bool usesPositionEquivalenceMode,
                     bool tryEnableLargePages,
                     PositionWithHistory priorMoves)
   {
@@ -259,14 +271,14 @@ public partial class GraphStore : IDisposable
     DebugLogInfo($"Creating MCTSNodeStore with max {maxNodes} nodes, graphEnabled={graphEnabled}, hasState={hasState}, hasAction={hasAction} #priorMoves={priorMoves.Count}");
 
     GraphEnabled = graphEnabled;
+    UsesPositionEquivalenceMode = usesPositionEquivalenceMode;
     MaxNodes = maxNodes;
     HasState = hasState;
     HasAction = hasAction;
 
     NodesStore = new GNodeStore(this, maxNodes, hasState, priorMoves,
                                 MCGSParamsFixed.STORAGE_USE_INCREMENTAL_ALLOC,
-                                MCGSParamsFixed.TryEnableLargePages,
-                                MCGSParamsFixed.STORAGE_USE_EXISTING_SHARED_MEM);
+                                MCGSParamsFixed.TryEnableLargePages, false);
     nodes = NodesStore.MemoryBufferOSStore;
 
     // Set prior moves and initialize related state
@@ -284,15 +296,14 @@ public partial class GraphStore : IDisposable
     EdgesStore = new GEdgeStore(NodesStore.ParentStore, reservedVisitEdges, tryEnableLargePages);
 
     long maxParents = (long)(1000L + MAX_EXTRA_PARENTS_PER_NODE * maxNodes);
-    int parentsMultiplier = coalescedMode ? 8 : 1; // In coalesced mode many more nodes will converge on same node
-    ParentsStore = new GParentsStore(this, maxParents, coalescedMode, tryEnableLargePages);
+    int parentsMultiplier = usesPositionEquivalenceMode ? 8 : 1; // In coalesced mode many more nodes will converge on same node
+    ParentsStore = new GParentsStore(this, maxParents, usesPositionEquivalenceMode, tryEnableLargePages);
 
     // Create the NodeIndexSet store with a reasonable size estimate
     long reservedNodeIndexSets = Math.Max(10000, maxNodes);
     NodeIndexSetStore = new GNodeIndexSetStore(this, (int)reservedNodeIndexSets,
                                               MCGSParamsFixed.STORAGE_USE_INCREMENTAL_ALLOC,
-                                              MCGSParamsFixed.TryEnableLargePages,
-                                              MCGSParamsFixed.STORAGE_USE_EXISTING_SHARED_MEM);
+                                              MCGSParamsFixed.TryEnableLargePages, false);
 
     // Save a copy of the prior moves
     NodesStore.PositionHistory = new PositionWithHistory(priorMoves);
@@ -504,83 +515,3 @@ public partial class GraphStore : IDisposable
 
   #endregion
 }
-
-
-#if EXPERIMENTAL
-  /// <summary>
-  /// 
-  /// </summary>
-  /// <param name="movesMade"></param>
-  /// <param name="thresholdFractionNodesRetained"></param>
-  /// <returns></returns>
-  public bool ResetRootAssumingMovesMade(IEnumerable<MGMove> movesMade, float thresholdFractionNodesRetained)
-  {
-    PositionWithHistory staringPriorMove = Nodes.PriorMoves;
-    MGPosition position = Nodes.PriorMoves.FinalPosMG;
-
-    ref MCTSNodeStruct priorRoot = ref RootNode;
-
-    // Advance root node and update prior moves
-    ref MCTSNodeStruct newRoot = ref priorRoot;
-    foreach (MGMove moveMade in movesMade)
-    {
-      // Append the moves made to the prior moves
-      Nodes.PriorMoves.AppendMove(moveMade);
-
-      bool foundChild = false;
-
-      // Find this new root node (after these moves)
-      foreach (MCTSNodeStructChild child in newRoot.Children)
-      {
-        if (child.IsExpanded)
-        {
-          MGMove thisChildMove = ConverterMGMoveEncodedMove.EncodedMoveToMGChessMove(child.Move, in position);
-          if (thisChildMove == moveMade)
-          {
-// NO! can't modify structure since we may need to abandon without modifying
-//              // Mark this node as deleted
-            newRoot.Detached = true;
-
-            // Advance new root to reflect this move
-            newRoot = ref child.ChildRef;
-
-            // Advance position
-            position.MakeMove(thisChildMove);
-
-            // Done looking for match
-            foundChild = true;
-            break;
-          }
-        }
-      }
-
-      if (!foundChild)
-      {
-        // Restore the tree the way we originally found it
-        Nodes.PriorMoves = staringPriorMove;
-        Console.WriteLine("No follow - not found");
-        return false;
-      }
-    }
-
-    // Only switch to this root if it meets the threshold size
-    float fractionNodesCouldBeRetained = (float)newRoot.N / (float)priorRoot.N;
-    if (fractionNodesCouldBeRetained < thresholdFractionNodesRetained)
-    {
-      Console.WriteLine("No follow - fraction too small " + fractionNodesCouldBeRetained);
-      return false;
-    }
-
-    // The new root no longer has a parent
-    newRoot.ParentIndex = MCTSNodeStructIndex.Null;
-
-    // Reset root to this node
-    RootIndex = newRoot.Index;
-
-    // TODO: should we consider removing the node from the transposition root table?
-
-    // Success
-    return true;
-  }
-
-#endif

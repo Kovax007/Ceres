@@ -19,6 +19,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
+
+using Onnx;
+using Microsoft.ML.OnnxRuntime;
+
 using Ceres.Base.Benchmarking;
 using Ceres.Base.DataType;
 using Ceres.Base.DataTypes;
@@ -27,10 +31,10 @@ using Ceres.Chess.LC0.Batches;
 using Ceres.Chess.NetEvaluation.Batch;
 using Ceres.Chess.NNBackends.ONNXRuntime;
 using Ceres.Chess.NNEvaluators;
+using Ceres.Chess.NNEvaluators.Ceres;
 using Ceres.Chess.NNEvaluators.Ceres.TPG;
 using Ceres.Chess.NNEvaluators.Defs;
-using Microsoft.ML.OnnxRuntime;
-using Onnx;
+
 
 #endregion
 
@@ -118,6 +122,17 @@ public class NNEvaluatorONNX : NNEvaluator
   readonly bool hasUncertaintyV;
   readonly bool hasUncertaintyP;
   readonly bool hasAction;
+  readonly bool hasPolicySecondary;
+
+  /// <summary>
+  /// If the evaluator has a secondary policy head.
+  /// </summary>
+  public override bool HasPolicySecondary => hasPolicySecondary;
+
+  /// <summary>
+  /// If the evaluator supports advanced policy features (Policy2 blending, per-head temperatures).
+  /// </summary>
+  public override bool SupportsAdvancedPolicyFeatures => true;
 
   /// <summary>
   /// If an input with the name "squares_byte" exists
@@ -221,6 +236,7 @@ public class NNEvaluatorONNX : NNEvaluator
   /// <param name="options"></param>
   /// <param name="hasValueSecondary"></param>
   /// <param name="hasState"></param>
+  /// <param name="hasPolicySecondary"></param>
   public NNEvaluatorONNX(string engineID, string onnxModelFileName, byte[] onnxModelBytes,
                          NNDeviceType deviceType, int gpuID, bool useTRT,
                          ONNXNetExecutor.NetTypeEnum type, int maxBatchSize,
@@ -232,7 +248,8 @@ public class NNEvaluatorONNX : NNEvaluator
                          bool useHistory = true, NNEvaluatorOptions options = null,
                          bool hasValueSecondary = false,
                          bool hasState = false,
-                         NNEvaluatorHeadOverride[] headOverrides = null)
+                         NNEvaluatorHeadOverride[] headOverrides = null,
+                         bool hasPolicySecondary = false)
   {
     EngineNetworkID = engineID;
     ONNXFileName = onnxModelFileName;
@@ -245,6 +262,7 @@ public class NNEvaluatorONNX : NNEvaluator
     this.hasUncertaintyV = hasUncertaintyV;
     this.hasUncertaintyP = hasUncertaintyP;
     this.hasAction = hasAction;
+    this.hasPolicySecondary = hasPolicySecondary;
     this.HasState = hasState;
     DeviceType = deviceType;
     OutputValue = outputValue;
@@ -312,8 +330,6 @@ public class NNEvaluatorONNX : NNEvaluator
   /// <param name="positionsNativeInput"></param>
   /// <param name="usesSecondaryInputs"></param>
   /// <param name="retrieveSupplementalResults"></param>
-  /// <returns></returns>
-  /// <exception cref="NotImplementedException"></exception>
   public override IPositionEvaluationBatch DoEvaluateNativeIntoBuffers(object positionsNativeInput, bool usesSecondaryInputs,
                                                                        int numPositions, Func<int, int, bool> posMoveIsLegal,
                                                                        bool retrieveSupplementalResults = false)
@@ -343,6 +359,11 @@ public class NNEvaluatorONNX : NNEvaluator
       throw new Exception("ConverterToFlatFromTPG must be provided");
     }
 
+    if (!haveInitializedLookupByteToHalf)
+    {
+      InitLookupTable();
+    }
+
     if (inputsPrimaryNative == null)
     {
       // TO DO: This buffer sizing logic is tied to TPG board representation
@@ -357,11 +378,6 @@ public class NNEvaluatorONNX : NNEvaluator
     }
 
     int numConverted = ConverterToFlatFromTPG(Options, positionsNativeInput, inputsPrimaryNative);
-
-    if (!haveInitializedLookupByteToHalf)
-    {
-      InitLookupTable();
-    }
 
     // Convert bytes to Half (efficiently via lookup table).
     for (int i = 0; i < numConverted; i++)
@@ -436,6 +452,15 @@ public class NNEvaluatorONNX : NNEvaluator
 
       short[] legalMoveIndices = null; // not needed, batch already contains moves
       ConverterToFlat(Options, batch, UseHistory, evaluatorInputBuffer, evaluatorInputBufferHalf, legalMoveIndices);
+
+      // Apply PlySinceLastMove transformation for byte input case.
+      // Pass pre-computed LastMovePlies if available; otherwise history-based estimation is used.
+      // Only apply if Options is NNEvaluatorOptionsCeres; otherwise skip ply-since logic entirely.
+      if (Options is NNEvaluatorOptionsCeres ceresOptions)
+      {
+        ReadOnlySpan<byte> lastMovePlies = batch.LastMovePlies.IsEmpty ? default : batch.LastMovePlies.Span.Slice(0, batch.NumPos * 64);
+        ApplyPlySinceLastMoveTransformationToTPGBuffer(evaluatorInputBuffer.Span, batch.NumPos, ceresOptions.PlySinceLastMoveMode, lastMovePlies);
+      }
 
       PositionEvaluationBatch ret = DoEvaluateBatch(batch, evaluatorInputBuffer, evaluatorInputBufferHalf, batch.States, batch.NumPos,
                                                     retrieveSupplementalResults, null, 1);
@@ -662,7 +687,7 @@ public class NNEvaluatorONNX : NNEvaluator
                                        HasAction, HasValueSecondary, HasState, numPos,
                                        MemoryMarshal.Cast<Float16, FP16>(result.ValuesRaw.Span),
                                        MemoryMarshal.Cast<Float16, FP16>(result.Values2Raw.Span),
-                                       result.PolicyVectors,//*/result.PolicyFlat, 
+                                       result.PolicyVectors, result.Policy2Vectors,
                                        result.ActionLogits,
                                        MemoryMarshal.Cast<Float16, FP16>(result.MLH.Span),
                                        MemoryMarshal.Cast<Float16, FP16>(result.UncertaintyV.Span),
@@ -677,6 +702,8 @@ public class NNEvaluatorONNX : NNEvaluator
                                        ValueHeadLogistic, PositionEvaluationBatch.PolicyType.LogProbabilities, false,
                                        batch,
                                        Options.PolicyTemperature, Options.PolicyUncertaintyTemperatureScalingFactor,
+                                       Options.FractionPolicyHead2, Options.Policy2BlendLogits,
+                                       Options.Policy1Temperature, Options.Policy2Temperature,
                                        stats, rawNetworkOutputs, RawNetworkOutputNames, useRentedPolicyBuffer);
 
     //#if NOT

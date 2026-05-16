@@ -27,7 +27,7 @@ using Ceres.MCGS.Search.Params;
 
 #endregion
 
-namespace Ceres.Features.UCI;
+namespace Ceres.MCGS.UCI;
 
 public partial class UCIManagerMCGS
 {
@@ -173,6 +173,11 @@ public partial class UCIManagerMCGS
   float fpuAtRoot = new ParamsSelect().FPUValueAtRoot;
 
   /// <summary>
+  /// If enabled, sets FPU mode to ActionHead with FPUValue=0.10 and FPUValueAtRoot=0.10.
+  /// </summary>
+  bool enableActionHead = false;
+
+  /// <summary>
   /// Set of batch sizes for which CUDA graphs are created.
   /// </summary>
   int[] cudaGraphSizes = [16, 32, 48, 64, 80];
@@ -224,12 +229,14 @@ public partial class UCIManagerMCGS
         break;
 
       case "loglivestats":
-        SetBool(value, ref logLiveStats);
+        // Purely controls output-formatting decisions in info lines; no engine state.
+        SetBool(value, ref logLiveStats, reinitializeEngine: false);
         break;
 
       case "uci_chess960":
-        SetBool(value, ref UCI_Chess960);
-        IsChess960OptionSet = UCI_Chess960;          
+        // Purely controls how castling moves are formatted in UCI output; no engine state.
+        SetBool(value, ref UCI_Chess960, reinitializeEngine: false);
+        IsChess960OptionSet = UCI_Chess960;
         break;
 
       case "mcgs":
@@ -281,7 +288,8 @@ public partial class UCIManagerMCGS
         break;
 
       case "verbosemovestats":
-        SetBool(value, ref verboseMoveStats);
+        // Purely controls whether verbose move stats lines are emitted; no engine state.
+        SetBool(value, ref verboseMoveStats, reinitializeEngine: false);
         break;
 
       case "scoretype":
@@ -317,11 +325,13 @@ public partial class UCIManagerMCGS
         break;
 
       case "perpvcounters":
-        SetBool(value, ref perPVCounters);
+        // Purely controls info-line formatting (useParentN); no engine state.
+        SetBool(value, ref perPVCounters, reinitializeEngine: false);
         break;
 
       case "uci_showwdl":
-        SetBool(value, ref showWDL);
+        // Purely controls whether WDL is emitted in info lines; no engine state.
+        SetBool(value, ref showWDL, reinitializeEngine: false);
         break;
 
       case "reducedmemorymode":
@@ -372,6 +382,10 @@ public partial class UCIManagerMCGS
 
       case "fpuatroot":
         SetFloat(value, 0, float.MaxValue, ref fpuAtRoot, true);
+        break;
+
+      case "enableactionhead":
+        SetBool(value, ref enableActionHead);
         break;
 
       case "cudagraphsizes":
@@ -520,7 +534,7 @@ public partial class UCIManagerMCGS
       OutStream.WriteLine("Invalid value, expected true or false");
     }
 
-    if (CeresEngine != null)
+    if (reinitializeEngine && CeresEngine != null)
     {
       ReinitializeEngine();
     }
@@ -632,6 +646,7 @@ option name PolicyTemperature type string default {new ParamsSelect().PolicySoft
 option name ValueTemperature type string default {new ParamsSearch().ValueTemperature}
 option name FPU type string default {new ParamsSelect().FPUValue}
 option name FPUAtRoot type string default {new ParamsSelect().FPUValueAtRoot}
+option name EnableActionHead type check default false
 option name SearchLimitMultiplier type string default 1.00
 option name MaxTreeVisits type string default
 option name MaxTreeNodes type string default

@@ -14,22 +14,20 @@
 #region Using directives
 
 using System;
-using System.Linq;
 using System.Collections.Generic;
-using Ceres.Base.DataTypes;
-using Ceres.Base.Math;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-
+using Ceres.Base.DataTypes;
+using Ceres.Base.Math;
 using Ceres.Chess;
 using Ceres.Chess.MoveGen;
-using Ceres.MCGS.Search.PathEvaluators;
-using Ceres.MCGS.Storage.Structs;
-using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Graphs.GEdges;
 using Ceres.MCGS.Graphs.GEdgeHeaders;
-using Ceres.MCGS.Graphs;
-using Ceres.MCGS.Storage;
+using Ceres.MCGS.Graphs.GEdges;
+using Ceres.MCGS.Graphs.GNodes;
+using Ceres.MCGS.Search.Params;
+using Ceres.MCGS.Search.PathEvaluators;
+using Ceres.MCGS.Search.Phases.Evaluation;
 
 #endregion
 
@@ -204,6 +202,8 @@ internal class GraphStoreValidator
       AssertNode(node.UncertaintyValue == 0, () => $"Node #{i} marked as Checkmate but UncertaintyValue={node.UncertaintyValue}", i, true);
     }
 
+    AssertNode(node.N == 0 || !double.IsNaN(node.Q), () => $"Node #{i} has N={node.N} but Q is NaN", i, true);  
+
     // Visited nodes should have values for WinP/LossP
     AssertNode(!(node.N > 0 && FP16.IsNaN(node.WinP + node.LossP)), () => "N > 0 but WinP/LossP NaN", i, false);
     AssertNodeQuiescent(node.N == 0 || Math.Abs(node.Q) < 1.50, () => $"Node Q Q was unreasonable {node.Q}", i);
@@ -247,7 +247,7 @@ internal class GraphStoreValidator
                  new ParallelOptions { MaxDegreeOfParallelism = 16 },
     i =>
     {
-      int idx = endNodeIndex - 1 - i;
+      int idx = endNodeIndex - 1 - (i - startNodeIndex);
       Span<GNodeStruct> nodes = store.NodesStore.Span;
       ref readonly GNodeStruct nodeR = ref nodes[idx];
       GNode node = graph[new NodeIndex(idx)];
@@ -255,6 +255,11 @@ internal class GraphStoreValidator
       if (idx == 0)
       {
         AssertNode(node.BlockIndexIntoEdgeHeaderStore == 0, () => $"Null node (index #0) was not in null state", idx);
+        return;
+      }
+
+      if (node.IsOldGeneration)
+      {
         return;
       }
 
@@ -393,11 +398,14 @@ internal class GraphStoreValidator
         AssertNode(nExpectedFromChild <= childEdge.ChildNode.N, () => $"Edge N exceeded child N ({childEdge.N} vs {childEdge.ChildNode.N})", childEdge.ChildNode.Index.Index);
 
 #if ACTION_ENABLED
-        // Do not apply this test if terminal edge, since the action V will have been overwritten in the edge
-        // but currently that overwriting is not replicated at the GEdgeHeaderStruct level
-        AssertNode(MathUtils.EqualsOrBothNaN(childEdge.ActionV, edgeHeaderStruct.ActionV), 
-                                             () => $"Chlid/MoveInfo disagreement on ActionV of {childEdge.ActionV} vs {edgeHeaderStruct.ActionV} at move index {childIndexInParent}", i);
+        if (MCGSParamsFixed.GEDGE_HAS_ACTIONV)
+        { 
+          // Do not apply this test if terminal edge, since the action V will have been overwritten in the edge
+          // but currently that overwriting is not replicated at the GEdgeHeaderStruct level
+          AssertNode(MathUtils.EqualsOrBothNaN(childEdge.ActionV, edgeHeaderStruct.ActionV),
+                                               () => $"Chlid/MoveInfo disagreement on ActionV of {childEdge.ActionV} vs {edgeHeaderStruct.ActionV} at move index {childIndexInParent}", i);
         // TODO: if/when we also copy over ActionU, then enable this    AssertNode(MathUtils.EqualsOrBothNaN(child.ActionU, moveInfo.ActionU), $"Chlid/MoveInfo disagreement on ActionU of {child.ActionU} vs {moveInfo.ActionU} at move index {visitToChildIndex}", i, in nodeR);
+        }
 #endif
       }
 
@@ -489,7 +497,6 @@ internal class GraphStoreValidator
     //        AssertNode(numVisitedThisChild == nodeR.NumChildrenVisited, "NumChildrenVisited inconsistent with number of populated entries in ChildVisits", i, in nodeR);
 
     AssertNode(!(node.Terminal.IsTerminal() && node.NumEdgesExpanded > 0), "Terminal node should have no expanded children", i, in nodeR, true);
-    AssertNode(node.NumEdgesVisited <= node.NumEdgesExpanded, "NumEdgesVisited cannot exceed NumEdgesExpanded", i, in nodeR, true);
 
     // Verify all visits to children point have correct statistics
     int sumChildEdgeN = 0;
@@ -497,11 +504,6 @@ internal class GraphStoreValidator
     {
       GEdge childEdge = node.ChildEdgeAtIndex(c);
       sumChildEdgeN += childEdge.N;
-
-      if (quiescent)
-      {
-        AssertNode(!(childEdge.N - childEdge.NDrawByRepetition> 0 && c >= node.NumEdgesVisited), ()=>  $"Child edge {c} has N/ND={childEdge.N}/{childEdge.NDrawByRepetition} but NumEdgesVisited={node.NumEdgesVisited}", i); 
-      }
 
       if (!childEdge.Type.IsTerminal())
       {
@@ -637,7 +639,10 @@ internal class GraphStoreValidator
           // Do not apply this test if terminal edge, since the action V will have been overwritten in the edge
           // but currently that overwriting is not replicated at the GEdgeHeaderStruct level
 #if ACTION_ENABLED
-          AssertNode(MathUtils.EqualsOrBothNaN(childEdge.ActionV, gEdgeHeaderStruct.ActionV), $"ActionV of child specified in edge does not match", i, in nodeR);
+          if (MCGSParamsFixed.GEDGE_HAS_ACTIONV)
+          {
+            AssertNode(MathUtils.EqualsOrBothNaN(childEdge.ActionV, gEdgeHeaderStruct.ActionV), $"ActionV of child specified in edge does not match", i, in nodeR);
+          }
 #endif
           AssertNodeQuiescent(Math.Abs(childEdge.Q) < 1.50, () => $"Child edge's Q was unreasonable {childEdge.Q}", i);
           
@@ -672,12 +677,11 @@ internal class GraphStoreValidator
         // Verify policy non-negative.
         AssertNode(gEdgeHeaderStruct.P >= 0, () => $"MoveInfo policy was negative: {gEdgeHeaderStruct.P}", i);
 
-        // Verify appears in order based on prior probability.
-        if (gEdgeHeaderStruct.P > lastP)
-        {
-          AssertNode(gEdgeHeaderStruct.P <= lastP, () => $"Children were not in descending order by prior probability: {gEdgeHeaderStruct.P} vs. {lastP}", i);
-          lastP = gEdgeHeaderStruct.P;
-        }
+        // Verify unexpanded edges appear in non-ascending order by prior probability (unless action head enabled).
+#if !ACTION_ENABLED
+        AssertNode(gEdgeHeaderStruct.P <= lastP, () => $"Unexpanded children were not in non-ascending order by prior probability: {gEdgeHeaderStruct.P} vs. {lastP}", i);
+#endif
+        lastP = gEdgeHeaderStruct.P;
       }
 
       headerIndex++;

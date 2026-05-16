@@ -215,7 +215,9 @@ namespace Ceres.Chess.Textual
 
         foreach (char c in castlingRights)
         {
-          //first check for normal castling rights
+          // KQkq notation: rook must be on rank 1 (white) / rank 8 (black) — the initial
+          // rook placement. Without the rank filter, a mid-game rook encountered earlier
+          // in FEN parse order could be mis-selected, corrupting WhiteKRInitPlacement.
           if (c == 'K' && whiteRookSquares.Count > 0)
           {
             // Must be on rank 1 — mid-game rooks elsewhere on the board must
@@ -270,6 +272,9 @@ namespace Ceres.Chess.Textual
 
           else //next chess960 castling rights
           {
+            // As with KQkq, the castling rook must be on rank 1 / rank 8 — it is the
+            // initial rook placement. FindIndex is used instead of FirstOrDefault to
+            // avoid the ambiguity where default(Square) equals A1 (rank 0, file 0).
             if (char.IsUpper(c) && whiteRookSquares.Count > 0) // White's castling rights
             {
               // Use FindIndex + idx<0 to distinguish "not found" from "found at a1":

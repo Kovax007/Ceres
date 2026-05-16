@@ -28,7 +28,6 @@ using Ceres.Chess.MoveGen;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NetEvaluation.Batch;
 using Ceres.MCGS.Graphs.GEdgeHeaders;
-using Ceres.MCGS.Storage.Structs;
 
 #endregion
 

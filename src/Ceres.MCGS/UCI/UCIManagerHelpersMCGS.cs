@@ -22,14 +22,13 @@ using Ceres.Chess;
 using Ceres.Chess.Positions;
 using Ceres.Chess.Textual.PgnFileTools;
 using Ceres.Chess.Games.Utils;
-using Ceres.Features.Visualization.AnalysisGraph;
+using Ceres.MCGS.Visualization.AnalysisGraph;
 using Ceres.Chess.UserSettings;
-using Ceres.MCGS.Storage;
 using Ceres.MCGS.Graphs.GraphStores;
 
 #endregion
 
-namespace Ceres.Features.UCI;
+namespace Ceres.MCGS.UCI;
 
 /// <summary>
 /// Static helper methods useful for the UCIManager.

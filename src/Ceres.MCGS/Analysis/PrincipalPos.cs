@@ -3,7 +3,6 @@
 using System.Collections.Generic;
 using Ceres.Chess.MoveGen;
 using Ceres.MCGS.Graphs.GNodes;
-using Ceres.MCGS.Storage;
 
 #endregion
 
