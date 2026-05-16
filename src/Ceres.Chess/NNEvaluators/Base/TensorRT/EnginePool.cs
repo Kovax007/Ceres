@@ -286,9 +286,14 @@ public sealed class EnginePool : IDisposable
     }
     else // Exact mode
     {
-      // sizes defines exact batch sizes, sorted descending for processing
+      // sizes must match the engine's INTERNAL optimization-profile order (ascending),
+      // because TRT_LoadMultiProfileEngineFile / LoadMultiProfileEngineWithCache map
+      // batchSizes[p] to setOptimizationProfileAsync(profileIndex=p). The orchestrator
+      // builds refittable .engine files with profiles in ascending batch-size order,
+      // so we must pass ascending here. The downstream code expects engines[0] to be
+      // the largest, so we reverse the returned array (using BatchSize from each engine)
+      // after loading.
       Array.Sort(sizes);
-      Array.Reverse(sizes);
 
       // Build a single multi-profile engine with shared weights across all batch sizes.
       // This eliminates N-fold weight duplication in VRAM and requires only one cache file.
@@ -304,6 +309,11 @@ public sealed class EnginePool : IDisposable
         multiEngines = this.trt.LoadMultiProfileEngineWithCache(
           onnxPath, sizes, options, cacheDir, deviceId);
       }
+
+      // Re-sort engines descending by BatchSize so engines[0] is largest (rest of the pool
+      // logic assumes this for Exact mode). The TRT context for each engine retains its
+      // correct internal profileIndex regardless of array order.
+      Array.Sort(multiEngines, (a, b) => b.BatchSize.CompareTo(a.BatchSize));
 
       foreach (TensorRTEngine engine in multiEngines)
       {
