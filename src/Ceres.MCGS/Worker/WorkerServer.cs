@@ -162,11 +162,20 @@ public class WorkerServer
   /// </summary>
   private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
   {
-    using var stream = client.GetStream();
+    using var rawStream = client.GetStream();
+    // Serialize all write-side ops through a per-connection semaphore.
+    // Multiple game threads can call SendResponseAsync concurrently during
+    // PLAY (fire-and-forget progress + game-pair streams from
+    // WorkerTournamentRunner.cs:312, :346) — without serialization the
+    // length-prefixes and bodies of those messages interleave on the wire,
+    // corrupting the stream so the orchestrator's recv blocks forever.
+    // Caught by ultrareview 2026-05-21. Reads remain on the raw stream
+    // because HandleClientAsync is single-threaded for header reads.
+    using var stream = new SerializedStream(rawStream);
 
     while (!ct.IsCancellationRequested)
     {
-      var header = await WorkerProtocol.ReadCommandHeaderAsync(stream, ct);
+      var header = await WorkerProtocol.ReadCommandHeaderAsync(stream.UnderlyingStream, ct);
       if (header == null) break;  // Client disconnected
 
       var (cmd, length) = header.Value;
@@ -181,13 +190,13 @@ public class WorkerServer
         {
           _payloadBuffer = new byte[length];
         }
-        await WorkerProtocol.ReadExactIntoAsync(stream, _payloadBuffer, length, ct);
+        await WorkerProtocol.ReadExactIntoAsync(stream.UnderlyingStream, _payloadBuffer, length, ct);
         payload = _payloadBuffer;
       }
       else if (length > 0)
       {
         // Non-REFIT commands have small JSON payloads (< 1KB), safe to allocate fresh
-        payload = await WorkerProtocol.ReadExactAsync(stream, length, ct);
+        payload = await WorkerProtocol.ReadExactAsync(stream.UnderlyingStream, length, ct);
       }
       else
       {
@@ -249,7 +258,7 @@ public class WorkerServer
   /// <summary>
   /// INIT: Load engine and configure tournament parameters.
   /// </summary>
-  private async Task HandleInitAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandleInitAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     try
     {
@@ -309,7 +318,7 @@ public class WorkerServer
 
       _state = "idle";
 
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         status = "ready",
         gpu_id = _gpuId,
@@ -320,7 +329,7 @@ public class WorkerServer
     catch (Exception ex)
     {
       Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Init failed: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         status = "error",
         error = ex.Message
@@ -332,11 +341,11 @@ public class WorkerServer
   /// <summary>
   /// REFIT: Replace engine weights in-place.
   /// </summary>
-  private async Task HandleRefitAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandleRefitAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     if (_refitter == null)
     {
-      await WorkerProtocol.SendResponseAsync(stream, new RefitResult
+      await stream.SendResponseAsync( new RefitResult
       {
         Status = "error",
         Error = "Worker not initialized — send INIT first"
@@ -347,7 +356,7 @@ public class WorkerServer
     // Acquire semaphore — prevents REFIT while PLAY is running (non-blocking)
     if (!await _opSemaphore.WaitAsync(0, ct))
     {
-      await WorkerProtocol.SendResponseAsync(stream, new RefitResult
+      await stream.SendResponseAsync( new RefitResult
       {
         Status = "error",
         Error = "Worker busy — PLAY in progress. Send STOP first."
@@ -374,13 +383,13 @@ public class WorkerServer
       }
 
       _state = "idle";
-      await WorkerProtocol.SendResponseAsync(stream, result, ct);
+      await stream.SendResponseAsync( result, ct);
     }
     catch (Exception ex)
     {
       _state = "idle";
       Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Refit error: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new RefitResult
+      await stream.SendResponseAsync( new RefitResult
       {
         Status = "error",
         Error = ex.Message
@@ -397,11 +406,11 @@ public class WorkerServer
   /// PLAY: Start a tournament with the current engine weights.
   /// Streams game-pair results, then sends final tournament result.
   /// </summary>
-  private async Task HandlePlayAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandlePlayAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     if (_tournamentRunner == null)
     {
-      await WorkerProtocol.SendResponseAsync(stream, new TournamentResult
+      await stream.SendResponseAsync( new TournamentResult
       {
         Type = "error",
         PerturbationId = "unknown"
@@ -412,7 +421,7 @@ public class WorkerServer
     // Acquire semaphore — only one REFIT or PLAY at a time (non-blocking check)
     if (!await _opSemaphore.WaitAsync(0, ct))
     {
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         type = "error",
         error = "Worker busy — REFIT or PLAY already in progress"
@@ -451,11 +460,11 @@ public class WorkerServer
             if (cached != null)
             {
               cached.CmdId = cmdId;
-              await WorkerProtocol.SendResponseAsync(stream, cached, ct);
+              await stream.SendResponseAsync( cached, ct);
             }
             else
             {
-              await WorkerProtocol.SendResponseAsync(stream, new
+              await stream.SendResponseAsync( new
               {
                 type = "error",
                 cmd_id = cmdId,
@@ -496,7 +505,7 @@ public class WorkerServer
               $"[Worker GPU:{_gpuId}] PLAY cmd_id={cmdId} STARTED & in_progress in this process — refusing duplicate");
             try
             {
-              await WorkerProtocol.SendResponseAsync(stream, new
+              await stream.SendResponseAsync( new
               {
                 type = "in_progress",
                 cmd_id = cmdId,
@@ -572,7 +581,7 @@ public class WorkerServer
             // Stream each completed game pair back to the orchestrator.
             try
             {
-              await WorkerProtocol.SendResponseAsync(stream, gamePairResult, ct);
+              await stream.SendResponseAsync( gamePairResult, ct);
             }
             catch (Exception ex)
             {
@@ -602,7 +611,7 @@ public class WorkerServer
       {
         _journal.AppendCompleted(cmdId, result);
       }
-      await WorkerProtocol.SendResponseAsync(stream, result, ct);
+      await stream.SendResponseAsync( result, ct);
 
       // Check memory usage — auto-exit if RSS exceeds threshold.
       // The start script (screen with restart) will respawn the worker.
@@ -641,7 +650,7 @@ public class WorkerServer
       {
         _journal.AppendFailed(cmdId, "operation_cancelled", stoppedResult);
       }
-      await WorkerProtocol.SendResponseAsync(stream, stoppedResult, ct);
+      await stream.SendResponseAsync( stoppedResult, ct);
     }
     catch (Exception ex)
     {
@@ -664,7 +673,7 @@ public class WorkerServer
           pentanomial = penta
         });
       }
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         type = "error",
         perturbation_id = perturbationId,
@@ -705,13 +714,13 @@ public class WorkerServer
   ///
   /// Called from WorkerTournamentRunner.PerGamePairCallback every K pairs.
   /// </summary>
-  private async Task BroadcastProgressAsync(NetworkStream stream,
+  private async Task BroadcastProgressAsync(SerializedStream stream,
       string cmdId, int gamesPlayed, int ofTotal, int[] partialWdl,
       CancellationToken ct)
   {
     try
     {
-      await WorkerProtocol.SendResponseAsync(stream, new ProgressMessage
+      await stream.SendResponseAsync( new ProgressMessage
       {
         Type = "progress",
         CmdId = cmdId,
@@ -744,7 +753,7 @@ public class WorkerServer
   /// is sent on the same socket and awaits its reply before the next PLAY
   /// dispatch).  No server-side queueing flag is needed.
   /// </summary>
-  private async Task HandleResumeAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandleResumeAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     try
     {
@@ -800,7 +809,7 @@ public class WorkerServer
         $"[Worker GPU:{_gpuId}] RESUME: server asked about {queriedCmdIds.Count} cmd_ids, " +
         $"replying with {replyEntries.Count} entries (recency-window scan)");
 
-      await WorkerProtocol.SendResponseAsync(stream, new ResumeReply
+      await stream.SendResponseAsync( new ResumeReply
       {
         Type = "resume_reply",
         Status = "ok",
@@ -810,7 +819,7 @@ public class WorkerServer
     catch (Exception ex)
     {
       Console.Error.WriteLine($"[Worker GPU:{_gpuId}] RESUME error: {ex}");
-      await WorkerProtocol.SendResponseAsync(stream, new ResumeReply
+      await stream.SendResponseAsync( new ResumeReply
       {
         Type = "resume_reply",
         Status = "error",
@@ -903,11 +912,11 @@ public class WorkerServer
   /// <summary>
   /// STOP: Stop the current tournament gracefully.
   /// </summary>
-  private async Task HandleStopAsync(NetworkStream stream, CancellationToken ct)
+  private async Task HandleStopAsync(SerializedStream stream, CancellationToken ct)
   {
     if (_state != "playing")
     {
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         type = "not_playing",
         state = _state
@@ -919,7 +928,7 @@ public class WorkerServer
     _tournamentRunner?.Stop();
     _tournamentCts?.Cancel();
 
-    await WorkerProtocol.SendResponseAsync(stream, new
+    await stream.SendResponseAsync( new
     {
       type = "stopping",
       perturbation_id = _currentPerturbationId
@@ -930,7 +939,7 @@ public class WorkerServer
   /// <summary>
   /// STATUS: Return current worker state.
   /// </summary>
-  private async Task HandleStatusAsync(NetworkStream stream, CancellationToken ct)
+  private async Task HandleStatusAsync(SerializedStream stream, CancellationToken ct)
   {
     string perturbationId;
     lock (_stateLock) { perturbationId = _currentPerturbationId; }
@@ -939,7 +948,7 @@ public class WorkerServer
     var (w, d, l) = _tournamentRunner != null ? _tournamentRunner.GetCurrentWDL() : (0, 0, 0);
     int[] penta = _tournamentRunner?.GetLivePentanomial();
 
-    await WorkerProtocol.SendResponseAsync(stream, new WorkerStatus
+    await stream.SendResponseAsync( new WorkerStatus
     {
       State = _state,
       PerturbationId = perturbationId,
@@ -961,7 +970,7 @@ public class WorkerServer
   /// Safe in any state: returns an empty list (state="idle"/"uninitialized")
   /// when nothing is running. Does NOT affect tournament state.
   /// </summary>
-  private async Task HandleListPlayedOffsetsAsync(NetworkStream stream, CancellationToken ct)
+  private async Task HandleListPlayedOffsetsAsync(SerializedStream stream, CancellationToken ct)
   {
     string perturbationId;
     lock (_stateLock) { perturbationId = _currentPerturbationId; }
@@ -975,7 +984,7 @@ public class WorkerServer
       }
     }
 
-    await WorkerProtocol.SendResponseAsync(stream, new PlayedOffsetsResult
+    await stream.SendResponseAsync( new PlayedOffsetsResult
     {
       PerturbationId = perturbationId,
       State = _state,
@@ -988,11 +997,11 @@ public class WorkerServer
   /// PROBE_DEPS: Discover fused TRT dependency names for the supplied weight names.
   /// The engine state is NOT modified — this is a read-only query.
   /// </summary>
-  private async Task HandleProbeDepAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandleProbeDepAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     if (_refitter == null)
     {
-      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
+      await stream.SendResponseAsync( new ProbeDepsResult
       {
         Status = "error",
         Error = "Worker not initialized — send INIT first"
@@ -1007,7 +1016,7 @@ public class WorkerServer
 
       Console.WriteLine($"[Worker GPU:{_gpuId}] ProbeDeps: {req.WeightNames.Count} user weights → {fusedDeps.Count} fused deps");
 
-      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
+      await stream.SendResponseAsync( new ProbeDepsResult
       {
         Status = "ok",
         FusedDeps = fusedDeps,
@@ -1017,7 +1026,7 @@ public class WorkerServer
     catch (Exception ex)
     {
       Console.Error.WriteLine($"[Worker GPU:{_gpuId}] ProbeDeps error: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new ProbeDepsResult
+      await stream.SendResponseAsync( new ProbeDepsResult
       {
         Status = "error",
         Error = ex.Message
@@ -1030,11 +1039,11 @@ public class WorkerServer
   /// SERIALIZE: Save the current engine weights to a file on the worker host.
   /// Useful for validation: refit then serialize, evaluate the resulting engine file with Ceres.
   /// </summary>
-  private async Task HandleSerializeAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandleSerializeAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     if (_engines == null)
     {
-      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
+      await stream.SendResponseAsync( new SerializeResult
       {
         Status = "error",
         Error = "Worker not initialized — send INIT first"
@@ -1059,7 +1068,7 @@ public class WorkerServer
 
       Console.WriteLine($"[Worker GPU:{_gpuId}] Serialized engine to {req.OutputPath} ({sizeBytes / 1024 / 1024.0:F1} MB)");
 
-      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
+      await stream.SendResponseAsync( new SerializeResult
       {
         Status = "ok",
         OutputPath = req.OutputPath,
@@ -1069,7 +1078,7 @@ public class WorkerServer
     catch (Exception ex)
     {
       Console.Error.WriteLine($"[Worker GPU:{_gpuId}] Serialize error: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new SerializeResult
+      await stream.SendResponseAsync( new SerializeResult
       {
         Status = "error",
         Error = ex.Message
@@ -1082,11 +1091,11 @@ public class WorkerServer
   /// NETVSNET: Run a Ceres-vs-Ceres tournament between two networks.
   /// Self-contained — does not require prior INIT. Uses the worker's GPU and local config.
   /// </summary>
-  private async Task HandleNetVsNetAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+  private async Task HandleNetVsNetAsync(SerializedStream stream, byte[] payload, CancellationToken ct)
   {
     if (_state == "playing")
     {
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         type = "error",
         error = "Cannot start NETVSNET while tournament is running — send STOP first"
@@ -1128,7 +1137,7 @@ public class WorkerServer
           {
             try
             {
-              await WorkerProtocol.SendResponseAsync(stream, gamePairResult, ct);
+              await stream.SendResponseAsync( gamePairResult, ct);
             }
             catch (Exception ex)
             {
@@ -1138,14 +1147,14 @@ public class WorkerServer
           ct: _tournamentCts.Token);
 
       _state = previousState;
-      await WorkerProtocol.SendResponseAsync(stream, result, ct);
+      await stream.SendResponseAsync( result, ct);
     }
     catch (OperationCanceledException)
     {
       _state = previousState;
       var (wins, draws, losses) = _tournamentRunner?.GetCurrentWDL() ?? (0, 0, 0);
       int[] penta = _tournamentRunner?.GetLivePentanomial();
-      await WorkerProtocol.SendResponseAsync(stream, new TournamentResult
+      await stream.SendResponseAsync( new TournamentResult
       {
         Type = "stopped",
         PerturbationId = "netvsnet",
@@ -1160,7 +1169,7 @@ public class WorkerServer
     {
       _state = previousState;
       Console.Error.WriteLine($"[Worker GPU:{_gpuId}] NETVSNET error: {ex.Message}");
-      await WorkerProtocol.SendResponseAsync(stream, new
+      await stream.SendResponseAsync( new
       {
         type = "error",
         error = ex.Message
@@ -1172,7 +1181,7 @@ public class WorkerServer
   /// <summary>
   /// SHUTDOWN: Clean exit.
   /// </summary>
-  private async Task HandleShutdownAsync(NetworkStream stream, CancellationToken ct)
+  private async Task HandleShutdownAsync(SerializedStream stream, CancellationToken ct)
   {
     Console.WriteLine($"[Worker GPU:{_gpuId}] Shutting down...");
 
@@ -1189,7 +1198,7 @@ public class WorkerServer
       }
     }
 
-    await WorkerProtocol.SendResponseAsync(stream, new
+    await stream.SendResponseAsync( new
     {
       status = "shutting_down"
     }, ct);
